@@ -1,0 +1,5 @@
+{
+  "port": 8812,
+  "transcripts": "~/.claude/projects",
+  "interval": 300
+}

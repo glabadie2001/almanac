@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Almanac</title>
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<div class="crt" aria-hidden="true"></div>
+<div id="boot" class="boot" aria-hidden="true"></div>
+<main id="app">
+  <header class="bar">
+    <span class="brand">ALMANAC<span class="dim">//</span>MISSION-CONTROL</span>
+    <span class="grow"></span>
+    <span id="link" class="link">● LINK</span>
+    <span id="clock" class="dim">--:--:--</span>
+  </header>
+  <nav class="tabs" role="tablist" aria-label="Views">
+    <button role="tab" data-tab="fleet" aria-selected="true">[1] FLEET</button>
+    <button role="tab" data-tab="gallery">[2] GALLERY</button>
+    <button role="tab" data-tab="chats">[3] CHATS</button>
+    <button role="tab" data-tab="telemetry">[4] TELEMETRY</button>
+    <button role="tab" data-tab="log">[5] LOG</button>
+    <span class="grow"></span>
+    <button id="help-btn" class="dim" aria-label="Keyboard help">[?] KEYS</button>
+  </nav>
+
+  <section id="fleet" class="view" role="tabpanel">
+    <p id="fleet-summary" class="line summary">probing…</p>
+    <div class="split">
+      <div class="box" data-title="FLEET">
+        <div class="scroll"><table class="fleet" id="fleet-table" aria-label="Claude processes">
+          <thead><tr><th title="pinned to the gallery">◇</th><th>PID</th><th>NAME</th><th>MODEL</th><th>EFFORT</th><th>STATE</th><th class="r">CPU</th><th></th><th class="r">MEM</th><th class="r">AGE</th></tr></thead>
+          <tbody></tbody>
+        </table></div>
+        <p id="fleet-empty" class="dim pad" hidden>no claude.exe running</p>
+      </div>
+      <div class="box detail" data-title="SESSION" id="detail">
+        <div id="detail-head" class="pad"><span class="dim">select a process ▸ j/k then enter</span></div>
+        <ol id="feed" class="feed" aria-live="polite"></ol>
+        <form id="say" class="say" autocomplete="off" hidden>
+          <label for="say-text" class="hi">say&gt;</label>
+          <input id="say-text" maxlength="4000" placeholder="type a line, enter sends it to this session">
+          <button type="submit">[SEND]</button>
+        </form>
+        <div id="actions" class="actions pad" hidden>
+          <a id="remote" class="btn" target="_blank" rel="noopener" hidden>[REMOTE ↗]</a>
+          <button id="pin" class="btn">[PIN ◇]</button>
+          <button id="kill" class="btn danger">[KILL ✕]</button>
+          <span id="act-msg" class="dim"></span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="gallery" class="view" role="tabpanel" hidden>
+    <div class="line controls">
+      <span class="dim">show</span>
+      <span class="seg" id="g-mode"><button data-v="all">all sessions</button><button data-v="pinned">pinned</button></span>
+      <span class="dim">cols</span>
+      <span class="seg" id="g-cols"><button data-v="auto">auto</button><button data-v="1">1</button><button data-v="2">2</button><button data-v="3">3</button><button data-v="4">4</button><button data-v="6">6</button></span>
+      <span class="dim">height</span>
+      <span class="seg" id="g-height"><button data-v="s">S</button><button data-v="m">M</button><button data-v="l">L</button></span>
+      <span id="g-count" class="dim"></span>
+    </div>
+    <div id="tiles-grid" class="gallery"></div>
+    <p id="g-empty" class="dim pad" hidden></p>
+  </section>
+
+  <section id="chats" class="view" role="tabpanel" hidden>
+    <div class="line controls">
+      <label for="chat-q" class="hi">find&gt;</label>
+      <input id="chat-q" class="find" placeholder="title, first prompt, folder or id" autocomplete="off">
+      <span id="chat-count" class="dim"></span>
+      <button id="name-all" title="Haiku names every ended chat without a name; names you gave are never replaced">[NAME BACKLOG ✦]</button>
+      <span id="name-status" class="dim"></span>
+    </div>
+    <div class="split">
+      <div class="box" data-title="EVERY CHAT">
+        <div class="scroll"><table class="fleet" id="chat-table" aria-label="Every chat Almanac has kept">
+          <thead><tr><th>LAST</th><th>TITLE</th><th>FOLDER</th><th>MODEL</th><th class="r">REPLIES</th><th class="r">CONTEXT</th><th class="r">RESUME ≥</th><th>KEPT</th></tr></thead>
+          <tbody></tbody>
+        </table></div>
+      </div>
+      <div class="box detail" data-title="CHAT" id="chat-detail">
+        <div id="chat-head" class="pad"><span class="dim">pick a chat to read it; resume brings it back as a live session</span></div>
+        <ol id="chat-feed" class="feed"></ol>
+        <div id="chat-actions" class="actions pad" hidden>
+          <button id="resume" class="btn hi">[RESUME ▸]</button>
+          <label class="dim"><input type="checkbox" id="resume-remote" checked> with Remote Control</label>
+          <span id="chat-msg" class="dim"></span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="telemetry" class="view" role="tabpanel" hidden>
+    <div class="line controls">
+      <span class="dim">range</span>
+      <span class="seg" id="days"><button data-v="7">7d</button><button data-v="30">30d</button><button data-v="90">90d</button><button data-v="0">all</button></span>
+      <span class="dim">bucket</span>
+      <span class="seg" id="bucket"><button data-v="day">day</button><button data-v="week">week</button></span>
+      <button id="rescan">[RESCAN]</button>
+      <span id="ingest-status" class="dim"></span>
+    </div>
+    <div class="tiles" id="tiles"></div>
+    <div class="box" data-title="TRENDS"><div id="trends" class="pad"></div></div>
+    <div class="box" data-title="SHELL CALLS BY PURPOSE"><div id="families" class="pad"></div></div>
+    <div class="box" data-title="HELPER ADOPTION"><div id="adoption" class="pad"></div></div>
+    <div class="box" data-title="TOOLS"><div id="tools" class="pad"></div></div>
+    <p id="coverage" class="dim line"></p>
+  </section>
+
+  <section id="log" class="view" role="tabpanel" hidden>
+    <div class="box" data-title="ACTIONS"><ol id="log-list" class="log pad"></ol></div>
+  </section>
+
+  <div id="help" class="help" hidden>
+    <div class="box" data-title="KEYS">
+      <pre class="pad">1 2 3 4 5  fleet · gallery · chats · telemetry · log
+j k ↑ ↓    move through the fleet
+enter      open the selected process
+p          pin / unpin it in the gallery
+/          type to the open session (in chats: search)
+x          kill the open process (then y)
+r          refresh now
+esc        close / cancel
+?          this help</pre>
+    </div>
+  </div>
+  <div class="tip" id="tip" role="status" hidden></div>
+</main>
+</body>
+</html>
