@@ -9,6 +9,10 @@ CHATS and TELEMETRY only read `~/.claude/projects`.
 
 ## Quick start
 
+Needs Python 3.10+ and Claude Code; nothing to install.
+
+    git clone https://github.com/glabadie2001/almanac.git
+    cd almanac
     python -m almanac --open          # start, and open the signed-in page in your browser
     python -m almanac --url           # print the sign-in link again
 
@@ -90,3 +94,7 @@ resumed from Almanac is started with that setting already.
 ## Tests
 
     python -m unittest discover tests
+
+## License
+
+MIT, see `LICENSE`.
