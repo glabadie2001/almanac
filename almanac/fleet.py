@@ -16,6 +16,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -23,13 +24,16 @@ import time
 from ctypes import wintypes
 from pathlib import Path
 
-from almanac import console
+from almanac import console, uds
 
 TH32CS_SNAPPROCESS = 0x2
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 SESSION_FLAGS = ("--remote-control", "--resume", "-r", "--continue", "-c", "-n", "--name", "--model", "--effort",
-                 "--settings", "--permission-mode", "--dangerously-skip-permissions", "--agent", "--add-dir", "--fork-session")
+                 "--settings", "--permission-mode", "--dangerously-skip-permissions", "--agent", "--add-dir", "--fork-session",
+                 "--conversation", "-i", "--prompt-interactive", "--mode", "--sandbox", "--project", "--new-project")
+AGENT_EXES = ("claude.exe", "agy.exe", "gemini.exe")
+PEER_SEND_TOOLS = ("SendMessage", "mesh_send", "claude_send_message")
 REMOTE = "https://claude.ai/code/{}"
 CPUS = os.cpu_count() or 1
 
@@ -125,22 +129,25 @@ def split_args(cmd: str) -> list[str]:
     return [p.replace("\\\\", "\\") for p in parts[1:]]
 
 
-def classify(path: str, cmd: str, record: dict | None) -> str:
+def classify(path: str, cmd: str, record: dict | None, exe: str = "") -> str:
     low_path = (path or "").lower()
+    low_exe = (exe or Path(path or "").name).lower()
     args = split_args(cmd or "")
     if "windowsapps" in low_path and "\\claude_" in low_path or any(a.startswith("--type=") for a in args):
         return "desktop-helper" if any(a.startswith("--type=") for a in args) else "desktop"
     if record:
-        return "session"
-    if args[:2] == ["daemon", "run"] or args[:1] == ["daemon"]:
+        return "hub" if record.get("provider") == "almanac" else "session"
+    if args[:2] == ["daemon", "run"] or args[:1] in (["daemon"], ["acp"], ["remote-control"]):
         return "daemon"
     if "--bg-pty-host" in args:
         return "pty-host"
-    if "-p" in args or "--print" in args:
+    if any(a in ("-p", "--print", "--prompt") or a.startswith(("-p=", "--print=", "--prompt=")) for a in args):
         return "headless"
     if args[:1] == ["mcp"]:
         return "mcp"
-    if not args or args[0] in SESSION_FLAGS or "--resume" in args:
+    if low_exe in ("agy.exe", "gemini.exe") and args[:1] in (["models"], ["agents"], ["agent"], ["plugin"], ["plugins"], ["help"], ["changelog"], ["update"], ["install"]):
+        return "other"
+    if not args or args[0] in SESSION_FLAGS or "--resume" in args or "--conversation" in args:
         return "session"
     return "other"
 
@@ -162,9 +169,48 @@ def short(text: str, n: int) -> str:
     return text if len(text) <= n else text[: n - 1] + "…"
 
 
+def prose(text: str, n: int = 4000) -> str:
+    """Words someone wrote (a prompt, a reply, a peer message, an error), kept as written: line breaks and
+    indentation stay, so a table, a diff or a stack trace is still readable. `short` is for one-line summaries."""
+    text = re.sub(r"\A\s*\n", "", str(text or "").replace("\r\n", "\n")).rstrip()   # blank lines off the ends, indent kept
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
 def tail_transcript(path: Path, limit: int = 40, window: int = 600_000) -> list[dict]:
     """The last `limit` readable events of a transcript: your prompts, Claude's words, its tool calls, results."""
     return read_tail(path, window)[0][-limit:]
+
+
+def _is_peer_send_tool(name: str | None) -> bool:
+    if not name:
+        return False
+    return name in PEER_SEND_TOOLS or any(name.endswith(f"__{t}") or name.endswith(f"_{t}") for t in PEER_SEND_TOOLS)
+
+
+def _peer_in_event(ts, parsed: dict) -> dict:
+    sender = parsed.get("from_name") or "peer"
+    ch = f"[{parsed['channel']}] " if parsed.get("channel") else ""
+    return dict(
+        ts=ts,
+        kind="peer_in",
+        from_name=sender,
+        channel=parsed.get("channel"),
+        text=prose(f"{sender}: {ch}{parsed.get('body') or ''}"),
+    )
+
+
+def _peer_out_event(ts, inp: dict) -> dict:
+    target = inp.get("to") or inp.get("recipient") or inp.get("target") or "peer"
+    ch = f" [{inp['channel']}]" if inp.get("channel") else ""
+    body = inp.get("message") or inp.get("text") or inp.get("content") or ""
+    return dict(
+        ts=ts,
+        kind="peer_out",
+        to_name=str(target),
+        channel=inp.get("channel"),
+        text=prose(f"{target}{ch}: {body}"),
+    )
 
 
 def read_tail(path: Path, window: int = 600_000, keep: int | None = None) -> tuple[list[dict], dict]:
@@ -189,42 +235,92 @@ def read_tail(path: Path, window: int = 600_000, keep: int | None = None) -> tup
             continue
         if not isinstance(rec, dict) or rec.get("isSidechain"):
             continue
-        kind, ts = rec.get("type"), rec.get("timestamp")
+        kind, ts = rec.get("type"), rec.get("timestamp") or rec.get("created_at")
+        # Native Antigravity transcript.jsonl records (USER_INPUT / PLANNER_RESPONSE)
+        if kind == "USER_INPUT":
+            raw_text = str(rec.get("content") or "")
+            parsed = uds.parse_cross_session(raw_text)
+            if parsed:
+                events.append(_peer_in_event(ts, parsed))
+            elif raw_text.strip() and not raw_text.startswith("<"):
+                events.append(dict(ts=ts, kind="you", text=prose(raw_text)))
+            continue
+        if kind == "PLANNER_RESPONSE":
+            meta["last_ts"] = ts or meta["last_ts"]
+            if rec.get("model"):
+                meta["model"] = rec["model"]
+            if str(rec.get("content") or "").strip():
+                events.append(dict(ts=ts, kind="gemini", text=prose(rec["content"])))
+            for tc in rec.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                tname = tc.get("name") or tc.get("tool_name") or "tool"
+                inp = tc.get("args") or tc.get("arguments") or {}
+                if isinstance(inp, dict) and _is_peer_send_tool(tname):
+                    events.append(_peer_out_event(ts, inp))
+                else:
+                    detail = ""
+                    if isinstance(inp, dict):
+                        detail = (inp.get("toolSummary") or inp.get("CommandLine") or inp.get("Path")
+                                  or inp.get("query") or inp.get("Prompt") or "")
+                    events.append(dict(ts=ts, kind="tool", text=short(f"{tname}: {detail}", 200)))
+            continue
         content = (rec.get("message") or {}).get("content")
+        speaker = "gemini" if rec.get("provider") == "gemini" else "claude"
         if kind == "assistant":
             model = (rec.get("message") or {}).get("model")
+            eff_rec = rec.get("effort")
             if model and model != "<synthetic>":
+                if speaker == "gemini":
+                    from almanac.gemini_host import split_agy_model_effort
+                    model, eff_rec = split_agy_model_effort(model, eff_rec)
                 meta["model"] = model
-            if rec.get("effort"):
-                meta["effort"] = rec["effort"]
+            if eff_rec:
+                meta["effort"] = eff_rec
             meta["last_ts"] = ts or meta["last_ts"]
         if kind == "user":
             if isinstance(content, str):
-                if not content.startswith("<"):           # skip harness wrappers like <command-name>
-                    events.append(dict(ts=ts, kind="you", text=short(content, 600)))
+                parsed = uds.parse_cross_session(content)
+                if parsed:
+                    events.append(_peer_in_event(ts, parsed))
+                elif not content.startswith("<"):         # skip harness wrappers like <command-name>
+                    events.append(dict(ts=ts, kind="you", text=prose(content)))
                 continue
             for block in content or []:
                 if not isinstance(block, dict):
                     continue
-                if block.get("type") == "text" and not str(block.get("text", "")).startswith("<"):
-                    events.append(dict(ts=ts, kind="you", text=short(block.get("text"), 600)))
+                if block.get("type") == "text":
+                    btext = str(block.get("text", ""))
+                    parsed = uds.parse_cross_session(btext)
+                    if parsed:
+                        events.append(_peer_in_event(ts, parsed))
+                    elif not btext.startswith("<"):
+                        events.append(dict(ts=ts, kind="you", text=prose(btext)))
                 elif block.get("type") == "tool_result":
                     body = block.get("content")
-                    text = body if isinstance(body, str) else " ".join(
+                    text = body if isinstance(body, str) else "\n".join(
                         b.get("text", "") for b in body or [] if isinstance(b, dict) and b.get("type") == "text")
-                    events.append(dict(ts=ts, kind="error" if block.get("is_error") else "result",
-                                       text=short(text, 160) or "(no text)"))
+                    failed = bool(block.get("is_error"))        # an error is read in full; a result is a glance
+                    events.append(dict(ts=ts, kind="error" if failed else "result",
+                                       text=(prose(text, 1200) if failed else short(text, 160)) or "(no text)"))
         elif kind == "assistant":
             for block in content or []:
                 if not isinstance(block, dict):
                     continue
                 if block.get("type") == "text" and block.get("text", "").strip():
-                    events.append(dict(ts=ts, kind="claude", text=short(block["text"], 900)))
+                    events.append(dict(ts=ts, kind=speaker, text=prose(block["text"])))
                 elif block.get("type") == "tool_use":
                     inp = block.get("input") or {}
-                    detail = (inp.get("description") or inp.get("command") or inp.get("file_path") or inp.get("pattern")
-                              or inp.get("url") or inp.get("prompt") or "")
-                    events.append(dict(ts=ts, kind="tool", text=short(f"{block.get('name')}: {detail}", 200)))
+                    tname = block.get("name")
+                    if _is_peer_send_tool(tname) and isinstance(inp, dict):
+                        events.append(_peer_out_event(ts, inp))
+                    elif tname == "call_mcp_tool" and isinstance(inp, dict) and _is_peer_send_tool(inp.get("ToolName")) and isinstance(inp.get("Arguments"), dict):
+                        events.append(_peer_out_event(ts, inp["Arguments"]))
+                    else:
+                        detail = (inp.get("description") or inp.get("command") or inp.get("CommandLine")
+                                  or inp.get("file_path") or inp.get("Path") or inp.get("pattern")
+                                  or inp.get("url") or inp.get("prompt") or inp.get("ToolName") or "")
+                        events.append(dict(ts=ts, kind="tool", text=short(f"{tname}: {detail}", 200)))
     return events[-(keep or TAIL_KEEP):], meta
 
 
@@ -234,8 +330,10 @@ TAIL_KEEP = 120
 class Fleet:
     """The scanner state: command lines and CPU samples cached between scans."""
 
-    def __init__(self, home: Path | None = None, *, table=process_table, facts=process_facts, lines=command_lines):
+    def __init__(self, home: Path | None = None, *, extra_projects: list[Path] | None = None,
+                 table=process_table, facts=process_facts, lines=command_lines):
         self.home = Path(home or Path.home() / ".claude")
+        self.extra_projects = [Path(p) for p in (extra_projects or [])]
         self.table, self.facts, self.lines = table, facts, lines
         self.cmd_cache: dict[tuple[int, int], str] = {}
         self.cpu_prev: dict[tuple[int, int], tuple[int, float]] = {}
@@ -250,9 +348,13 @@ class Fleet:
         hit = self.transcripts.get(session_id)
         if hit and hit.exists():
             return hit
-        for path in (self.home / "projects").glob(f"*/{session_id}.jsonl"):
-            self.transcripts[session_id] = path
-            return path
+        roots = [self.home / "projects", *self.extra_projects]
+        for root in roots:
+            if not root.is_dir():
+                continue
+            for path in root.glob(f"*/{session_id}.jsonl"):
+                self.transcripts[session_id] = path
+                return path
         return None
 
     def view(self, session_id: str) -> tuple[Path | None, list[dict], dict]:
@@ -277,7 +379,16 @@ class Fleet:
             now = time.time()
             table = self.table()
             names = {p["pid"]: p["exe"] for p in table}
-            mine = [p for p in table if p["exe"].lower() == "claude.exe"]
+            records = read_records(self.home)
+            self_pid = os.getpid()
+            mine = []
+            for p in table:
+                exe_low = p["exe"].lower()
+                rec = records.get(p["pid"])
+                if rec and rec.get("provider") == "almanac":
+                    continue
+                if exe_low in AGENT_EXES or (rec and p["pid"] != self_pid):
+                    mine.append(p)
             facts = {p["pid"]: self.facts(p["pid"]) for p in mine}
             alive = {(pid, f["created"]) for pid, f in facts.items() if f}
             new = sorted({pid for pid, created in alive if (pid, created) not in self.cmd_cache})
@@ -285,8 +396,8 @@ class Fleet:
                 if facts.get(pid):
                     self.cmd_cache[(pid, facts[pid]["created"])] = cmd
             self.cmd_cache = {k: v for k, v in self.cmd_cache.items() if k in alive}
-            records = read_records(self.home)
             procs = []
+            sessions_dir = self.home / "sessions"
             for p in mine:
                 f = facts.get(p["pid"])
                 if not f:
@@ -294,24 +405,52 @@ class Fleet:
                 key = (p["pid"], f["created"])
                 cmd = self.cmd_cache.get(key, "")
                 record = records.get(p["pid"])
-                role = classify(f["path"], cmd, record)
+                role = classify(f["path"], cmd, record, p["exe"])
+                if role == "hub":
+                    continue
                 prev = self.cpu_prev.get(key)
                 cpu = None
                 if prev and now > prev[1]:
                     cpu = round(max(0.0, (f["cpu"] - prev[0]) / 1e7 / (now - prev[1]) / CPUS * 100), 1)
                 self.cpu_prev[key] = (f["cpu"], now)
+                exe_low = p["exe"].lower()
+                default_provider = "gemini" if exe_low in ("agy.exe", "gemini.exe") else "claude"
                 row = dict(pid=p["pid"], ppid=p["ppid"], parent=names.get(p["ppid"], ""), role=role,
+                           provider=default_provider, agent_role=None, squad_id=None, pipe=None, has_uds=False,
                            started=round((f["created"] - 116444736000000000) / 1e7, 3), created=str(f["created"]),
                            cpu=cpu, mem_mb=round(f["mem"] / 1048576), cmd=short(cmd, 220), path=f["path"],
                            name=None, status=None, kind=None, cwd=None, session_id=None, version=None,
                            remote_url=None, updated=None, model=None, effort=None)
                 if record:
-                    row.update(name=record.get("name"), name_source=record.get("nameSource"), status=record.get("status"), kind=record.get("kind"),
-                               cwd=record.get("cwd"), session_id=record.get("sessionId"), version=record.get("version"),
-                               updated=(record.get("statusUpdatedAt") or record.get("updatedAt") or 0) / 1000 or None,
-                               remote_url=REMOTE.format(record["bridgeSessionId"]) if record.get("bridgeSessionId") else None)
+                    pipe = record.get("messagingSocketPath") or None
+                    has_key = bool(pipe and (sessions_dir / f"{p['pid']}.{uds.sha256_pipe(pipe)}.key").exists())
+                    tpath = record.get("transcriptPath")
+                    sid = record.get("sessionId")
+                    if sid and tpath:
+                        self.transcripts[sid] = Path(tpath)
+                    row.update(
+                        provider=record.get("provider") or default_provider,
+                        agent_role=record.get("roleName") or None,
+                        squad_id=record.get("squadId") or None,
+                        pipe=pipe,
+                        has_uds=has_key,
+                        name=record.get("name"),
+                        name_source=record.get("nameSource"),
+                        status=record.get("status"),
+                        kind=record.get("kind"),
+                        cwd=record.get("cwd"),
+                        session_id=sid,
+                        version=record.get("version"),
+                        updated=(record.get("statusUpdatedAt") or record.get("updatedAt") or 0) / 1000 or None,
+                        remote_url=REMOTE.format(record["bridgeSessionId"]) if record.get("bridgeSessionId") else None,
+                    )
                     _, _, meta = self.view(row["session_id"] or "")
-                    row.update(model=meta["model"], effort=meta["effort"])
+                    raw_m = meta["model"] or record.get("model")
+                    raw_e = meta["effort"] or record.get("effort")
+                    if row["provider"] == "gemini" and raw_m:
+                        from almanac.gemini_host import split_agy_model_effort
+                        raw_m, raw_e = split_agy_model_effort(raw_m, raw_e)
+                    row.update(model=raw_m, effort=raw_e)
                 row["can_send"] = role == "session"
                 row["can_kill"] = role in ("session", "headless", "desktop", "daemon", "pty-host", "mcp", "other")
                 procs.append(row)
@@ -327,11 +466,23 @@ class Fleet:
             order = {"session": 0, "headless": 1, "desktop": 2, "daemon": 3, "pty-host": 4, "mcp": 5, "other": 6, "desktop-helper": 7}
             procs.sort(key=lambda r: (order.get(r["role"], 9), -(r["updated"] or r["started"])))
             sessions = [r for r in procs if r["role"] == "session"]
-            summary = dict(sessions=len(sessions), busy=sum(r["status"] not in (None, "idle") for r in sessions),
-                           idle=sum(r["status"] == "idle" for r in sessions), processes=len(procs),
-                           headless=sum(r["role"] == "headless" for r in procs),
-                           daemon=any(r["role"] == "daemon" for r in procs), desktop=any(r["role"] == "desktop" for r in procs),
-                           cpu=round(sum(r["cpu"] or 0 for r in procs), 1), mem_mb=sum(r["mem_mb"] for r in procs))
+            claude_cnt = sum(r["provider"] == "claude" for r in sessions)
+            gemini_cnt = sum(r["provider"] == "gemini" for r in sessions)
+            summary = dict(
+                sessions=len(sessions),
+                claude_sessions=claude_cnt,
+                gemini_sessions=gemini_cnt,
+                providers=dict(claude=claude_cnt, gemini=gemini_cnt),
+                uds_peers=sum(bool(r.get("has_uds")) for r in sessions),
+                busy=sum(r["status"] not in (None, "idle") for r in sessions),
+                idle=sum(r["status"] == "idle" for r in sessions),
+                processes=len(procs),
+                headless=sum(r["role"] == "headless" for r in procs),
+                daemon=any(r["role"] == "daemon" for r in procs),
+                desktop=any(r["role"] == "desktop" for r in procs),
+                cpu=round(sum(r["cpu"] or 0 for r in procs), 1),
+                mem_mb=sum(r["mem_mb"] for r in procs),
+            )
             self.last = dict(at=now, processes=procs, summary=summary)
             return self.last
 
@@ -340,6 +491,20 @@ class Fleet:
         for row in self.snapshot()["processes"]:
             if row["pid"] == pid and row["created"] == str(created):
                 return row
+        return None
+
+    def resolve_session(self, target: str) -> dict | None:
+        """Find a live session row by name, session_id, or pid."""
+        if not target:
+            return None
+        needle = str(target).strip()
+        rows = [r for r in self.snapshot()["processes"] if r["role"] == "session"]
+        for r in rows:
+            if r.get("name") == needle:
+                return r
+        for r in rows:
+            if r.get("session_id") == needle or str(r["pid"]) == needle:
+                return r
         return None
 
     def kill(self, pid: int, created: str) -> tuple[bool, str, dict | None]:
@@ -352,12 +517,39 @@ class Fleet:
         text = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip().splitlines()
         return proc.returncode == 0, (text[-1] if text else f"taskkill exited {proc.returncode}"), row
 
-    def send(self, pid: int, created: str, text: str, python: str = sys.executable) -> tuple[bool, str, dict | None]:
+    def send(
+        self,
+        pid: int,
+        created: str,
+        text: str,
+        python: str = sys.executable,
+        *,
+        from_name: str = "operator",
+        from_pipe: str | None = None,
+        channel: str | None = None,
+        write_fn=None,
+    ) -> tuple[bool, str, dict | None]:
         row = self.find(pid, created)
         if row is None:
             return False, f"pid {pid} is gone or is now a different process; refresh", None
         if not row["can_send"]:
             return False, f"pid {pid} is a {row['role']}, not a session with a console", row
+        if row.get("has_uds"):
+            try:
+                uds.send_peer(
+                    self.home / "sessions",
+                    str(pid),
+                    text,
+                    from_name=from_name,
+                    from_pipe=from_pipe,
+                    channel=channel,
+                    alive_fn=lambda _: True,
+                    write_fn=write_fn,
+                )
+                return True, f"sent {len(text.strip())} chars via uds-messaging", row
+            except Exception as exc:
+                if row.get("provider") == "gemini":
+                    return False, f"uds-messaging delivery failed: {exc}", row
         ok, message = console.send(pid, text, python=python)
         return ok, message, row
 
@@ -367,4 +559,8 @@ class Fleet:
             return None
         with self.lock:
             path, events, meta = self.view(row.get("session_id") or "")
+        if not meta.get("model") and row.get("model"):
+            meta = dict(meta, model=row["model"])
+        if not meta.get("effort") and row.get("effort"):
+            meta = dict(meta, effort=row["effort"])
         return dict(process=row, transcript=str(path) if path else None, events=events[-limit:], meta=meta)

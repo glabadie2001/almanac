@@ -20,7 +20,7 @@ import time
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 PUBLIC = frozenset({"/ident", "/healthz"})
 COOKIE = "almanac_session"
@@ -62,6 +62,24 @@ def _sign(token: str, value: str) -> str:
     return hmac.new(token.encode(), value.encode(), hashlib.sha256).hexdigest()
 
 
+AGENT_PATHS = "/api/mesh"       # an agent token opens this route and everything under it, nothing else
+
+
+def agent_token(token: str, name: str) -> str:
+    """A spawned agent's own bearer: it names its holder and only opens AGENT_PATHS, so an agent cannot post as
+    someone else or reach /api/kill and /api/spawn. Derived from the door's secret, so nothing is stored."""
+    # ponytail: stops accidents, not an adversary: an agent runs as this user and can read <state>/token itself.
+    # Upgrade path: run agents under another account, or keep the secret out of their reach.
+    return f"agent.{name}.{_sign(token, 'agent:' + name)}"
+
+
+def agent_of(bearer: str, token: str) -> str | None:
+    """The agent name a bearer was minted for, or None. Names never contain a dot (`spawner.AGENT_NAME_RE`)."""
+    kind, _, rest = bearer.partition(".")
+    name, _, signature = rest.rpartition(".")
+    return name if kind == "agent" and name and _equal(signature, _sign(token, "agent:" + name)) else None
+
+
 def new_session(token: str) -> str:
     value = f"{int(time.time())}.{secrets.token_hex(12)}"
     return f"{value}.{_sign(token, value)}"
@@ -86,6 +104,7 @@ class JsonHandler(BaseHTTPRequestHandler):
     static_dir: Path | None = None
     log = logging.getLogger("almanac.web")
     _cache = None
+    agent: str | None = None        # set by the door when the request carries an agent token
 
     def log_message(self, *args):
         pass
@@ -172,6 +191,7 @@ def protect(handler_class, *, token: str, hosts=(), timeout: float = 60):
             for name in ("_almanac_body", "_almanac_length"):
                 if hasattr(self, name):
                     delattr(self, name)
+            self.agent = None               # a keep-alive connection must not carry one request's agent into the next
             try:
                 self._check()
             except Refused as exc:
@@ -200,13 +220,17 @@ def protect(handler_class, *, token: str, hosts=(), timeout: float = 60):
             port = self.server.server_port
             if not _host_ok(self.headers.get("Host"), port, hosts):
                 raise Refused(403, "unexpected Host")
-            path = urlsplit(self.path).path
+            path = unquote(urlsplit(self.path).path)   # the path the door routes on
             if path in PUBLIC:
                 return
             if path == "/login":
                 return                      # checks its own token
             bearer = (self.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
-            if not (_equal(bearer, token) or valid_session(self.headers.get("Cookie"), token)):
+            self.agent = agent_of(bearer, token)
+            if self.agent:
+                if path != AGENT_PATHS and not path.startswith(AGENT_PATHS + "/"):
+                    raise Refused(403, "an agent token only opens /api/mesh")
+            elif not (_equal(bearer, token) or valid_session(self.headers.get("Cookie"), token)):
                 raise Refused(401, "sign in: open the /login?token=... link Almanac printed at startup")
             origin = self.headers.get("Origin")
             if self.command not in ("GET", "HEAD") and origin is not None:

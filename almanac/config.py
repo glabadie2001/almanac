@@ -8,7 +8,8 @@ DEFAULTS = dict(
     port=8812,                              # 127.0.0.1:<port>
     transcripts="~/.claude/projects",       # Claude Code's transcript folder
     interval=300,                           # seconds between transcript reads (>= 30)
-    claude="~/.local/bin/claude.exe",       # the CLI that resumes chats and names them
+    claude="~/.local/bin/claude.exe",       # the CLI that spawns/resumes Claude chats and names them
+    gemini="~/.gemini/bin/agy.exe",         # the CLI that powers Gemini agents (`agy` or `gemini`)
     naming=True,                            # name ended chats with Haiku through `claude -p` (spends on your Claude login)
     naming_model="haiku",                   # any --model value the CLI accepts
     prices={},                              # {"claude-opus-5-5": 5.0}: USD per million input tokens, for resume estimates
@@ -33,6 +34,8 @@ def load(path):
     out["transcripts"] = str(Path(out["transcripts"]).expanduser())
     claude = Path(out["claude"]).expanduser()
     out["claude"] = str(claude) if claude.exists() else (shutil.which("claude") or str(claude))
+    gemini = Path(out["gemini"]).expanduser()
+    out["gemini"] = str(gemini) if gemini.exists() else (shutil.which("agy") or shutil.which("gemini") or str(gemini))
     if not all(isinstance(h, str) and h for h in out["hosts"]):
         raise ValueError("hosts is a list of host:port strings")
     if not all(isinstance(k, str) and isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0

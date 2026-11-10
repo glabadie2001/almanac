@@ -23,7 +23,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from almanac import classify
+from almanac import classify, uds
 
 SCHEMA = """
 create table if not exists files (path text primary key, size integer, mtime_ns integer, offset integer);
@@ -41,8 +41,158 @@ create index if not exists usage_ts on usage(ts);
 create table if not exists meta (key text primary key, value text);
 create table if not exists actions (id integer primary key autoincrement, ts real, action text, pid integer,
                                     session text, name text, ok integer, detail text, who text);
+create table if not exists messages (
+    id integer primary key autoincrement,
+    msg_id text unique,
+    ts real not null,
+    from_name text not null,
+    from_session text,
+    from_provider text,
+    to_name text not null,
+    to_session text,
+    to_provider text,
+    channel text,
+    squad_id text,
+    body text not null,
+    transport text default 'uds'
+);
+create index if not exists messages_ts on messages(ts);
+create index if not exists messages_peers on messages(from_name, to_name);
+create table if not exists roles (
+    id text primary key,
+    title text not null,
+    provider text not null,
+    model text,
+    effort text,
+    workspace_mode text default 'shared',
+    permission_mode text default 'auto',
+    system_prompt text not null,
+    channels text default '[]',
+    updated_ts real
+);
+create table if not exists squads (
+    id text primary key,
+    name text not null,
+    cwd text not null,
+    brief text,
+    created_ts real not null,
+    status text default 'active'
+);
 """
-SHELL = ("Bash", "PowerShell")
+# One row per spawn. Keyed by session: squads reuse handles like `impl-claude`, and a later squad must not erase
+# an earlier squad's roster. Lookups by name take the newest row.
+SPAWNED_TABLE = """
+create table if not exists spawned_agents (
+    session_id text primary key not null,
+    agent_name text not null,
+    squad_id text,
+    role_id text,
+    provider text not null,
+    model text,
+    effort text,
+    cwd text not null,
+    worktree_path text,
+    pid integer,
+    created_ts real not null,
+    channels text
+);
+"""
+SPAWNED_COLUMNS = "session_id, agent_name, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, created_ts, channels"
+SHELL = ("Bash", "PowerShell", "run_command")
+DUPLICATE_WINDOW = 900      # seconds: a transcript copy of a message the hub journaled this recently is the same message
+
+ARCHITECT = (
+    "You are the Lead Architect: you plan and review, you do not write code. Break the mission into stages and "
+    "slices, give each slice a named owner and the files it may touch, and review what comes back. Read teammates' "
+    "live context (`mesh_context_stream`) before unblocking anyone and coordinate handoffs over `mesh_send`. "
+    "You must NOT edit or create project files: hand every code change to an implementer. If no implementer is "
+    "live, tell the operator (`mesh_send(to=\"operator\")`) instead of doing it yourself."
+)
+IMPLEMENTER = (
+    "You are a Software Implementer, the only role that edits code. Own your assigned slice end to end with tests, "
+    "and stay inside the files you were given; ask the architect before touching anything else. Check peer context "
+    "and contact streams (`mesh_context_stream`, `mesh_contact_stream`) to stay aligned on shared interfaces. When "
+    "a slice is done, report to the architect and reviewer over `mesh_send`: files touched, the test command and "
+    "its result, and anything you could not do."
+)
+REVIEWER = (
+    "You are the Cross-Model Peer Reviewer: you do not edit code. Read the implementer's diff and live context "
+    "(`mesh_context_stream`), run the tests yourself, and probe edge cases. Send findings (file:line, what breaks, "
+    "how to reproduce) to the implementer, and sign-off or the open findings to the architect, over `mesh_send`."
+)
+# the briefs as first shipped; a stored role still equal to one of these is upgraded once (schema v4)
+OLD_ARCHITECT = "You are the Lead Architect. Break down missions into clear stages and contracts, inspect teammates' live context streams (`mesh_context_stream`) before unblocking dependencies, and coordinate handoffs over `mesh_send`."
+OLD_IMPLEMENTER = 'You are a Software Implementer. Own your assigned slice end-to-end with tests, check peer context and contact streams (`mesh_context_stream`, `mesh_contact_stream`) to stay aligned on shared interfaces, and report wave completion to the architect/reviewer via `mesh_send`.'
+OLD_REVIEWER = "You are the Cross-Model Peer Reviewer. Watch implementers' context streams (`mesh_context_stream`), verify diffs, edge cases, and test results when notified, and send actionable sign-off or findings back over `mesh_send`."
+
+DEFAULT_ROLES = (
+    dict(
+        id="architect-gemini",
+        title="System Architect (Gemini)",
+        provider="gemini",
+        model="",
+        effort="high",
+        workspace_mode="shared",
+        permission_mode="auto",
+        channels=["#squad", "#architecture"],
+        system_prompt=ARCHITECT,
+    ),
+    dict(
+        id="architect-claude",
+        title="System Architect (Claude)",
+        provider="claude",
+        model="opus",
+        effort="high",
+        workspace_mode="shared",
+        permission_mode="auto",
+        channels=["#squad", "#architecture"],
+        system_prompt=ARCHITECT,
+    ),
+    dict(
+        id="implementer-claude",
+        title="Implementer (Claude)",
+        provider="claude",
+        model="sonnet",
+        effort="high",
+        workspace_mode="worktree",
+        permission_mode="auto",
+        channels=["#squad", "#impl"],
+        system_prompt=IMPLEMENTER,
+    ),
+    dict(
+        id="implementer-gemini",
+        title="Implementer (Gemini)",
+        provider="gemini",
+        model="",
+        effort="high",
+        workspace_mode="worktree",
+        permission_mode="auto",
+        channels=["#squad", "#impl"],
+        system_prompt=IMPLEMENTER,
+    ),
+    dict(
+        id="reviewer-gemini",
+        title="Peer Reviewer (Gemini)",
+        provider="gemini",
+        model="",
+        effort="high",
+        workspace_mode="shared",
+        permission_mode="auto",
+        channels=["#squad", "#review"],
+        system_prompt=REVIEWER,
+    ),
+    dict(
+        id="reviewer-claude",
+        title="Peer Reviewer (Claude)",
+        provider="claude",
+        model="opus",
+        effort="high",
+        workspace_mode="shared",
+        permission_mode="auto",
+        channels=["#squad", "#review"],
+        system_prompt=REVIEWER,
+    ),
+)
 
 
 def parse_ts(value) -> float | None:
@@ -80,11 +230,16 @@ class Store:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
+        self.msg_cond = threading.Condition()
         self.db = sqlite3.connect(str(self.path), check_same_thread=False)
-        self.db.executescript(SCHEMA)
+        self.db.executescript(SCHEMA + SPAWNED_TABLE)
         self.db.execute("pragma journal_mode=wal")
         self.last_ingest: dict = {}
-        self._migrate()
+        try:
+            self._migrate()
+        except BaseException:
+            self.db.close()                 # a failed start must not keep the database file locked
+            raise
 
     def _migrate(self):
         """v2 (2026-11-08): sessions learn title, cwd, last model and context size. Existing rows only get them
@@ -93,21 +248,83 @@ class Store:
         have = {r[1] for r in self.db.execute("pragma table_info(sessions)")}
         for column, kind in (("title", "text"), ("first_prompt", "text"), ("cwd", "text"), ("model", "text"),
                              ("context", "integer"), ("messages", "integer default 0"), ("custom_title", "text"),
-                             ("name", "text"), ("name_usd", "real"), ("named_at", "real"), ("name_error", "text")):
+                             ("name", "text"), ("name_usd", "real"), ("named_at", "real"), ("name_error", "text"),
+                             ("provider", "text default 'claude'")):
             if column not in have:
                 self.db.execute(f"alter table sessions add column {column} {kind}")
+        self._rekey_spawned()
+        self.db.execute("create index if not exists spawned_agents_name on spawned_agents(agent_name, created_ts)")
         row = self.db.execute("select value from meta where key = 'schema'").fetchone()
-        if not row or int(row[0]) < 3:       # v3: custom titles (the user's /rename, or ours) are read too
+        version = int(row[0]) if row else 0
+        if version < 3:                      # v3: custom titles (the user's /rename, or ours) are read too
             self.db.execute("delete from files")
-            self.db.execute("insert or replace into meta values ('schema', '3')")
+        if version < 4:
+            # v4: messages read back out of a recipient's transcript name the recipient and its squad (older rows
+            # carry the first 8 characters of its session id), and the ones the hub had already journaled go.
+            self.db.execute(
+                "update messages set "
+                "to_name = (select agent_name from spawned_agents where session_id = messages.to_session), "
+                "squad_id = (select squad_id from spawned_agents where session_id = messages.to_session) "
+                "where transport = 'uds-transcript' and squad_id is null "
+                "and to_session in (select session_id from spawned_agents)")
+            self.db.execute(
+                "delete from messages where transport = 'uds-transcript' and exists ("
+                "select 1 from messages d where d.transport != 'uds-transcript' and d.from_name = messages.from_name "
+                "and d.body = messages.body and d.ts between messages.ts - ? and messages.ts + ? "
+                "and (d.to_session = messages.to_session or d.to_name = messages.to_name "
+                "or (d.transport = 'uds-broadcast' and d.squad_id is messages.squad_id)))",
+                (DUPLICATE_WINDOW, DUPLICATE_WINDOW))
+            # role briefs that still read as shipped get the ones that say what each role must not do
+            for old, role_ids in ((OLD_ARCHITECT, ("architect-gemini", "architect-claude")),
+                                  (OLD_IMPLEMENTER, ("implementer-claude", "implementer-gemini")),
+                                  (OLD_REVIEWER, ("reviewer-gemini", "reviewer-claude"))):
+                for rid in role_ids:
+                    new = next(r["system_prompt"] for r in DEFAULT_ROLES if r["id"] == rid)
+                    self.db.execute("update roles set system_prompt = ?, updated_ts = ? where id = ? and system_prompt = ?",
+                                    (new, time.time(), rid, old))
+        self.db.execute("insert or replace into meta values ('schema', '4')")
+        if self.db.execute("select count(*) from roles").fetchone()[0] == 0:
+            now = time.time()
+            for r in DEFAULT_ROLES:
+                self.db.execute(
+                    "insert into roles (id, title, provider, model, effort, workspace_mode, permission_mode, system_prompt, channels, updated_ts) "
+                    "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (r["id"], r["title"], r["provider"], r["model"], r["effort"], r["workspace_mode"],
+                     r["permission_mode"], r["system_prompt"], json.dumps(r["channels"]), now),
+                )
         self.db.commit()
+
+    def _rekey_spawned(self):
+        """Spawns were keyed by agent name before 2026-11-10; key them by session. Rename, create, copy and drop
+        are one transaction, so a crash leaves the old table as it was. A rebuild that an earlier build left
+        half done (rows stranded in spawned_agents_by_name) is finished here."""
+        keyed_by_name = bool({r[1]: r[5] for r in self.db.execute("pragma table_info(spawned_agents)")}.get("agent_name"))
+        stranded = self.db.execute("select 1 from sqlite_master where name = 'spawned_agents_by_name'").fetchone()
+        if not keyed_by_name and not stranded:
+            return
+        self.db.commit()
+        try:
+            self.db.execute("begin")
+            if keyed_by_name:
+                self.db.execute("alter table spawned_agents rename to spawned_agents_by_name")
+                self.db.execute(SPAWNED_TABLE)
+            old = {r[1] for r in self.db.execute("pragma table_info(spawned_agents_by_name)")}
+            self.db.execute(
+                f"insert or ignore into spawned_agents ({SPAWNED_COLUMNS}) select coalesce(session_id, 'legacy:' || agent_name), "
+                "agent_name, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, created_ts, "
+                f"{'channels' if 'channels' in old else 'null'} from spawned_agents_by_name")
+            self.db.execute("drop table spawned_agents_by_name")
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
 
     def close(self):
         self.db.close()
 
     # ------------------------------------------------------------------ ingest
 
-    def ingest(self, root: Path) -> dict:
+    def ingest(self, root: Path, *, provider: str = "claude") -> dict:
         """Read every transcript under `root` from where the last pass stopped. Returns what changed."""
         started = time.monotonic()
         root = Path(root).expanduser()
@@ -129,7 +346,7 @@ class Store:
                     continue
                 if st.st_size < offset:
                     offset = 0          # rewritten or truncated: read it again; keys keep this idempotent
-                new_offset = self._read_file(path, root, offset, stats)
+                new_offset = self._read_file(path, root, offset, stats, provider=provider)
                 self.db.execute("insert or replace into files values (?, ?, ?, ?)", (key, st.st_size, st.st_mtime_ns, new_offset))
                 stats["read"] += 1
             self.db.commit()
@@ -138,7 +355,7 @@ class Store:
         self.db.commit()
         return self.last_ingest
 
-    def _read_file(self, path: Path, root: Path, offset: int, stats: dict) -> int:
+    def _read_file(self, path: Path, root: Path, offset: int, stats: dict, *, provider: str = "claude") -> int:
         project = path.relative_to(root).parts[0]
         with path.open("rb") as fh:
             fh.seek(offset)
@@ -153,20 +370,22 @@ class Store:
             except ValueError:
                 continue
             if isinstance(rec, dict):
-                self._record(rec, project, stats)
+                self._record(rec, project, stats, default_provider=provider)
         return offset + end + 1
 
-    def _record(self, rec: dict, project: str, stats: dict):
+    def _record(self, rec: dict, project: str, stats: dict, *, default_provider: str = "claude"):
         kind = rec.get("type")
         session = rec.get("sessionId") or ""
+        prov = rec.get("provider") or default_provider
         if kind == "custom-title" and session and rec.get("customTitle"):
-            self.db.execute("insert into sessions (id, project, custom_title) values (?, ?, ?) "
+            self.db.execute("insert into sessions (id, project, custom_title, provider) values (?, ?, ?, ?) "
                             "on conflict(id) do update set custom_title = excluded.custom_title",
-                            (session, project, str(rec["customTitle"])[:200]))
+                            (session, project, str(rec["customTitle"])[:200], prov))
             return
         if kind == "ai-title" and session and rec.get("aiTitle"):
-            self.db.execute("insert into sessions (id, project, title) values (?, ?, ?) "
-                            "on conflict(id) do update set title = excluded.title", (session, project, str(rec["aiTitle"])[:200]))
+            self.db.execute("insert into sessions (id, project, title, provider) values (?, ?, ?, ?) "
+                            "on conflict(id) do update set title = excluded.title",
+                            (session, project, str(rec["aiTitle"])[:200], prov))
             return
         if kind not in ("assistant", "user"):
             return
@@ -175,19 +394,41 @@ class Store:
         main = not rec.get("isSidechain")
         if session and ts:
             self.db.execute(
-                "insert into sessions (id, project, first_ts, last_ts, sidechain, version, cwd) values (?, ?, ?, ?, ?, ?, ?) "
+                "insert into sessions (id, project, first_ts, last_ts, sidechain, version, cwd, provider) values (?, ?, ?, ?, ?, ?, ?, ?) "
                 "on conflict(id) do update set first_ts = min(coalesce(first_ts, excluded.first_ts), excluded.first_ts), "
                 "last_ts = max(coalesce(last_ts, excluded.last_ts), excluded.last_ts), version = coalesce(excluded.version, version), "
-                "cwd = coalesce(excluded.cwd, cwd)",
-                (session, project, ts, ts, int(not main), rec.get("version"), rec.get("cwd") if main else None))
+                "cwd = coalesce(excluded.cwd, cwd), provider = coalesce(excluded.provider, provider)",
+                (session, project, ts, ts, int(not main), rec.get("version"), rec.get("cwd") if main else None, prov))
         msg = rec.get("message") or {}
         content = msg.get("content")
         if main and session and kind == "user":
             text = content if isinstance(content, str) else next(
                 (b.get("text") for b in content or [] if isinstance(b, dict) and b.get("type") == "text"), None)
-            if text and not str(text).startswith("<"):
-                self.db.execute("update sessions set first_prompt = coalesce(first_prompt, ?) where id = ?",
-                                (" ".join(str(text).split())[:200], session))
+            if text:
+                parsed_peer = uds.parse_cross_session(str(text))
+                if parsed_peer:
+                    sender, body, stamp = parsed_peer.get("from_name") or "peer", parsed_peer.get("body") or "", ts or time.time()
+                    det_id = "tx:" + hashlib.sha1(
+                        f"{session}|{ts_raw or ''}|{parsed_peer.get('from_name') or ''}|{body}".encode("utf-8", "replace")
+                    ).hexdigest()[:24]
+                    # A message sent through the hub is journaled when sent; its copy in the recipient's transcript
+                    # is the same message, not a second one. Only what bypassed the hub (native SendMessage) is new.
+                    to = self.db.execute("select agent_name, squad_id from spawned_agents where session_id = ?",
+                                         (session,)).fetchone() or (session[:8], None)
+                    journaled = self.db.execute(
+                        "select 1 from messages where transport != 'uds-transcript' and from_name = ? and body = ? "
+                        "and ts between ? and ? and (to_session = ? or to_name = ? "
+                        "or (transport = 'uds-broadcast' and squad_id is ?)) limit 1",
+                        (sender, body, stamp - DUPLICATE_WINDOW, stamp + DUPLICATE_WINDOW, session, to[0], to[1])).fetchone()
+                    if not journaled:
+                        self.db.execute(
+                            "insert or ignore into messages (msg_id, ts, from_name, to_name, to_session, to_provider, channel, squad_id, body, transport) "
+                            "values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'uds-transcript')",
+                            (det_id, stamp, sender, to[0], session, prov, parsed_peer.get("channel"), to[1], body),
+                        )
+                elif not str(text).startswith("<"):
+                    self.db.execute("update sessions set first_prompt = coalesce(first_prompt, ?) where id = ?",
+                                    (" ".join(str(text).split())[:200], session))
         if kind == "assistant":
             usage = msg.get("usage")
             if main and session and usage and msg.get("model") not in (None, "<synthetic>"):
@@ -308,7 +549,7 @@ class Store:
         with self.lock:
             rows = self.db.execute(
                 "select s.id, s.project, s.title, s.first_prompt, s.cwd, s.model, s.context, s.first_ts, s.last_ts, s.version, "
-                "count(u.message_id), coalesce(sum(u.output), 0), s.custom_title, s.name, s.name_error "
+                "count(u.message_id), coalesce(sum(u.output), 0), s.custom_title, s.name, s.name_error, coalesce(s.provider, 'claude') "
                 "from sessions s left join usage u on u.session = s.id "
                 "where s.id not like 'legacy:%' and s.first_ts is not null and s.cwd is not null "
                 "and (coalesce(s.title, '') like ? or coalesce(s.first_prompt, '') like ? or coalesce(s.cwd, '') like ? or s.id like ? "
@@ -322,7 +563,7 @@ class Store:
                 source = "haiku"             # the custom title is the one we wrote back
             out.append(dict(id=r[0], project=r[1], title=title, title_source=source, auto_title=r[2], first_prompt=r[3],
                             cwd=r[4], model=r[5], context=r[6] or 0, first=r[7], last=r[8], version=r[9], replies=r[10],
-                            output=r[11], custom_title=r[12], name=r[13], name_error=r[14]))
+                            output=r[11], custom_title=r[12], name=r[13], name_error=r[14], provider=r[15]))
         return out
 
     def titles(self, ids: list[str]) -> dict[str, str]:
@@ -362,6 +603,390 @@ class Store:
             chars = self.db.execute("select avg(out_chars) from calls where ts >= ? and out_chars is not null",
                                     (since,)).fetchone()[0]
         return dict(calls=calls or 0, sessions=sessions or 0, kb_per_call=round((chars or 0) / 1000, 2))
+
+    # ------------------------------------------------------------------ mesh: contact stream, roles, squads
+
+    def record_message(
+        self,
+        *,
+        from_name: str,
+        to_name: str,
+        body: str,
+        msg_id: str | None = None,
+        ts: float | None = None,
+        from_session: str | None = None,
+        from_provider: str | None = None,
+        to_session: str | None = None,
+        to_provider: str | None = None,
+        channel: str | None = None,
+        squad_id: str | None = None,
+        transport: str = "uds",
+    ) -> dict:
+        mid = msg_id or f"m:{hashlib.sha1(f'{time.time_ns()}|{from_name}|{to_name}'.encode()).hexdigest()[:20]}"
+        stamp = ts if ts is not None else time.time()
+        with self.lock:
+            cur = self.db.execute(
+                "insert or ignore into messages "
+                "(msg_id, ts, from_name, from_session, from_provider, to_name, to_session, to_provider, channel, squad_id, body, transport) "
+                "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (mid, stamp, from_name, from_session, from_provider, to_name, to_session, to_provider, channel, squad_id, body, transport),
+            )
+            self.db.commit()
+            row_id = cur.lastrowid if cur.rowcount else (
+                self.db.execute("select id from messages where msg_id = ?", (mid,)).fetchone() or (0,)
+            )[0]
+        entry = dict(
+            id=row_id,
+            msg_id=mid,
+            ts=stamp,
+            from_name=from_name,
+            from_session=from_session,
+            from_provider=from_provider,
+            to_name=to_name,
+            to_session=to_session,
+            to_provider=to_provider,
+            channel=channel,
+            squad_id=squad_id,
+            body=body,
+            transport=transport,
+        )
+        with self.msg_cond:
+            self.msg_cond.notify_all()
+        return entry
+
+    def messages(
+        self,
+        *,
+        peer: str | None = None,
+        channel: str | None = None,
+        squad_id: str | None = None,
+        since_id: int = 0,
+        limit: int = 100,
+    ) -> list[dict]:
+        clauses = ["id > ?"]
+        params: list = [max(0, int(since_id))]
+        if peer:
+            clauses.append("(from_name = ? or to_name = ? or from_session = ? or to_session = ? or to_name in ('@all', '@squad'))")
+            params.extend([peer, peer, peer, peer])
+        if channel:
+            clauses.append("channel = ?")
+            params.append(channel)
+        if squad_id:
+            clauses.append("squad_id = ?")
+            params.append(squad_id)
+        lim = max(1, min(500, int(limit)))
+        order = "asc" if since_id > 0 else "desc"
+        sql = (
+            "select id, msg_id, ts, from_name, from_session, from_provider, to_name, to_session, to_provider, "
+            f"channel, squad_id, body, transport from messages where {' and '.join(clauses)} order by id {order} limit ?"
+        )
+        params.append(lim)
+        with self.lock:
+            rows = self.db.execute(sql, params).fetchall()
+        if order == "desc":
+            rows = list(reversed(rows))
+        return [
+            dict(
+                id=r[0],
+                msg_id=r[1],
+                ts=r[2],
+                from_name=r[3],
+                from_session=r[4],
+                from_provider=r[5],
+                to_name=r[6],
+                to_session=r[7],
+                to_provider=r[8],
+                channel=r[9],
+                squad_id=r[10],
+                body=r[11],
+                transport=r[12],
+            )
+            for r in rows
+        ]
+
+    def latest_message_id(self) -> int:
+        with self.lock:
+            row = self.db.execute("select coalesce(max(id), 0) from messages").fetchone()
+        return int(row[0] or 0)
+
+    def wait_messages(
+        self,
+        *,
+        peer: str | None = None,
+        channel: str | None = None,
+        squad_id: str | None = None,
+        since_id: int = 0,
+        timeout: float = 30.0,
+        stop_event: threading.Event | None = None,
+    ) -> list[dict]:
+        deadline = time.monotonic() + max(0.0, min(600.0, float(timeout)))
+        while True:
+            found = self.messages(peer=peer, channel=channel, squad_id=squad_id, since_id=since_id, limit=100)
+            # When waiting as a specific peer, exclude messages sent BY that peer itself
+            if peer:
+                found = [m for m in found if m["from_name"] != peer and m["from_session"] != peer]
+            if found:
+                return found
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or (stop_event is not None and stop_event.is_set()):
+                return []
+            with self.msg_cond:
+                self.msg_cond.wait(timeout=min(remaining, 1.0))
+
+    def roles(self) -> list[dict]:
+        with self.lock:
+            rows = self.db.execute(
+                "select id, title, provider, model, effort, workspace_mode, permission_mode, system_prompt, channels, updated_ts "
+                "from roles order by id"
+            ).fetchall()
+        out = []
+        for r in rows:
+            try:
+                ch = json.loads(r[8] or "[]")
+            except ValueError:
+                ch = []
+            out.append(
+                dict(
+                    id=r[0],
+                    title=r[1],
+                    provider=r[2],
+                    model=r[3] or "",
+                    effort=r[4] or "",
+                    workspace_mode=r[5] or "shared",
+                    permission_mode=r[6] or "auto",
+                    system_prompt=r[7] or "",
+                    channels=ch if isinstance(ch, list) else [],
+                    updated_ts=r[9],
+                )
+            )
+        return out
+
+    def role(self, role_id: str) -> dict | None:
+        return next((r for r in self.roles() if r["id"] == role_id), None)
+
+    def upsert_role(self, doc: dict) -> dict:
+        import re as _re
+        rid = str(doc.get("id") or "").strip().lower()
+        if not _re.match(r"^[a-z0-9][a-z0-9_-]{0,62}$", rid):
+            raise ValueError("role id must be 1..63 lowercase letters, digits, '-' or '_'")
+        provider = str(doc.get("provider") or "claude").strip().lower()
+        if provider not in ("claude", "gemini"):
+            raise ValueError("provider must be 'claude' or 'gemini'")
+        wmode = str(doc.get("workspace_mode") or "shared").strip().lower()
+        if wmode == "inherit":
+            wmode = "shared"
+        if wmode not in ("shared", "worktree"):
+            raise ValueError("workspace_mode must be 'shared' or 'worktree'")
+        pmode = str(doc.get("permission_mode") or "auto").strip()
+        if pmode not in ("plan", "accept-edits", "auto", "bypass", "manual"):
+            raise ValueError("permission_mode must be plan, accept-edits, auto, bypass, or manual")
+        title = str(doc.get("title") or rid).strip()[:120]
+        prompt = str(doc.get("system_prompt") or "").strip()
+        if not prompt:
+            raise ValueError("system_prompt is required")
+        model_raw = str(doc.get("model") or "").strip()[:120]
+        effort_raw = str(doc.get("effort") or "").strip()[:20]
+        from almanac.spawner import split_model_effort
+        norm_m, norm_e = split_model_effort(provider, model_raw or None, effort_raw or None)
+        model = (norm_m or model_raw)[:120]
+        effort = (norm_e or effort_raw)[:20]
+        raw_channels = doc.get("channels") or []
+        if isinstance(raw_channels, str):
+            raw_channels = [c.strip() for c in raw_channels.split(",") if c.strip()]
+        channels = [str(c).strip() for c in raw_channels if str(c).strip()][:20]
+        now = time.time()
+        with self.lock:
+            self.db.execute(
+                "insert into roles (id, title, provider, model, effort, workspace_mode, permission_mode, system_prompt, channels, updated_ts) "
+                "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "on conflict(id) do update set title=excluded.title, provider=excluded.provider, model=excluded.model, "
+                "effort=excluded.effort, workspace_mode=excluded.workspace_mode, permission_mode=excluded.permission_mode, "
+                "system_prompt=excluded.system_prompt, channels=excluded.channels, updated_ts=excluded.updated_ts",
+                (rid, title, provider, model, effort, wmode, pmode, prompt, json.dumps(channels), now),
+            )
+            self.db.commit()
+        return self.role(rid)
+
+    def delete_role(self, role_id: str) -> bool:
+        with self.lock:
+            cur = self.db.execute("delete from roles where id = ?", (role_id,))
+            self.db.commit()
+        return cur.rowcount > 0
+
+    def create_squad(self, squad_id: str, name: str, cwd: str, brief: str = "") -> dict:
+        now = time.time()
+        with self.lock:
+            self.db.execute(
+                "insert or replace into squads (id, name, cwd, brief, created_ts, status) values (?, ?, ?, ?, ?, 'active')",
+                (squad_id, name, cwd, brief, now),
+            )
+            self.db.commit()
+        return dict(id=squad_id, name=name, cwd=cwd, brief=brief, created_ts=now, status="active")
+
+    def squads(self, limit: int = 50) -> list[dict]:
+        with self.lock:
+            rows = self.db.execute(
+                "select id, name, cwd, brief, created_ts, status from squads order by created_ts desc limit ?",
+                (max(1, min(200, int(limit))),),
+            ).fetchall()
+            agents_rows = self.db.execute(
+                "select agent_name, session_id, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, created_ts "
+                "from spawned_agents order by created_ts asc"
+            ).fetchall()
+        by_squad: dict[str, list[dict]] = {}
+        for a in agents_rows:
+            if a[2]:
+                by_squad.setdefault(a[2], []).append(
+                    dict(
+                        agent_name=a[0],
+                        session_id=a[1],
+                        squad_id=a[2],
+                        role_id=a[3],
+                        provider=a[4],
+                        model=a[5],
+                        effort=a[6],
+                        cwd=a[7],
+                        worktree_path=a[8],
+                        pid=a[9],
+                        created_ts=a[10],
+                    )
+                )
+        return [
+            dict(
+                id=r[0],
+                name=r[1],
+                cwd=r[2],
+                brief=r[3],
+                created_ts=r[4],
+                status=r[5],
+                agents=by_squad.get(r[0], []),
+            )
+            for r in rows
+        ]
+
+    def record_spawn(
+        self,
+        *,
+        agent_name: str,
+        session_id: str | None,
+        squad_id: str | None,
+        role_id: str | None,
+        provider: str,
+        model: str | None,
+        effort: str | None,
+        cwd: str,
+        worktree_path: str | None,
+        pid: int,
+        channels: list[str] | None = None,
+    ) -> dict:
+        if not session_id:
+            raise ValueError("a spawn record needs its session id")
+        now = time.time()
+        with self.lock:
+            self.db.execute(
+                "insert or replace into spawned_agents "
+                "(agent_name, session_id, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, created_ts, channels) "
+                "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (agent_name, session_id, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, now,
+                 json.dumps(list(channels or []))),
+            )
+            self.db.commit()
+        return dict(
+            agent_name=agent_name,
+            session_id=session_id,
+            squad_id=squad_id,
+            role_id=role_id,
+            provider=provider,
+            model=model,
+            effort=effort,
+            cwd=cwd,
+            worktree_path=worktree_path,
+            pid=pid,
+            created_ts=now,
+        )
+
+    def update_spawn_model(
+        self,
+        *,
+        session_id: str | None = None,
+        agent_name: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+    ) -> None:
+        with self.lock:
+            if session_id:
+                self.db.execute(
+                    "update spawned_agents set model = coalesce(?, model), effort = coalesce(?, effort) where session_id = ?",
+                    (model, effort, session_id),
+                )
+                self.db.execute("update sessions set model = coalesce(?, model) where id = ?", (model, session_id))
+            if agent_name:
+                self.db.execute(
+                    "update spawned_agents set model = coalesce(?, model), effort = coalesce(?, effort) where session_id = "
+                    "(select session_id from spawned_agents where agent_name = ? order by created_ts desc limit 1)",
+                    (model, effort, agent_name),
+                )
+            self.db.commit()
+
+    def known_models(self) -> dict[str, list[str]]:
+        by_prov: dict[str, list[str]] = {"claude": [], "gemini": []}
+        with self.lock:
+            rows = (
+                self.db.execute("select coalesce(provider, 'claude'), model from sessions where model is not null and model != ''").fetchall()
+                + self.db.execute(
+                    "select coalesce(s.provider, 'claude'), u.model "
+                    "from usage u left join sessions s on s.id = u.session "
+                    "where u.model is not null and u.model != ''"
+                ).fetchall()
+                + self.db.execute("select provider, model from roles where model is not null and model != ''").fetchall()
+                + self.db.execute("select provider, model from spawned_agents where model is not null and model != ''").fetchall()
+            )
+        for prov, m in rows:
+            key = "gemini" if str(prov).lower() == "gemini" else "claude"
+            ms = str(m).strip()
+            if ms and ms != "<synthetic>" and ms not in by_prov[key]:
+                by_prov[key].append(ms)
+        return by_prov
+
+    def spawned(self, squad_id: str | None = None, limit: int = 100) -> list[dict]:
+        with self.lock:
+            if squad_id:
+                rows = self.db.execute(
+                    "select agent_name, session_id, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, created_ts, channels "
+                    "from spawned_agents where squad_id = ? order by created_ts desc limit ?",
+                    (squad_id, limit),
+                ).fetchall()
+            else:
+                rows = self.db.execute(
+                    "select agent_name, session_id, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, created_ts, channels "
+                    "from spawned_agents order by created_ts desc limit ?",
+                    (limit,),
+                ).fetchall()
+        return [
+            dict(
+                agent_name=a[0],
+                session_id=a[1],
+                squad_id=a[2],
+                role_id=a[3],
+                provider=a[4],
+                model=a[5],
+                effort=a[6],
+                cwd=a[7],
+                worktree_path=a[8],
+                pid=a[9],
+                created_ts=a[10],
+                channels=_json_list(a[11]),
+            )
+            for a in rows
+        ]
+
+
+def _json_list(raw) -> list:
+    try:
+        value = json.loads(raw or "[]")
+    except ValueError:
+        return []
+    return value if isinstance(value, list) else []
 
 
 # ---------------------------------------------------------------------- report pieces (plain functions, testable)

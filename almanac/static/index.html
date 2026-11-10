@@ -13,74 +13,313 @@
 <main id="app">
   <header class="bar">
     <span class="brand">ALMANAC<span class="dim">//</span>MISSION-CONTROL</span>
+    <span id="mesh-pill" class="dim">claude + gemini // uds</span>
     <span class="grow"></span>
     <span id="link" class="link">● LINK</span>
     <span id="clock" class="dim">--:--:--</span>
   </header>
   <nav class="tabs" role="tablist" aria-label="Views">
-    <button role="tab" data-tab="fleet" aria-selected="true">[1] FLEET</button>
-    <button role="tab" data-tab="gallery">[2] GALLERY</button>
-    <button role="tab" data-tab="chats">[3] CHATS</button>
-    <button role="tab" data-tab="telemetry">[4] TELEMETRY</button>
-    <button role="tab" data-tab="log">[5] LOG</button>
+    <button type="button" id="tab-fleet" role="tab" data-tab="fleet" aria-selected="true">[1] FLEET</button>
+    <button type="button" id="tab-gallery" role="tab" data-tab="gallery" aria-selected="false">[2] GALLERY</button>
+    <button type="button" id="tab-mesh" role="tab" data-tab="mesh" aria-selected="false">[3] MESH</button>
+    <button type="button" id="tab-chats" role="tab" data-tab="chats" aria-selected="false">[4] CHATS</button>
+    <button type="button" id="tab-telemetry" role="tab" data-tab="telemetry" aria-selected="false">[5] TELEMETRY</button>
+    <button type="button" id="tab-log" role="tab" data-tab="log" aria-selected="false">[6] LOG</button>
     <span class="grow"></span>
-    <button id="help-btn" class="dim" aria-label="Keyboard help">[?] KEYS</button>
+    <button type="button" id="help-btn" class="dim" aria-label="Keyboard help">[?] KEYS</button>
   </nav>
 
-  <section id="fleet" class="view" role="tabpanel">
-    <p id="fleet-summary" class="line summary">probing…</p>
+  <section id="fleet" class="view" role="tabpanel" aria-labelledby="tab-fleet">
+    <div class="line bar-line">
+      <p id="fleet-summary" class="summary">probing…</p>
+      <span class="grow"></span>
+      <button type="button" id="toggle-spawn" class="btn hi" aria-expanded="false">[+ SPAWN AGENT]</button>
+      <button type="button" id="toggle-squad" class="btn cyan" aria-expanded="false">[+ LAUNCH SQUAD]</button>
+    </div>
+
+    <div id="spawn-drawer" class="box drawer" data-title="SPAWN AGENT" hidden>
+      <form id="spawn-form" class="pad form-grid" autocomplete="off">
+        <div class="field">
+          <label for="spawn-cwd">workspace folder *</label>
+          <input id="spawn-cwd" name="cwd" required autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="C:\path\to\repo">
+        </div>
+        <div class="field">
+          <label for="spawn-role">role preset</label>
+          <select id="spawn-role" name="role_id"></select>
+        </div>
+        <div class="field">
+          <label for="spawn-name">agent handle</label>
+          <input id="spawn-name" name="agent_name" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="auto (e.g. claude-arch)">
+        </div>
+        <div class="field">
+          <label for="spawn-provider">provider</label>
+          <select id="spawn-provider" name="provider">
+            <option value="">(from role)</option>
+            <option value="claude">claude (claude.exe)</option>
+            <option value="gemini">gemini (agy.exe + uds)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="spawn-model">model override</label>
+          <input id="spawn-model" name="model" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="(from role, e.g. fable / opus-5-5)">
+        </div>
+        <div class="field">
+          <label for="spawn-effort">effort</label>
+          <select id="spawn-effort" name="effort">
+            <option value="">(from role)</option>
+            <option value="low">low</option>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+            <option value="xhigh">xhigh</option>
+            <option value="max">max</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="spawn-workspace">isolation</label>
+          <select id="spawn-workspace" name="workspace_mode">
+            <option value="">(from role)</option>
+            <option value="shared">shared folder</option>
+            <option value="worktree">git worktree</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="spawn-channels">channels</label>
+          <input id="spawn-channels" name="channels" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="#squad, #review">
+        </div>
+        <div class="field span-all">
+          <label for="spawn-prompt">initial mission / prompt</label>
+          <textarea id="spawn-prompt" name="initial_prompt" rows="2" placeholder="Describe what this agent owns and who it should coordinate with on the mesh…"></textarea>
+        </div>
+        <div class="form-actions span-all">
+          <label class="chk"><input type="checkbox" id="spawn-headless" name="headless"><span>headless (-p)</span></label>
+          <label class="chk"><input type="checkbox" id="spawn-remote" name="remote"><span>Remote Control (Claude)</span></label>
+          <button type="submit" id="spawn-submit" class="btn hi">[LAUNCH AGENT ▸]</button>
+          <button type="button" id="spawn-cancel" class="btn dim">[CLOSE]</button>
+          <span id="spawn-msg" class="dim" role="status" aria-live="polite"></span>
+        </div>
+      </form>
+    </div>
+
+    <div id="squad-drawer" class="box drawer" data-title="LAUNCH CROSS-MODEL SQUAD" hidden>
+      <form id="squad-form" class="pad form-grid" autocomplete="off">
+        <div class="field">
+          <label for="squad-name">squad name *</label>
+          <input id="squad-name" name="name" required autocorrect="off" autocapitalize="none" spellcheck="false" value="alpha-squad">
+        </div>
+        <div class="field span-2">
+          <label for="squad-cwd">shared repo / workspace folder *</label>
+          <input id="squad-cwd" name="cwd" required autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="C:\path\to\repo">
+        </div>
+        <div class="field span-all">
+          <label for="squad-brief">shared mission brief *</label>
+          <textarea id="squad-brief" name="brief" rows="2" required placeholder="Shared goal, acceptance criteria, and coordination protocol for every squad member…"></textarea>
+        </div>
+        <div class="field span-all">
+          <div class="bar-line">
+            <span class="dim">squad roster (Claude + Gemini peers share #squad and uds-messaging automatically)</span>
+            <span class="grow"></span>
+            <button type="button" id="squad-add-member" class="btn cyan">[+ ADD MEMBER]</button>
+          </div>
+          <div class="member-head dim" aria-hidden="true"><span>role</span><span>handle</span><span>model</span><span>effort</span><span>isolation</span><span></span></div>
+          <div id="squad-members" class="member-rows"></div>
+        </div>
+        <div class="form-actions span-all">
+          <button type="submit" id="squad-submit" class="btn hi">[LAUNCH SQUAD ▸]</button>
+          <button type="button" id="squad-cancel" class="btn dim">[CLOSE]</button>
+          <span id="squad-msg" class="dim" role="status" aria-live="polite"></span>
+        </div>
+      </form>
+    </div>
+
     <div class="split">
       <div class="box" data-title="FLEET">
-        <div class="scroll"><table class="fleet" id="fleet-table" aria-label="Claude processes">
-          <thead><tr><th title="pinned to the gallery">◇</th><th>PID</th><th>NAME</th><th>MODEL</th><th>EFFORT</th><th>STATE</th><th class="r">CPU</th><th></th><th class="r">MEM</th><th class="r">AGE</th></tr></thead>
+        <div class="scroll"><table class="fleet" id="fleet-table" aria-label="Agent processes">
+          <thead><tr><th title="pinned to the gallery">◇</th><th>PID</th><th>PROV</th><th>NAME</th><th>ROLE</th><th>MODEL</th><th>EFFORT</th><th>STATE</th><th class="r">CPU</th><th></th><th class="r">MEM</th><th class="r">AGE</th></tr></thead>
           <tbody></tbody>
         </table></div>
-        <p id="fleet-empty" class="dim pad" hidden>no claude.exe running</p>
+        <p id="fleet-empty" class="dim pad" hidden>no Claude or Gemini agent sessions running — use [+ SPAWN AGENT] or [+ LAUNCH SQUAD]</p>
       </div>
       <div class="box detail" data-title="SESSION" id="detail">
         <div id="detail-head" class="pad"><span class="dim">select a process ▸ j/k then enter</span></div>
         <ol id="feed" class="feed" aria-live="polite"></ol>
         <form id="say" class="say" autocomplete="off" hidden>
           <label for="say-text" class="hi">say&gt;</label>
-          <input id="say-text" maxlength="4000" placeholder="type a line, enter sends it to this session">
+          <input id="say-text" name="text" maxlength="4000" placeholder="type a message, enter delivers via uds-messaging (or console)">
           <button type="submit">[SEND]</button>
         </form>
         <div id="actions" class="actions pad" hidden>
           <a id="remote" class="btn" target="_blank" rel="noopener" hidden>[REMOTE ↗]</a>
-          <button id="pin" class="btn">[PIN ◇]</button>
-          <button id="kill" class="btn danger">[KILL ✕]</button>
-          <span id="act-msg" class="dim"></span>
+          <button type="button" id="open-mesh-peer" class="btn cyan">[MESH ▸]</button>
+          <button type="button" id="set-model-btn" class="btn cyan" title="set or switch this session's model (m)">[MODEL ✎]</button>
+          <button type="button" id="pin" class="btn">[PIN ◇]</button>
+          <button type="button" id="kill" class="btn danger">[KILL ✕]</button>
+          <span id="act-msg" class="dim" role="status" aria-live="polite"></span>
         </div>
       </div>
     </div>
   </section>
 
-  <section id="gallery" class="view" role="tabpanel" hidden>
+  <section id="gallery" class="view" role="tabpanel" aria-labelledby="tab-gallery" hidden>
     <div class="line controls">
       <span class="dim">show</span>
-      <span class="seg" id="g-mode"><button data-v="all">all sessions</button><button data-v="pinned">pinned</button></span>
+      <span class="seg" id="g-mode"><button type="button" data-v="all">all sessions</button><button type="button" data-v="pinned">pinned</button></span>
       <span class="dim">cols</span>
-      <span class="seg" id="g-cols"><button data-v="auto">auto</button><button data-v="1">1</button><button data-v="2">2</button><button data-v="3">3</button><button data-v="4">4</button><button data-v="6">6</button></span>
+      <span class="seg" id="g-cols"><button type="button" data-v="auto">auto</button><button type="button" data-v="1">1</button><button type="button" data-v="2">2</button><button type="button" data-v="3">3</button><button type="button" data-v="4">4</button><button type="button" data-v="6">6</button></span>
       <span class="dim">height</span>
-      <span class="seg" id="g-height"><button data-v="s">S</button><button data-v="m">M</button><button data-v="l">L</button></span>
+      <span class="seg" id="g-height"><button type="button" data-v="s">S</button><button type="button" data-v="m">M</button><button type="button" data-v="l">L</button></span>
       <span id="g-count" class="dim"></span>
     </div>
     <div id="tiles-grid" class="gallery"></div>
     <p id="g-empty" class="dim pad" hidden></p>
   </section>
 
-  <section id="chats" class="view" role="tabpanel" hidden>
+  <section id="mesh" class="view" role="tabpanel" aria-labelledby="tab-mesh" hidden>
     <div class="line controls">
-      <label for="chat-q" class="hi">find&gt;</label>
-      <input id="chat-q" class="find" placeholder="title, first prompt, folder or id" autocomplete="off">
+      <label for="mesh-squad-filter" class="dim">squad</label>
+      <select id="mesh-squad-filter" class="inline-select">
+        <option value="">all peers</option>
+      </select>
+      <span id="mesh-summary" class="dim">probing mesh…</span>
+      <span class="grow"></span>
+      <button type="button" id="toggle-roles" class="btn amber" aria-expanded="false">[ROLES ⚙]</button>
+      <button type="button" id="mesh-spawn-jump" class="btn hi">[+ SPAWN ▸]</button>
+      <button type="button" id="mesh-refresh" class="btn">[REFRESH]</button>
+    </div>
+
+    <div id="roles-drawer" class="box drawer" data-title="AGENT ROLE DEFINITIONS" hidden>
+      <div class="split pad">
+        <div>
+          <div class="dim">click a role to inspect or edit; agents spawned with a role inherit its system prompt, provider, model, and workspace policy</div>
+          <div class="scroll"><table class="fleet" id="roles-table" aria-label="Agent roles">
+            <thead><tr><th>ID</th><th>PROV</th><th>TITLE</th><th>MODEL</th><th>EFFORT</th><th>ISOLATION</th></tr></thead>
+            <tbody></tbody>
+          </table></div>
+        </div>
+        <form id="role-form" class="form-grid" autocomplete="off">
+          <div class="field">
+            <label for="role-id">role id *</label>
+            <input id="role-id" name="id" required autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="gemini-sec-auditor">
+          </div>
+          <div class="field">
+            <label for="role-title">title *</label>
+            <input id="role-title" name="title" required placeholder="Security Auditor">
+          </div>
+          <div class="field">
+            <label for="role-provider">provider</label>
+            <select id="role-provider" name="provider">
+              <option value="claude">claude</option>
+              <option value="gemini">gemini</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="role-model">default model</label>
+            <input id="role-model" name="model" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="fable / opus-5-5 / gemini-4-carbon-high">
+          </div>
+          <div class="field">
+            <label for="role-effort">effort</label>
+            <select id="role-effort" name="effort">
+              <option value="low">low</option>
+              <option value="medium">medium</option>
+              <option value="high" selected>high</option>
+              <option value="xhigh">xhigh</option>
+              <option value="max">max</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="role-workspace">workspace</label>
+            <select id="role-workspace" name="workspace_mode">
+              <option value="shared">shared</option>
+              <option value="worktree">worktree</option>
+            </select>
+          </div>
+          <div class="field span-all">
+            <label for="role-prompt">role system prompt *</label>
+            <textarea id="role-prompt" name="system_prompt" rows="3" required placeholder="Responsibilities, boundaries, verification standards, and how this role collaborates with peers…"></textarea>
+          </div>
+          <div class="form-actions span-all">
+            <button type="submit" id="role-save" class="btn hi">[SAVE ROLE ▸]</button>
+            <button type="button" id="role-new" class="btn">[CLEAR]</button>
+            <button type="button" id="role-delete" class="btn danger">[DELETE]</button>
+            <button type="button" id="role-close" class="btn dim">[CLOSE]</button>
+            <span id="role-msg" class="dim" role="status" aria-live="polite"></span>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <div class="split mesh-split">
+      <div class="mesh-col">
+        <div class="box" data-title="LIVE PEER ROSTER">
+          <div class="scroll"><table class="fleet" id="mesh-peers-table" aria-label="Mesh peers">
+            <thead><tr><th>PROV</th><th>PEER</th><th>ROLE</th><th>SQUAD</th><th>UDS</th><th>STATE</th><th>LAST ACTIVITY</th></tr></thead>
+            <tbody></tbody>
+          </table></div>
+          <p id="mesh-peers-empty" class="dim pad" hidden>no live peers on the mesh yet</p>
+        </div>
+
+        <div class="box detail mesh-ctx" data-title="PEER CONTEXT STREAM" id="mesh-ctx-box">
+          <div class="pad bar-line">
+            <div id="mesh-ctx-head" class="dim">click a peer above to inspect its live Context Stream (prompts, replies, tool calls, peer traffic)</div>
+            <span class="grow"></span>
+            <span class="seg" id="mesh-ctx-kinds">
+              <button type="button" data-v="" aria-pressed="true">all</button>
+              <button type="button" data-v="you,claude,gemini,peer_in,peer_out">dialog</button>
+              <button type="button" data-v="peer_in,peer_out">contacts</button>
+              <button type="button" data-v="tool,result,error">tools</button>
+            </span>
+          </div>
+          <ol id="mesh-ctx-feed" class="feed" aria-live="polite"></ol>
+        </div>
+      </div>
+
+      <div class="box detail mesh-bus" data-title="CONTACT STREAM // UDS-MESSAGING">
+        <div class="pad bar-line">
+          <span class="dim">filter</span>
+          <span class="seg" id="mesh-msg-scope">
+            <button type="button" data-v="all" aria-pressed="true">all traffic</button>
+            <button type="button" data-v="peer" aria-pressed="false">selected peer</button>
+          </span>
+          <label for="mesh-filter-ch" class="dim">channel</label>
+          <input id="mesh-filter-ch" class="inline-input" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="#any">
+          <span class="grow"></span>
+          <span id="mesh-msg-count" class="dim">0 msgs</span>
+        </div>
+        <ol id="mesh-feed" class="feed contact-feed" aria-live="polite"></ol>
+        <form id="mesh-send-form" class="mesh-say" autocomplete="off">
+          <div class="mesh-say-top">
+            <label for="mesh-to" class="hi">to&gt;</label>
+            <input id="mesh-to" name="to" list="mesh-targets" required autocorrect="off" autocapitalize="none" spellcheck="false" value="@all" placeholder="peer, @squad, @all, #channel">
+            <datalist id="mesh-targets">
+              <option value="@all"></option>
+              <option value="@squad"></option>
+              <option value="#review"></option>
+            </datalist>
+            <label for="mesh-channel" class="dim">ch&gt;</label>
+            <input id="mesh-channel" name="channel" class="inline-input" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="#review">
+            <button type="submit" id="mesh-send-btn" class="btn hi">[SEND UDS ▸]</button>
+          </div>
+          <label for="mesh-text" class="visually-hidden">Message body</label>
+          <textarea id="mesh-text" name="text" rows="2" maxlength="8000" required placeholder="Broadcast or direct-message over Claude uds-messaging (Enter sends, Shift+Enter newline)…"></textarea>
+          <div id="mesh-send-msg" class="dim" role="status" aria-live="polite"></div>
+        </form>
+      </div>
+    </div>
+  </section>
+
+  <section id="chats" class="view" role="tabpanel" aria-labelledby="tab-chats" hidden>
+    <div class="line controls">
+      <search class="search-wrap">
+        <label for="chat-q" class="hi">find&gt;</label>
+        <input id="chat-q" name="q" class="find" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="title, first prompt, folder or id" autocomplete="off">
+      </search>
       <span id="chat-count" class="dim"></span>
-      <button id="name-all" title="Haiku names every ended chat without a name; names you gave are never replaced">[NAME BACKLOG ✦]</button>
+      <button type="button" id="name-all" title="Haiku names every ended chat without a name; names you gave are never replaced">[NAME BACKLOG ✦]</button>
       <span id="name-status" class="dim"></span>
     </div>
     <div class="split">
       <div class="box" data-title="EVERY CHAT">
         <div class="scroll"><table class="fleet" id="chat-table" aria-label="Every chat Almanac has kept">
-          <thead><tr><th>LAST</th><th>TITLE</th><th>FOLDER</th><th>MODEL</th><th class="r">REPLIES</th><th class="r">CONTEXT</th><th class="r">RESUME ≥</th><th>KEPT</th></tr></thead>
+          <thead><tr><th>LAST</th><th>PROV</th><th>TITLE</th><th>FOLDER</th><th>MODEL</th><th class="r">REPLIES</th><th class="r">CONTEXT</th><th class="r">RESUME ≥</th><th>KEPT</th></tr></thead>
           <tbody></tbody>
         </table></div>
       </div>
@@ -88,21 +327,21 @@
         <div id="chat-head" class="pad"><span class="dim">pick a chat to read it; resume brings it back as a live session</span></div>
         <ol id="chat-feed" class="feed"></ol>
         <div id="chat-actions" class="actions pad" hidden>
-          <button id="resume" class="btn hi">[RESUME ▸]</button>
+          <button type="button" id="resume" class="btn hi">[RESUME ▸]</button>
           <label class="dim"><input type="checkbox" id="resume-remote" checked> with Remote Control</label>
-          <span id="chat-msg" class="dim"></span>
+          <span id="chat-msg" class="dim" role="status" aria-live="polite"></span>
         </div>
       </div>
     </div>
   </section>
 
-  <section id="telemetry" class="view" role="tabpanel" hidden>
+  <section id="telemetry" class="view" role="tabpanel" aria-labelledby="tab-telemetry" hidden>
     <div class="line controls">
       <span class="dim">range</span>
-      <span class="seg" id="days"><button data-v="7">7d</button><button data-v="30">30d</button><button data-v="90">90d</button><button data-v="0">all</button></span>
+      <span class="seg" id="days"><button type="button" data-v="7">7d</button><button type="button" data-v="30">30d</button><button type="button" data-v="90">90d</button><button type="button" data-v="0">all</button></span>
       <span class="dim">bucket</span>
-      <span class="seg" id="bucket"><button data-v="day">day</button><button data-v="week">week</button></span>
-      <button id="rescan">[RESCAN]</button>
+      <span class="seg" id="bucket"><button type="button" data-v="day">day</button><button type="button" data-v="week">week</button></span>
+      <button type="button" id="rescan">[RESCAN]</button>
       <span id="ingest-status" class="dim"></span>
     </div>
     <div class="tiles" id="tiles"></div>
@@ -113,23 +352,26 @@
     <p id="coverage" class="dim line"></p>
   </section>
 
-  <section id="log" class="view" role="tabpanel" hidden>
+  <section id="log" class="view" role="tabpanel" aria-labelledby="tab-log" hidden>
     <div class="box" data-title="ACTIONS"><ol id="log-list" class="log pad"></ol></div>
   </section>
 
   <div id="help" class="help" hidden>
     <div class="box" data-title="KEYS">
-      <pre class="pad">1 2 3 4 5  fleet · gallery · chats · telemetry · log
-j k ↑ ↓    move through the fleet
-enter      open the selected process
-p          pin / unpin it in the gallery
-/          type to the open session (in chats: search)
-x          kill the open process (then y)
-r          refresh now
-esc        close / cancel
-?          this help</pre>
+      <pre class="pad">1 2 3 4 5 6  fleet · gallery · mesh · chats · telemetry · log
+j k ↑ ↓      move through the fleet
+enter        open the selected process
+m            set model on the selected fleet session (or click MODEL cell)
+s            toggle spawn agent drawer (in fleet)
+p            pin / unpin it in the gallery
+/            type to the open session / mesh bus (in chats: search)
+x            kill the open process (then y)
+r            refresh now
+esc          close / cancel
+?            this help</pre>
     </div>
   </div>
+  <ul id="model-picker" class="model-picker" role="listbox" aria-label="Available models" hidden></ul>
   <div class="tip" id="tip" role="status" hidden></div>
 </main>
 </body>

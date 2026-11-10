@@ -10,7 +10,7 @@ from almanac.web import ensure_token
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Almanac: mission control for every Claude Code session on this PC")
+    parser = argparse.ArgumentParser(description="Almanac: cross-model mission control for Claude & Gemini agents on this PC")
     parser.add_argument("--config", type=Path, default=Path("config.json"))
     parser.add_argument("--state", type=Path, default=Path(".almanac"))
     parser.add_argument("--port", type=int)
@@ -40,8 +40,10 @@ def main(argv=None):
     from almanac.resume import Prices
     namer = Namer(model=settings["naming_model"], claude=settings["claude"],
                   workdir=args.state.resolve() / "namer-cwd") if settings["naming"] else None
+    gemini_projects = args.state.resolve() / "gemini" / "projects"
     service = Service(store, settings["transcripts"], settings["interval"],
-                      fleet=Fleet(Path(settings["transcripts"]).parent), state=args.state, claude=settings["claude"],
+                      fleet=Fleet(Path(settings["transcripts"]).parent, extra_projects=[gemini_projects]),
+                      state=args.state, claude=settings["claude"], gemini=settings["gemini"],
                       prices=Prices(settings["prices"]), namer=namer)
     if args.ingest:
         print(service.ingest())
@@ -60,6 +62,8 @@ def main(argv=None):
         pass
     finally:
         service.stop.set()
+        service.wake.set()      # the loop sleeps on wake
+        service.close_hub()
         if server:
             server.server_close()
     return 0
