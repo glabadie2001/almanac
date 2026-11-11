@@ -440,3 +440,18 @@ details table td:first-child, details table th:first-child { text-align: left; }
 .feed li:has(> .md ~ .flag)::before { flex: none; }
 .feed li:has(> .md ~ .flag) > .md { flex: 1; width: auto; min-width: 0; }
 .feed li:has(> .md ~ .flag) > .flag { flex: none; margin-left: 6px; }
+/* ROLES: a multi-pick (a <details> of checkboxes) styled like the form's inputs; the list opens over the form */
+.field-lbl { color: var(--dim); font-size: 12px; }
+.multi { position: relative; margin: 0; color: var(--fg); }
+.multi > summary { list-style: none; border: 1px solid var(--line); background: var(--bg); padding: 3px 6px; cursor: pointer;
+                   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.multi > summary::-webkit-details-marker { display: none; }
+.multi > summary::after { content: " ▾"; content: " ▾" / ""; color: var(--dim); float: right; }
+.multi[open] > summary { border-color: var(--hi); }
+.multi-pop { position: absolute; z-index: 20; left: 0; right: 0; top: 100%; background: var(--bg); border: 1px solid var(--hi);
+             box-shadow: 0 6px 18px rgba(0, 0, 0, .5); padding: 4px 6px; }
+.multi-list { display: flex; flex-direction: column; max-height: 240px; overflow-y: auto; }
+.multi-list .chk { color: var(--fg); padding: 1px 0; }
+.multi-pop .inline-input { width: 100%; margin-top: 4px; }
+.multi-list .chk { justify-content: flex-start; font-size: 13px; }
+.multi-list input[type="checkbox"] { width: auto; flex: none; border: 0; padding: 0; }   /* not .field input's 100% */
