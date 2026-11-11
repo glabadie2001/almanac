@@ -231,6 +231,21 @@ def parse_agy_stream_event(event: dict) -> dict:
     return dict(kind="other")
 
 
+RUNNER_EXITED = "runner_exited"     # agy's stdout closed before a `result`: the process died; not retried
+
+
+def turn_error(err, finished_reason=None) -> dict:
+    """{error, text} for a failed agy turn. The class is agy's own code when the error carries one (`code`, `type`,
+    `status`), else `gemini_error`; recover.py retries neither, since no saved transcript shows what agy reports."""
+    code = None
+    if isinstance(err, dict):
+        code = err.get("code") or err.get("type") or err.get("status")
+        text = err.get("message") or err.get("text") or json.dumps(err)
+    else:
+        text = str(err or finished_reason or "agy reported an error")
+    return dict(error=str(code) if code else "gemini_error", text=str(text)[:300])
+
+
 class GeminiHost:
     """Owns one Gemini agent's `uds-messaging` pipe, turn queue, normalized transcript, and `agy` subprocess."""
 
@@ -434,6 +449,8 @@ class GeminiHost:
             proc.stdin.write(wire)
             proc.stdin.flush()
 
+        self._turn_error = None
+        ended = False                   # a `result` event came: without one, agy's output closed mid-turn
         text_chunks: list[str] = []
         final_text = ""
         tool_events: list[dict] = []
@@ -519,16 +536,21 @@ class GeminiHost:
                 else:
                     final_text = ev["text"]
             elif ev["kind"] == "result":
+                ended = True
                 if ev.get("model"):
                     seen_model = str(ev["model"])
+                if ev.get("is_error"):
+                    self._turn_error = turn_error(ev.get("error"), ev.get("finished_reason"))
                 if ev.get("text"):
                     final_text = ev["text"]
-                elif ev.get("is_error") and ev.get("error"):
-                    final_text = f"[error] {ev['error']}"
+                elif self._turn_error:
+                    final_text = f"[error] {self._turn_error['text']}"
                 if ev.get("usage"):
                     usage = ev["usage"]
                 break
 
+        if not ended and not self.stop_event.is_set():
+            self._turn_error = dict(error=RUNNER_EXITED, text="agy's output closed before the turn ended")
         reply = final_text.strip() or "".join(text_chunks).strip()
         return reply, tool_events, usage, seen_model
 
@@ -547,14 +569,20 @@ class GeminiHost:
         )
         full_prompt = self._build_turn_prompt(item["prompt_text"])
         self._turn_index += 1
+        self._turn_error = None
         try:
             reply, _, usage, seen_model = self._run_agy_turn(full_prompt)
             if seen_model:
                 self.model, self.effort = split_agy_model_effort(seen_model, self.effort)
             if reply:
                 self._log(f"\n✦ [{self.name}] {reply}\n")
+            err = self._turn_error
+            if err and not reply:
+                reply = f"[error] {err['text']}"
             self._append_record(
                 {
+                    # a failed turn is marked the way Claude Code marks one, so fleet.read_tail sees the stall
+                    **({"isApiErrorMessage": True, "error": err["error"]} if err else {}),
                     "type": "assistant",
                     "provider": "gemini",
                     "sessionId": self.session_id,

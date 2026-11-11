@@ -224,3 +224,105 @@ class RecoverTests(Fixture):
             def fleet_now(self):
                 raise RuntimeError("scan failed")
         self.assertEqual(recover.tick(Broken(self.store)), [])
+
+    def test_an_open_escalation_survives_a_restart_and_closes_on_recovery(self):
+        self.stall("impl", error="authentication_failed")
+        self.at(T0)
+        self.assertEqual(self.told, ["arch", "operator"])
+        self.rec = recover.Recover(clock=lambda: self.now)          # Almanac restarted: no memory of the stall
+        for ts in (T0 + 20, T0 + 100, T0 + 400):
+            self.at(ts)
+        self.assertEqual((self.tries(), self.told), ([], ["arch", "operator"]), "not tried or escalated again")
+        self.assertEqual(len(self.store.open_needs(to_name="operator")), 1)
+        del self.svc.fleet.stalls["s-impl"]                          # it works again
+        self.assertEqual([d["action"] for d in self.at(T0 + 500)], ["resolved"])
+        self.assertEqual(self.store.open_needs(to_name="operator"), [])
+
+
+from support import TOKEN                                            # noqa: E402
+from test_server_fixes import MeshRig                                # noqa: E402
+
+
+class OperatorSeesItTests(MeshRig):
+    """The escalation is in GET /api/operator/inbox and raises the alert a blocking question raises."""
+
+    def test_an_escalation_raises_the_blocking_alert(self):
+        self.store.create_squad("sq-1", "alpha", str(self.root), "Ship it.")
+        self.store.record_spawn(agent_name="impl", session_id="s-impl", squad_id="sq-1", role_id="implementer-claude",
+                                provider="claude", model=None, effort=None, cwd=str(self.root), worktree_path=None, pid=900)
+        svc = FakeService(self.store)
+        svc.fleet.rows.append(dict(pid=900, created="1", role="session", session_id="s-impl", status="idle"))
+        svc.fleet.stalls["s-impl"] = dict(error="authentication_failed", text="Not logged in", ts=iso(T0))
+        rec = recover.Recover(clock=lambda: T0)
+        rec.tick(svc)
+        status, _, doc = self.request(self.handler, "/api/operator/inbox", token=TOKEN)
+        self.assertEqual(status, 200)
+        self.assertEqual((doc["open"]["blocking"], doc["unread"]), (1, 1))
+        self.assertIsNotNone(doc["oldest_blocking_ts"], "the header's '▲ blocked on operator' age")
+        [m] = [m for m in doc["messages"] if m["body"].startswith("[stalled] impl")]
+        self.assertEqual((m["from_name"], m["to_name"], m["needs"], m["squad_id"]), ("almanac-hub", "operator", "blocking", "sq-1"))
+        _, _, mesh = self.request(self.handler, "/api/mesh?squad=sq-1", token=TOKEN)
+        self.assertIn(m["id"], [o["id"] for o in mesh["open"]], "the squad strip's 'blocked on operator'")
+        del svc.fleet.stalls["s-impl"]
+        rec.tick(svc)
+        _, _, doc = self.request(self.handler, "/api/operator/inbox?limit=0", token=TOKEN)
+        self.assertEqual(doc["open"]["blocking"], 0, "recovered: the alert clears itself")
+
+
+import io                                                            # noqa: E402
+import os                                                            # noqa: E402
+from unittest import mock                                            # noqa: E402
+
+from almanac import gemini_host, uds                                 # noqa: E402
+from almanac.fleet import Fleet                                      # noqa: E402
+from test_fleet import FakeMachine                                   # noqa: E402
+
+
+class GeminiTests(Fixture):
+    def host(self):
+        self.sessions = self.root / "claude" / "sessions"
+        self.sessions.mkdir(parents=True, exist_ok=True)
+        self.tx = self.root / "gem.jsonl"
+        h = gemini_host.GeminiHost(name="gem", cwd=str(self.root), transcript_path=self.tx, sessions_dir=self.sessions,
+                                   session_id="s-gem", agy_bin="agy", in_memory_uds=True, quiet=True)
+        self.addCleanup(h.close)
+        return h
+
+    def turn(self, h, *events):
+        proc = mock.MagicMock(stdin=io.StringIO(), stdout=io.StringIO("".join(json.dumps(e) + "\n" for e in events)))
+        with mock.patch.object(h, "_ensure_stream_proc", return_value=proc):
+            h.run_one_turn(dict(raw_content="go", prompt_text="go"))
+        return fl.read_tail(self.tx)
+
+    def test_an_error_result_is_marked_like_claudes(self):
+        h = self.host()
+        events, meta = self.turn(h, {"type": "result", "is_error": True,
+                                     "error": {"code": "RESOURCE_EXHAUSTED", "message": "quota"}})
+        self.assertEqual((meta["stall"]["error"], meta["stall"]["text"]), ("RESOURCE_EXHAUSTED", "[error] quota"))
+        self.assertEqual(events[-1]["kind"], "error")
+        _, meta = self.turn(h, {"type": "result", "is_error": True, "error": "something broke"})
+        self.assertEqual(meta["stall"]["error"], "gemini_error")
+        _, meta = self.turn(h, {"type": "result", "result": {"response": "done"}})
+        self.assertIsNone(meta["stall"], "a good turn ends it")
+
+    def test_a_runner_that_died_mid_turn_is_its_own_class(self):
+        h = self.host()
+        _, meta = self.turn(h, {"type": "init", "model": "gemini-4-carbon"})          # no result: stdout closed
+        self.assertEqual(meta["stall"]["error"], gemini_host.RUNNER_EXITED)
+        self.assertNotIn(gemini_host.RUNNER_EXITED, recover.TRANSIENT)
+        self.assertNotIn("gemini_error", recover.TRANSIENT)
+
+    def test_continue_reaches_a_gemini_agent_through_fleet_send(self):
+        h = self.host()
+        h.peer.start()
+        machine = FakeMachine()
+        machine.procs[os.getpid()] = dict(ppid=1, exe="agy.exe", path=r"C:\x\agy.exe", cmd="agy.exe",
+                                          created=int(h.peer.proc_start), cpu=0, mem=1 << 20)
+        fleet = Fleet(self.root / "claude", table=machine.table, facts=machine.facts, lines=machine.lines)
+        row = next(r for r in fleet.snapshot()["processes"] if r.get("session_id") == "s-gem")
+        self.assertEqual((row["provider"], row["has_uds"]), ("gemini", True))
+        ok, message, _ = fleet.send(row["pid"], row["created"], recover.TEXT, from_name=recover.HUB)
+        self.assertTrue(ok, message)
+        item = h.turns.get(timeout=2)
+        parsed = uds.parse_cross_session(item["raw_content"])
+        self.assertEqual((parsed["from_name"], parsed["body"].strip()), ("almanac-hub", "continue"))
