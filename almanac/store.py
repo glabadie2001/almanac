@@ -907,7 +907,10 @@ class Store:
         squad_id: str | None = None,
         transport: str = "uds",
         needs: str | None = None,
+        closes: bool = True,
     ) -> dict:
+        """`closes=False` (with transport `system`, which a later question never takes as its answer): a notice
+        from Almanac itself, such as recover.py's `continue`, that must not close anyone's open flag."""
         needs = needs or None
         if needs not in NEEDS:
             raise ValueError("needs must be 'reply', 'blocking' or empty")
@@ -923,7 +926,8 @@ class Store:
             )
             if cur.rowcount:
                 row_id = cur.lastrowid
-                self._close_answered(row_id, stamp, from_name, to_name, squad_id)
+                if closes:
+                    self._close_answered(row_id, stamp, from_name, to_name, squad_id)
                 if needs:
                     self._close_if_answered(row_id, stamp, from_name, to_name, squad_id)
             else:
@@ -988,8 +992,9 @@ class Store:
             repliers = OPERATOR_NAMES if to in OPERATOR_NAMES else (to,)
             who, who_params = f"from_name in ({','.join('?' * len(repliers))})", list(repliers)
         row = self.db.execute(
-            f"select id, ts from messages where id != ? and ts >= ? and to_name in ({','.join('?' * len(askers))}) "
-            f"and {who} and (squad_id is null or ? is null or squad_id = ?) order by ts asc, id asc limit 1",
+            f"select id, ts from messages where id != ? and ts >= ? and transport != 'system' "
+            f"and to_name in ({','.join('?' * len(askers))}) and {who} "
+            "and (squad_id is null or ? is null or squad_id = ?) order by ts asc, id asc limit 1",
             (row_id, ts, *askers, *who_params, squad_id, squad_id)).fetchone()
         if row is None:
             return 0

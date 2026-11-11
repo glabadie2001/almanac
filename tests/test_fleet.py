@@ -109,6 +109,19 @@ class FleetTests(Fixture):
         self.fleet.snapshot()
         self.assertEqual(len(self.machine.asked[-1]), 0, "command lines are fetched once per process")
 
+    def test_a_row_is_stalled_only_while_idle_on_an_api_error(self):
+        path = self.home / "projects" / "D--x-realm" / "sess-a.jsonl"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "assistant", "isApiErrorMessage": True, "error": "server_error", "timestamp": "t3",
+                                 "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "API Error: x"}]}}) + "\n")
+        row = next(r for r in self.fleet.snapshot()["processes"] if r["pid"] == 100)
+        self.assertIsNone(row["stall"], "busy: a try may be in flight")
+        rec = self.home / "sessions" / "100.json"
+        rec.write_text(rec.read_text(encoding="utf-8").replace('"busy"', '"idle"'), encoding="utf-8")
+        row = next(r for r in self.fleet.snapshot()["processes"] if r["pid"] == 100)
+        self.assertEqual((row["stall"]["error"], row["stall"]["ts"]), ("server_error", "t3"))
+        self.assertEqual(self.fleet.detail(100)["events"][-1]["kind"], "error")
+
     def test_cpu_comes_from_process_time_deltas(self):
         with mock.patch.object(fl.time, "time", side_effect=[1000.0, 1002.0]):
             self.fleet.snapshot()
@@ -121,7 +134,7 @@ class FleetTests(Fixture):
         d = self.fleet.detail(100)
         self.assertTrue(d["transcript"].endswith("sess-a.jsonl"))
         self.assertEqual(d["events"], [dict(ts="t", kind="you", text="hello"), dict(ts="t1", kind="claude", text="hi")])
-        self.assertEqual(d["meta"], dict(model="claude-test", effort="high", last_ts="t1"))
+        self.assertEqual(d["meta"], dict(model="claude-test", effort="high", last_ts="t1", stall=None))
         self.assertEqual(len(self.fleet.detail(100, limit=1)["events"]), 1)
         path = Path(d["transcript"])
         before = self.fleet.tails[path][0]

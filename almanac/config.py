@@ -15,6 +15,7 @@ DEFAULTS = dict(
     naming_model="haiku",                   # any --model value the CLI accepts
     prices={},                              # {"claude-opus-5-5": 5.0}: USD per million input tokens, for resume estimates
     hosts=[],                               # extra Host values to accept, e.g. a reverse proxy name "box.example:443"
+    auto_continue=True,                     # send `continue` to a squad agent stalled on a transient API error (recover.py)
 )
 
 

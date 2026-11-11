@@ -47,6 +47,7 @@ def main(argv=None):
                       fleet=Fleet(Path(settings["transcripts"]).parent, extra_projects=[gemini_projects]),
                       state=args.state, claude=settings["claude_configured"], gemini=settings["gemini_configured"],
                       prices=Prices(settings["prices"]), namer=namer)
+    service.auto_continue = settings["auto_continue"]
     for kind, runner in service.runners().items():
         if not runner["ok"]:
             logging.warning("%s runner not found; looked in: %s; set \"%s\" in config.json",

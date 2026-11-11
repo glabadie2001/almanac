@@ -523,8 +523,10 @@ class Service:
         threading.Thread(target=run, name=f"almanac-name-{session_id[:8]}", daemon=True).start()
 
     def loop(self):
+        from almanac import recover
         while not self.stop.is_set():
             self.ingest()
+            recover.tick(self)                            # stalled squad agents: auto-continue, then escalate
             if self.namer is not None:
                 self.name_backlog(quiet_minutes=10)       # anything the hook missed (crash, kill, older Claude)
             self.wake.wait(min(LIVE_INTERVAL, self.interval) if self.agents_live() else self.interval)
@@ -638,6 +640,7 @@ class Service:
                     mem_mb=p.get("mem_mb"),
                     started=p.get("started"),
                     last_event=last_ev,
+                    stall=p.get("stall"),
                 )
             )
         return peers

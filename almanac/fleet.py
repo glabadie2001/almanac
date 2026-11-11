@@ -215,10 +215,21 @@ def _peer_out_event(ts, inp: dict) -> dict:
     )
 
 
+def _stall(rec: dict, ts) -> dict | None:
+    """{error, text, ts} for an assistant record Claude Code wrote for a failed API call, else None."""
+    if not rec.get("isApiErrorMessage"):
+        return None
+    content = (rec.get("message") or {}).get("content") or []
+    text = " ".join(b.get("text", "") for b in content if isinstance(b, dict)) if isinstance(content, list) else str(content)
+    return dict(error=str(rec.get("error") or "unknown"), text=short(text, 300), ts=ts)
+
+
 def read_tail(path: Path, window: int = 600_000, keep: int | None = None) -> tuple[list[dict], dict]:
-    """(events, meta) from the end of a transcript. meta = the latest main-thread {model, effort, last_ts}:
-    every assistant record carries `message.model` and the session's `effort` at that turn."""
-    meta = dict(model=None, effort=None, last_ts=None)
+    """(events, meta) from the end of a transcript. meta = the latest main-thread {model, effort, last_ts, stall}:
+    every assistant record carries `message.model` and the session's `effort` at that turn. `stall` is
+    {error, text, ts} while the newest main-thread assistant record is an API error (`isApiErrorMessage`), else None.
+    Only assistant output ends it: a user record does not, or the `continue` sent to recover would end every stall."""
+    meta = dict(model=None, effort=None, last_ts=None, stall=None)
     try:
         size = path.stat().st_size
         with path.open("rb") as fh:
@@ -280,6 +291,7 @@ def read_tail(path: Path, window: int = 600_000, keep: int | None = None) -> tup
             if eff_rec:
                 meta["effort"] = eff_rec
             meta["last_ts"] = ts or meta["last_ts"]
+            meta["stall"] = _stall(rec, ts)
         if kind == "user":
             if isinstance(content, str):
                 parsed = uds.parse_cross_session(content)
@@ -310,7 +322,8 @@ def read_tail(path: Path, window: int = 600_000, keep: int | None = None) -> tup
                 if not isinstance(block, dict):
                     continue
                 if block.get("type") == "text" and block.get("text", "").strip():
-                    events.append(dict(ts=ts, kind=speaker, text=prose(block["text"])))
+                    events.append(dict(ts=ts, kind="error" if rec.get("isApiErrorMessage") else speaker,
+                                       text=prose(block["text"])))
                 elif block.get("type") == "tool_use":
                     inp = block.get("input") or {}
                     tname = block.get("name")
@@ -424,7 +437,7 @@ class Fleet:
                            started=round((f["created"] - 116444736000000000) / 1e7, 3), created=str(f["created"]),
                            cpu=cpu, mem_mb=round(f["mem"] / 1048576), cmd=short(cmd, 220), path=f["path"],
                            name=None, status=None, kind=None, cwd=None, session_id=None, version=None,
-                           remote_url=None, updated=None, model=None, effort=None)
+                           remote_url=None, updated=None, model=None, effort=None, stall=None)
                 if record:
                     pipe = record.get("messagingSocketPath") or None
                     has_key = bool(pipe and (sessions_dir / f"{p['pid']}.{uds.sha256_pipe(pipe)}.key").exists())
@@ -454,7 +467,8 @@ class Fleet:
                     if row["provider"] == "gemini" and raw_m:
                         from almanac.gemini_host import split_agy_model_effort
                         raw_m, raw_e = split_agy_model_effort(raw_m, raw_e)
-                    row.update(model=raw_m, effort=raw_e)
+                    # stalled: alive, idle, and the transcript ended on an API error (`recover` acts on it)
+                    row.update(model=raw_m, effort=raw_e, stall=meta.get("stall") if row["status"] == "idle" else None)
                 row["can_send"] = role == "session"
                 row["can_kill"] = role in ("session", "headless", "desktop", "daemon", "pty-host", "mcp", "other")
                 procs.append(row)
