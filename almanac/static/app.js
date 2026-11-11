@@ -2403,7 +2403,9 @@ async function loadTask(ref) {
 // ------------------------------------------------------------------ mesh: backlog (tasks no squad has taken yet)
 // Every project's, whatever squad is selected; refetched when objects_rev changes. [DISPATCH] launches a squad on one
 // (POST /api/squads/dispatch, the operator's only), after a second click that names the roster and the limit.
-const backlogState = { rev: undefined, rows: [], note: "", msg: "", armed: null, armedAt: 0, busy: false, sig: "" };
+// [ASSIGN] moves one into a running squad of its project (POST /api/squads/assign): pick the squad, click twice.
+const backlogState = { rev: undefined, rows: [], note: "", msg: "", armed: null, armedAt: 0, busy: false, sig: "",
+  squads: [], squadsAt: 0, pick: {}, armedAssign: null };
 const BACKLOG_EMPTY = "No backlog. Agents and the operator file one with mesh_file(backlog=true).";
 const DEFAULT_SQUAD = [{ role: "orchestrator-claude" }, { role: "reviewer-gemini" }];   // the door's DEFAULT_ROSTER
 
@@ -2417,8 +2419,18 @@ function backlogLimit(o) {
   return n ? `the lead may add ${n} × ${role === "*" ? "any role" : role}` : "the lead adds nobody";
 }
 
+async function loadBacklogSquads() {                    // the active squads, each with its `project`; every 20 s at most
+  if (Date.now() - backlogState.squadsAt < 20000) return;
+  backlogState.squadsAt = Date.now();
+  try { backlogState.squads = ((await api("/api/squads?limit=50")).squads || []).filter((q) => q.status === "active"); }
+  catch { backlogState.squadsAt = 0; }
+}
+
 async function loadBacklog(rev) {
-  if (rev === backlogState.rev) return;
+  const stale = Date.now() - backlogState.squadsAt >= 20000;
+  if (rev === backlogState.rev && !stale) return;
+  await loadBacklogSquads();
+  if (rev === backlogState.rev) return paintBacklog();     // only the squads moved
   backlogState.rev = rev;
   try {
     const doc = await planGet("/api/mesh/objects?backlog=1&kind=task&status=queued&limit=500");   // what can dispatch
@@ -2438,6 +2450,22 @@ function backlogRow(o) {
     title: `${backlogRoster(o)}; ${backlogLimit(o)}` });
   btn.addEventListener("click", (e) => { e.stopPropagation(); dispatchBacklog(o); });
   btn.addEventListener("keydown", (e) => e.stopPropagation());   // Enter on the button is the button's, not the row's
+  const squads = backlogState.squads.filter((q) => q.project === o.project);
+  const assign = [];
+  if (squads.length) {                                  // not offered when its project has no active squad
+    const picked = squads.find((q) => q.id === backlogState.pick[o.ref]) || squads[0];
+    const sel = el("select", { cls: "inline-effort-select", title: picked.name, "aria-label": `squad to assign ${o.ref} to`, disabled: backlogState.busy },
+      ...squads.map((q) => el("option", { value: q.id, text: q.name, selected: q.id === picked.id })));
+    sel.addEventListener("change", () => { backlogState.pick[o.ref] = sel.value; backlogState.armedAssign = null; paintBacklog(); });
+    sel.addEventListener("click", (e) => e.stopPropagation());
+    sel.addEventListener("keydown", (e) => e.stopPropagation());
+    const armedA = backlogState.armedAssign === `${o.ref}:${picked.id}`;   // the squad it names, not just the task
+    const ab = el("button", { type: "button", cls: `btn ${armedA ? "confirm" : ""}`, disabled: backlogState.busy,
+      text: armedA ? "[ASSIGN? click again]" : "[ASSIGN ▸]", title: `move ${o.ref} into squad ${picked.name}; its lead is told` });
+    ab.addEventListener("click", (e) => { e.stopPropagation(); assignBacklog(o, picked); });
+    ab.addEventListener("keydown", (e) => e.stopPropagation());
+    assign.push(sel, " ", ab, " ");
+  }
   const project = String(o.project || "").split(/[\\/]/).filter(Boolean).pop() || "";
   const tr = el("tr", { tabindex: "0", "data-ref": o.ref, cls: meshState.selTask === o.ref ? "sel" : "" },
     el("td", { cls: "cyan", text: o.ref }),
@@ -2445,7 +2473,7 @@ function backlogRow(o) {
       project ? el("span", { cls: "dim", text: ` · ${project}` }) : null),
     el("td", { cls: "last", text: backlogRoster(o), title: `${backlogRoster(o)}\n${backlogLimit(o)}` }),
     el("td", { cls: "r", text: age(o.created_ts), title: `filed by ${o.created_by_name}` }),
-    el("td", {}, btn),
+    el("td", {}, ...assign, btn),
   );
   tr.addEventListener("click", () => openTask(o.ref));
   tr.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTask(o.ref); } });
@@ -2455,7 +2483,8 @@ function backlogRow(o) {
 function paintBacklog() {
   const rows = backlogState.rows;
   const sig = JSON.stringify([rows, backlogState.armed, backlogState.busy, backlogState.note, backlogState.msg,
-    meshState.selTask, rows.map((o) => age(o.created_ts))]);
+    meshState.selTask, rows.map((o) => age(o.created_ts)), backlogState.squads.map((q) => [q.id, q.name, q.project]),
+    backlogState.pick, backlogState.armedAssign]);
   if (sig === backlogState.sig) return;               // polled: do not rebuild (and drop focus) when nothing changed
   backlogState.sig = sig;
   $("backlog-table").hidden = !rows.length;
@@ -2468,7 +2497,7 @@ function paintBacklog() {
 async function dispatchBacklog(o) {
   if (backlogState.busy) return;
   if (backlogState.armed !== o.ref) {                  // the first click arms; the second, within 5 s, launches
-    backlogState.armed = o.ref; backlogState.armedAt = Date.now();
+    backlogState.armed = o.ref; backlogState.armedAssign = null; backlogState.armedAt = Date.now();
     backlogState.msg = `${o.ref}: launch ${backlogRoster(o)}; ${backlogLimit(o)}. Click [LAUNCH?] again within 5 s.`;
     paintBacklog();
     setTimeout(() => {
@@ -2497,6 +2526,37 @@ async function dispatchBacklog(o) {
     openTask(o.ref);                                   // now the lead's task in the new squad's plan
   }
   setTimeout(() => { loadFleet(); loadMesh(); }, 900);
+}
+
+async function assignBacklog(o, squad) {
+  if (backlogState.busy) return;
+  const key = `${o.ref}:${squad.id}`;
+  if (backlogState.armedAssign !== key) {             // the first click arms; the second, within 5 s, assigns
+    backlogState.armedAssign = key; backlogState.armed = null; backlogState.armedAt = Date.now();
+    backlogState.msg = `${o.ref}: move into squad ${squad.name}; its lead is told. Click [ASSIGN?] again within 5 s.`;
+    paintBacklog();
+    setTimeout(() => {
+      if (backlogState.armedAssign === key && Date.now() - backlogState.armedAt >= 5000) {
+        backlogState.armedAssign = null; backlogState.msg = `${o.ref}: not assigned`; paintBacklog();
+      }
+    }, 5100);
+    return;
+  }
+  backlogState.armedAssign = null; backlogState.busy = true; backlogState.msg = `assigning ${o.ref}…`;
+  paintBacklog();
+  let r;
+  try {
+    r = await post("/api/squads/assign", { ref: o.ref, squad_id: squad.id });   // a refusal comes back as { error }
+  } catch (err) {
+    r = { error: err.message };
+  }
+  backlogState.msg = r.ok
+    ? `${o.ref} → squad ${squad.name}${r.note ? `: ${r.note}` : `: ${r.lead} told`}`
+    : `${o.ref} not assigned${r.error ? `: ${r.error}` : ""}`;
+  backlogState.busy = false; backlogState.rev = undefined; backlogState.squadsAt = 0;
+  paintBacklog();
+  if (r.ok) { setMeshSquad(squad.id); openTask(o.ref); }
+  setTimeout(() => loadMesh(), 900);
 }
 
 // ------------------------------------------------------------------ mesh: topology (who talks to whom)
