@@ -397,9 +397,13 @@ details table td:first-child, details table th:first-child { text-align: left; }
 /* plan table: fixed columns, so TASK and LAST share what is left and cut with an ellipsis, rather than the table
    growing past the box (it still scrolls below 640px) */
 .plan { table-layout: fixed; min-width: 640px; }
-.plan th:nth-child(1) { width: 6ch; } .plan th:nth-child(3) { width: 14ch; } .plan th:nth-child(4) { width: 22ch; }
+.plan th:nth-child(1) { width: calc(6ch + 16px); } .plan th:nth-child(3) { width: 14ch; } .plan th:nth-child(4) { width: 22ch; }
 .plan th:nth-child(5) { width: 7ch; }
 .plan td { overflow: hidden; text-overflow: ellipsis; }
+/* REF (PLAN and BACKLOG): border-box widths include the cell's 2 x 8px padding, so the column is a four-digit ref
+   ("T-1234") plus that padding; the selection marker sits in the left padding. A ref is never cut: a longer one
+   shows in full over the next cell's padding rather than as "T-1…" */
+.plan td:first-child { overflow: visible; text-overflow: clip; }
 .plan td.task, .plan td.last { max-width: none; }
 /* backlog: its own five columns (the id outranks .plan's); TASK and SQUAD TO LAUNCH share what is left */
 #backlog-table th:nth-child(3) { width: auto; } #backlog-table th:nth-child(4) { width: 6ch; }
