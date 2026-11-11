@@ -33,6 +33,9 @@ This is the evidence for ROADMAP item 13.
 
 ## 3. Build A: context policy (ROADMAP item 13)
 
+**Built on 2026-11-11** by squad `Context-policy-per-role` (T-10). What shipped, what was measured and what was not
+verified are in ROADMAP item 13. The brief as it was given:
+
 What this build unblocked: the handoff is a task ref and its log; "between tasks" is a task reaching `accepted`; a
 cheap fresh agent is an elastic spawn; and typing into a console at the right moment is what `recover.py` already
 does. Pieces:

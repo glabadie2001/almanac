@@ -207,15 +207,48 @@ impl-plan 97k to 420k, impl-backend 92k to 397k, against engram-fable, one job t
 
 What the 2026-11-11 build unblocked: the handoff is a task ref and its log (item 9); "between tasks" is a task
 reaching `accepted`; a cheap fresh agent is an elastic spawn with the role's allowed models and efforts; typing
-into a console at the right moment is what `recover.py` already does. Pieces:
+into a console at the right moment is what `recover.py` already does.
 
-- context size per agent in FLEET and on the PLAN owner chip, with a threshold (`sessions.context` is stored);
-- a per-role `context_policy`: `fresh-per-task` | `compact-at-N` (at a task boundary only) | `none`;
-- a lead action that respawns an owner on the same task with its log, which is also the recovery step beyond
-  `continue` for a stalled agent.
+**Shipped 2026-11-11** by squad `Context-policy-per-role` (backlog task T-10; its slices T-20 to T-24):
 
-Check first: whether a typed `/compact` works through Almanac's console send path, and what a Gemini agent has
-instead. The next squad's brief is `docs/next-squad-brief.md`.
+- Context per agent: a CTX column in FLEET and the owner chip in PLAN, marked at or above `context_warn`
+  (`config.json`, default 300,000). It is the tokens one step re-reads. For a Gemini agent it now comes from agy's
+  `step_update` usage; before, it was the conversation's running total.
+- `roles.context_policy`, set in the ROLES form: `none`, `fresh-per-task`, `compact-at-N`. Seeded once: implementers
+  `fresh-per-task`, architects and the orchestrator `compact-at-300000`, reviewers `none`.
+- Enforcement is in the hub, on one event: a task becoming `accepted` (`door.context_boundary`). A `fresh-per-task`
+  owner is retired: its session is ended, its spawn slot is free again, and its handle is refused as an owner. A
+  `compact-at-N` owner, and the task's creator when it is in the squad (the lead), gets `/compact` when its context
+  is at or above N, at most once in ten minutes. Claude: typed into its console (`console.send`); typed mid-turn it
+  queues and runs when the turn ends. Gemini: its host sends agy a raw `/compact` turn. A headless Claude has no
+  console, and the task's log says so.
+- Respawn: `mesh_respawn(ref)`, CLI `respawn`, and [RESPAWN] on a task in PLAN. The owner's session is ended and a
+  fresh one of the same handle, role and worktree starts on the task, with the mission, the task and its log as
+  the kickoff (cut to fit a command line). A stalled agent's escalation names it as the next step after `continue`.
+- From the operator during the run: BACKLOG [ASSIGN] moves a backlog task into a running squad, and
+  `mesh_spawn(ref=...)` puts a fresh member on an existing task. The backlog is a feature map (T-32): a backlog
+  task can have a backlog parent (`mesh_file(backlog=true, parent=...)`, `mesh_log(ref, parent=...)` to move it),
+  BACKLOG shows parents collapsed with a slice count, a dispatched or assigned parent takes its queued slices
+  along, and `mesh_amend` replaces a task's title, body or files with the old text kept in its log.
+
+Measured in that run: six builders, one task each, ended at 127k to 265k tokens per step, against 662k for the
+builder reused over twelve slices. A respawn on T-23 ended a session at 211k and the fresh one fixed five review
+findings from the task's log alone, ending near 125k. The lead was compacted at a task boundary from 445k to 74k.
+
+Checked first: a typed `/compact` works on an idle Claude Code session and queues mid-turn; agy runs `/compact` as a
+turn (a `checkpoint` step).
+
+Left:
+
+- Not run in a browser: the CTX column, the owner chip, the ROLES policy fields, [RESPAWN], [ASSIGN] and the
+  BACKLOG tree.
+- Not run on a live Gemini agent: retire, respawn and compact. What a compaction frees on agy is not measured.
+- No second task was done by a fresh builder under the enforced policy, so "flat context across tasks" rests on
+  each builder's one task and on the respawn.
+- A compaction summary loses exact names. A Gemini reviewer that its own runner compacted mid-review wrote
+  verdicts citing functions that do not exist; `none` does not stop a runner's own compaction.
+- The backlog tasks filed from this run: what a task costs (T-25 to T-28, T-11), a shorter review loop (T-29 to
+  T-31), squad lifecycle (T-17, T-18).
 
 ## 14. Findings ledger: is review worth its tokens — M
 
