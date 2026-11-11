@@ -2405,7 +2405,7 @@ async function loadTask(ref) {
 // (POST /api/squads/dispatch, the operator's only), after a second click that names the roster and the limit.
 // [ASSIGN] moves one into a running squad of its project (POST /api/squads/assign): pick the squad, click twice.
 const backlogState = { rev: undefined, rows: [], note: "", msg: "", armed: null, armedAt: 0, busy: false, sig: "",
-  squads: [], squadsAt: 0, pick: {}, armedAssign: null };
+  squads: [], squadsAt: 0, pick: {}, armedAssign: null, open: {} };   // open: {ref: true} for the parents expanded; a parent starts collapsed
 const BACKLOG_EMPTY = "No backlog. Agents and the operator file one with mesh_file(backlog=true).";
 const DEFAULT_SQUAD = [{ role: "orchestrator-claude" }, { role: "reviewer-gemini" }];   // the door's DEFAULT_ROSTER
 
@@ -2443,7 +2443,10 @@ async function loadBacklog(rev) {
   paintBacklog();
 }
 
-function backlogRow(o) {
+// a parent's own count covers its slices wherever they are (still in the backlog or already in a squad)
+function slicesText(c) { return `${c.total} slice${c.total === 1 ? "" : "s"}, ${c.accepted} accepted`; }
+
+function backlogRow(o, depth, listedKids) {
   const armed = backlogState.armed === o.ref;
   const btn = el("button", { type: "button", cls: `btn ${armed ? "confirm" : "hi"}`, disabled: backlogState.busy,
     text: armed ? "[LAUNCH? click again]" : "[DISPATCH ▸]",
@@ -2467,10 +2470,22 @@ function backlogRow(o) {
     assign.push(sel, " ", ab, " ");
   }
   const project = String(o.project || "").split(/[\\/]/).filter(Boolean).pop() || "";
+  let toggle = null;
+  if (listedKids) {                                     // its slices still in the backlog sit under it, collapsed until opened
+    const open = !!backlogState.open[o.ref];
+    toggle = el("button", { type: "button", cls: "btn", "data-toggle": o.ref, "aria-expanded": String(open),
+      "aria-label": `${open ? "collapse" : "expand"} the slices of ${o.ref}`, text: open ? "▾" : "▸" });
+    toggle.addEventListener("click", (e) => { e.stopPropagation(); backlogState.open[o.ref] = !open; paintBacklog(); });
+    toggle.addEventListener("keydown", (e) => e.stopPropagation());
+  }
+  const task = el("td", { cls: "task", title: `${o.title}\n${o.project || ""}` }, toggle, toggle ? " " : null,
+    depth && !toggle ? el("span", { cls: "dim", text: "└ " }) : null, o.title,
+    project ? el("span", { cls: "dim", text: ` · ${project}` }) : null,
+    o.children?.total ? el("span", { cls: "dim", text: ` · ${slicesText(o.children)}` }) : null);
+  if (depth) task.style.paddingLeft = `${8 + Math.min(depth, 6) * 16}px`;   // CSSOM: the CSP allows no style attribute
   const tr = el("tr", { tabindex: "0", "data-ref": o.ref, cls: meshState.selTask === o.ref ? "sel" : "" },
     el("td", { cls: "cyan", text: o.ref }),
-    el("td", { cls: "task", title: `${o.title}\n${o.project || ""}` }, o.title,
-      project ? el("span", { cls: "dim", text: ` · ${project}` }) : null),
+    task,
     el("td", { cls: "last", text: backlogRoster(o), title: `${backlogRoster(o)}\n${backlogLimit(o)}` }),
     el("td", { cls: "r", text: age(o.created_ts), title: `filed by ${o.created_by_name}` }),
     el("td", {}, ...assign, btn),
@@ -2484,14 +2499,31 @@ function paintBacklog() {
   const rows = backlogState.rows;
   const sig = JSON.stringify([rows, backlogState.armed, backlogState.busy, backlogState.note, backlogState.msg,
     meshState.selTask, rows.map((o) => age(o.created_ts)), backlogState.squads.map((q) => [q.id, q.name, q.project]),
-    backlogState.pick, backlogState.armedAssign]);
+    backlogState.pick, backlogState.armedAssign, backlogState.open]);
   if (sig === backlogState.sig) return;               // polled: do not rebuild (and drop focus) when nothing changed
   backlogState.sig = sig;
   $("backlog-table").hidden = !rows.length;
   $("backlog-msg").textContent = backlogState.msg || backlogState.note || (rows.length ? "" : BACKLOG_EMPTY);
-  const focused = document.activeElement?.closest?.("#backlog-table tr")?.dataset.ref;
-  $("backlog-table").querySelector("tbody").replaceChildren(...rows.map(backlogRow));
-  if (focused) $("backlog-table").querySelector(`tr[data-ref="${CSS.escape(focused)}"]`)?.focus({ preventScroll: true });   // a polled repaint must not scroll the page back to the row
+  // rows arrive in tree order (a parent before its slices); a slice shows only when every parent above it is open
+  const byRef = new Map(rows.map((o) => [o.ref, o])), depth = new Map(), listedKids = new Set();
+  for (const o of rows) {
+    const up = o.parent && byRef.has(o.parent);
+    depth.set(o.ref, up ? depth.get(o.parent) + 1 : 0);
+    if (up) listedKids.add(o.parent);
+  }
+  const shown = rows.filter((o) => { for (let p = o.parent; p && byRef.has(p); p = byRef.get(p).parent) if (!backlogState.open[p]) return false; return true; });
+  const active = document.activeElement;
+  const focused = active?.closest?.("#backlog-table tr")?.dataset.ref, toggled = active?.dataset?.toggle;
+  $("backlog-table").querySelector("tbody").replaceChildren(...shown.map((o) => backlogRow(o, depth.get(o.ref), listedKids.has(o.ref))));
+  const back = toggled ? `button[data-toggle="${CSS.escape(toggled)}"]` : focused ? `tr[data-ref="${CSS.escape(focused)}"]` : null;
+  if (back) $("backlog-table").querySelector(back)?.focus({ preventScroll: true });   // a polled repaint must not scroll the page back to the row
+}
+
+function movedText(r) {                                  // what a parent's move did to its slices
+  const c = r.children || {}, out = [];
+  if (c.moved?.length) out.push(`${c.moved.length} slice${c.moved.length === 1 ? "" : "s"} moved with it (${c.moved.join(", ")})`);
+  if (c.left?.length) out.push(`left in place: ${c.left.map((x) => `${x.ref} ${x.why}`).join(", ")}`);
+  return out;
 }
 
 async function dispatchBacklog(o) {
@@ -2517,7 +2549,7 @@ async function dispatchBacklog(o) {
   }
   const failed = (r.squad?.agents || []).filter((a) => !a.ok).map((a) => `${a.agent_name} failed: ${a.error}`);
   backlogState.msg = r.dispatched
-    ? [`${o.ref} → squad ${r.squad.name}: ${r.launched} launched`, ...failed].join("; ")
+    ? [`${o.ref} → squad ${r.squad.name}: ${r.launched} launched`, ...movedText(r), ...failed].join("; ")
     : [`${o.ref} not dispatched${r.error ? `: ${r.error}` : ""}`, ...failed].join("; ");
   backlogState.busy = false; backlogState.rev = undefined;
   paintBacklog();
@@ -2551,7 +2583,7 @@ async function assignBacklog(o, squad) {
     r = { error: err.message };
   }
   backlogState.msg = r.ok
-    ? `${o.ref} → squad ${squad.name}${r.note ? `: ${r.note}` : `: ${r.lead} told`}`
+    ? `${o.ref} → squad ${squad.name}${r.note ? `: ${r.note}` : `: ${r.lead} told`}${movedText(r).map((t) => `; ${t}`).join("")}`
     : `${o.ref} not assigned${r.error ? `: ${r.error}` : ""}`;
   backlogState.busy = false; backlogState.rev = undefined; backlogState.squadsAt = 0;
   paintBacklog();
