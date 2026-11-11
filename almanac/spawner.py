@@ -419,7 +419,8 @@ def spawn_agent(
             return dict(ok=False, pid=None, agent_name=eff_name, session_id=None, provider=eff_provider, role_id=role_id,
                         error=f"Gemini runner not found; looked in: {'; '.join(runner['searched'])}; "
                               "set \"gemini\" in config.json")
-    token = web.agent_token(token, eff_name)    # the agent's own bearer: names it, opens /api/mesh only
+    session_id = str(uuid.uuid4())              # minted before the token, which carries it
+    token = web.agent_token(token, eff_name, session_id)    # the agent's own bearer: names it, opens /api/mesh only
 
     repo_dir = Path(cwd).expanduser().resolve()
     if not repo_dir.is_dir():
@@ -444,7 +445,6 @@ def spawn_agent(
             worktree_path = wt
             run_cwd = wt
 
-    session_id = str(uuid.uuid4())
     spawn_dir = service.state / "spawns" / f"{eff_name}-{session_id[:8]}"
     spawn_dir.mkdir(parents=True, exist_ok=True)
 
