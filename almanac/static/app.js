@@ -158,6 +158,280 @@ async function api(path, opts = {}) {
 const post = (path, body) => api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 const del = (path) => api(path, { method: "DELETE" });
 
+// ------------------------------------------------------------------ markdown (what agents write), as DOM nodes
+// md:begin. A pure parser, text to a small tree: no DOM and no globals, so tests/test_md.py runs this part under node.
+// ponytail: a hand-written subset (fenced code, inline code, # to ####, bold, italic, lists nested by indent, pipe
+// tables, quotes, rules, http(s) links, paragraphs, a newline as a line break). Not handled, shown as literal text:
+// raw HTML, setext headings, reference links, bare URLs, code inside a list item, table alignment, lazy quote lines.
+// Upgrade path: vendor a real parser (markdown-it) plus a sanitizer (DOMPurify) when agents' text outgrows this.
+// Every scan is linear: delimiters are found with indexOf, and a search that found nothing is not repeated.
+const MD_MAX_DEPTH = 8;                               // quotes, lists and emphasis nest this deep; deeper stays literal
+const MD_FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+const MD_HEAD = /^ {0,3}(#{1,4})[ \t]+(.*)$/;
+const MD_ITEM = /^([ \t]*)([-*+]|\d{1,9}[.)])[ \t]+(.*)$/;
+const MD_QUOTE = /^ {0,3}>/;
+const MD_PUNCT = "\\`*_{}[]()#+-.!|>~<";
+
+function mdIndent(s) {
+  let n = 0;
+  for (const ch of s) { if (ch === " ") n++; else if (ch === "\t") n += 4; else break; }
+  return n;
+}
+function mdIsRule(line) {                             // three or more of one of - * _, spaces allowed between
+  const s = line.replace(/[ \t]/g, "");
+  return s.length >= 3 && "-*_".includes(s[0]) && s === s[0].repeat(s.length);
+}
+function mdCells(line) {                              // a table row's cells; \| is a literal pipe, as is one in `code`
+  let s = line.trim();
+  if (s.startsWith("|")) s = s.slice(1);
+  if (s.endsWith("|") && !s.endsWith("\\|")) s = s.slice(0, -1);
+  const cells = [];
+  let cur = "", code = false;
+  for (let k = 0; k < s.length; k++) {
+    const ch = s[k];
+    if (ch === "\\" && s[k + 1] === "|") { cur += "|"; k++; continue; }
+    if (ch === "`") code = !code;
+    if (ch === "|" && !code) { cells.push(cur.trim()); cur = ""; continue; }
+    cur += ch;
+  }
+  cells.push(cur.trim());
+  return cells;
+}
+function mdTableAt(lines, i) {                        // a header row with a pipe, then a rule row of as many cells
+  if (!lines[i].includes("|") || i + 1 >= lines.length || !lines[i + 1].includes("-")) return false;
+  const rule = mdCells(lines[i + 1]);
+  return rule.every((c) => /^:?-+:?$/.test(c)) && rule.length === mdCells(lines[i]).length;
+}
+function mdHref(raw) {                                // only http(s), and only what new URL() accepts
+  const u = raw.trim().split(/\s+/)[0].replace(/^<(.*)>$/, "$1");
+  try {
+    const url = new URL(u);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.href : null;
+  } catch { return null; }
+}
+
+function mdParse(text, depth = 0) {
+  const lines = String(text ?? "").replace(/\r\n?/g, "\n").split("\n");
+  const out = [];
+  let para = [], i = 0, m;
+  const flush = () => { if (para.length) { out.push({ t: "p", c: mdInline(para.join("\n")) }); para = []; } };
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) { flush(); i++; continue; }
+    if ((m = MD_FENCE.exec(line))) {                  // runs to its closing fence, or to the end when there is none
+      flush();
+      const ch = m[1][0], body = [];
+      for (i++; i < lines.length; i++) {
+        const c = lines[i].trim();
+        if (c.length >= m[1].length && c === ch.repeat(c.length)) { i++; break; }
+        body.push(lines[i]);
+      }
+      out.push({ t: "code", lang: m[2].trim(), text: body.join("\n") });
+      continue;
+    }
+    if (mdIsRule(line)) { flush(); out.push({ t: "hr" }); i++; continue; }
+    if ((m = MD_HEAD.exec(line))) {
+      flush();
+      let h = m[2].trimEnd(), j = h.length;           // a closing run of # goes, when a space comes before it
+      while (j > 0 && h[j - 1] === "#") j--;
+      if (j === 0 || h[j - 1] === " " || h[j - 1] === "\t") h = h.slice(0, j).trimEnd();
+      out.push({ t: "h", level: m[1].length, c: mdInline(h) });
+      i++;
+      continue;
+    }
+    if (MD_QUOTE.test(line)) {
+      flush();
+      const inner = [];
+      for (; i < lines.length && MD_QUOTE.test(lines[i]); i++) inner.push(lines[i].replace(/^ {0,3}> ?/, ""));
+      out.push(depth >= MD_MAX_DEPTH ? { t: "p", c: mdInline(inner.join("\n")) } : { t: "quote", c: mdParse(inner.join("\n"), depth + 1) });
+      continue;
+    }
+    if (mdTableAt(lines, i)) {
+      flush();
+      const head = mdCells(lines[i]), rows = [];
+      for (i += 2; i < lines.length && lines[i].trim() && lines[i].includes("|"); i++) {
+        const cells = mdCells(lines[i]);
+        while (cells.length < head.length) cells.push("");   // a short row is padded; a long one keeps its extra cells
+        rows.push(cells.map((c) => mdInline(c)));
+      }
+      out.push({ t: "table", head: head.map((c) => mdInline(c)), rows });
+      continue;
+    }
+    if (MD_ITEM.test(line)) {
+      flush();
+      const [lists, next] = mdList(lines, i);
+      out.push(...lists);
+      i = next;
+      continue;
+    }
+    para.push(line);
+    i++;
+  }
+  flush();
+  return out;
+}
+
+// a run of list lines: items, lines indented under an item (its continuation), and blank lines between items
+function mdList(lines, i) {
+  const items = [];
+  while (i < lines.length) {
+    const line = lines[i], m = MD_ITEM.exec(line);
+    if (m && !mdIsRule(line)) { items.push({ indent: mdIndent(m[1]), ordered: /\d/.test(m[2]), marker: m[2], text: m[3] }); i++; continue; }
+    if (!line.trim()) {
+      let k = i + 1;
+      while (k < lines.length && !lines[k].trim()) k++;
+      if (k < lines.length && ((MD_ITEM.test(lines[k]) && !mdIsRule(lines[k])) || mdIndent(lines[k]) > items[items.length - 1].indent)) { i = k; continue; }
+      break;
+    }
+    if (mdIndent(line) > items[items.length - 1].indent) { items[items.length - 1].text += "\n" + line.trim(); i++; continue; }
+    break;
+  }
+  const root = { sub: [] }, stack = [{ indent: -1, node: root }];
+  for (const it of items) {
+    while (stack.length > 1 && stack[stack.length - 1].indent >= it.indent) stack.pop();
+    if (stack.length > MD_MAX_DEPTH) stack.length = MD_MAX_DEPTH;   // deeper items become siblings at the limit
+    const parent = stack[stack.length - 1].node;
+    let list = parent.sub[parent.sub.length - 1];
+    if (!list || list.ordered !== it.ordered) { list = { t: "list", ordered: it.ordered, items: [] }; parent.sub.push(list); }
+    const node = { marker: it.marker, c: mdInline(it.text), sub: [] };
+    list.items.push(node);
+    stack.push({ indent: it.indent, node });
+  }
+  return [root.sub, i];
+}
+
+// inline: `code`, **bold** / __bold__, *italic* / _italic_ (an underscore inside a word stays literal, for
+// snake_case paths), [text](http-url), ![alt](http-url) as a link, \-escapes, and a newline as a break
+function mdInline(s, depth = 0) {
+  const out = [], none = new Set();
+  let buf = "", i = 0;
+  const push = (node) => { if (buf) { out.push({ t: "text", v: buf }); buf = ""; } out.push(node); };
+  const find = (tok, from) => {                       // `from` only grows for a given tok, so a miss stays a miss
+    if (none.has(tok)) return -1;
+    const k = s.indexOf(tok, from);
+    if (k < 0) none.add(tok);
+    return k;
+  };
+  const word = (c) => !!c && /[A-Za-z0-9]/.test(c);
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch === "\\" && i + 1 < s.length && MD_PUNCT.includes(s[i + 1])) { buf += s[i + 1]; i += 2; continue; }
+    if (ch === "\n") { push({ t: "br" }); i++; continue; }
+    if (ch === "`") {
+      let n = 1;
+      while (s[i + n] === "`") n++;
+      const tick = "`".repeat(n);
+      let k = find(tick, i + n);
+      while (k >= 0 && s[k + n] === "`") {            // a longer run is not the closer: skip past it
+        let e = k;
+        while (s[e] === "`") e++;
+        k = s.indexOf(tick, e);
+      }
+      if (k >= 0) {
+        let v = s.slice(i + n, k).replace(/\n/g, " ");
+        if (v.length > 2 && v[0] === " " && v[v.length - 1] === " ") v = v.slice(1, -1);
+        push({ t: "code", v });
+        i = k + n;
+        continue;
+      }
+      buf += tick; i += n;
+      continue;
+    }
+    if (ch === "*" || ch === "_") {
+      const L = s[i + 1] === ch ? 2 : 1, tok = ch.repeat(L), after = s[i + L];
+      if (depth < MD_MAX_DEPTH && (ch === "*" || !word(s[i - 1])) && after && after !== " " && after !== "\n") {
+        const k = find(tok, i + L + 1);               // and the content is more than * and _ (a run of them is text)
+        if (k >= 0 && s[k - 1] !== " " && s[k - 1] !== "\n" && (ch === "*" || !word(s[k + L])) && /[^*_]/.test(s.slice(i + L, k))) {
+          push({ t: L === 2 ? "b" : "i", c: mdInline(s.slice(i + L, k), depth + 1) });
+          i = k + L;
+          continue;
+        }
+      }
+      buf += ch; i++;
+      continue;
+    }
+    if (ch === "[" || (ch === "!" && s[i + 1] === "[")) {
+      const o = ch === "!" ? i + 1 : i, close = find("]", o + 1);
+      if (close >= 0 && s[close + 1] === "(") {
+        const end = find(")", close + 2);
+        const href = end >= 0 ? mdHref(s.slice(close + 2, end)) : null;
+        if (href && depth < MD_MAX_DEPTH) {           // an image is only ever a link: nothing is fetched
+          const label = s.slice(o + 1, close);
+          push({ t: "a", href, c: label ? mdInline(label, depth + 1) : [{ t: "text", v: href }] });
+          i = end + 1;
+          continue;
+        }
+      }
+      buf += s.slice(i, o + 1); i = o + 1;
+      continue;
+    }
+    buf += ch; i++;
+  }
+  if (buf) out.push({ t: "text", v: buf });
+  return out;
+}
+// md:end
+
+// The DOM side: elements and text nodes only (el() sets textContent); the only attribute input reaches is a link's
+// href, after mdHref() allowed it. Rendered trees are cached by text and cloned, as the feeds repaint every 2 s.
+function mdInlineDom(nodes, parent) {
+  for (const n of nodes) {
+    if (n.t === "text") parent.append(n.v);
+    else if (n.t === "br") parent.append(el("br"));
+    else if (n.t === "code") parent.append(el("code", { text: n.v }));
+    else {
+      const node = n.t === "a" ? el("a", { href: n.href, rel: "noopener noreferrer", target: "_blank" }) : el(n.t === "b" ? "strong" : "em");
+      mdInlineDom(n.c, node);
+      parent.append(node);
+    }
+  }
+}
+function mdListDom(list) {
+  const l = el(list.ordered ? "ol" : "ul");
+  for (const it of list.items) {
+    const li = el("li");
+    if (list.ordered) li.append(el("span", { cls: "md-n", text: it.marker }));   // the number as written
+    mdInlineDom(it.c, li);
+    for (const sub of it.sub) li.append(mdListDom(sub));
+    l.append(li);
+  }
+  return l;
+}
+function mdBlockDom(blocks, parent) {
+  for (const b of blocks) {
+    let node;
+    if (b.t === "p" || b.t === "h") { node = el(b.t === "p" ? "p" : `h${b.level}`); mdInlineDom(b.c, node); }
+    else if (b.t === "code") node = el("pre", {}, el("code", { text: b.text }));
+    else if (b.t === "hr") node = el("hr");
+    else if (b.t === "quote") { node = el("blockquote"); mdBlockDom(b.c, node); }
+    else if (b.t === "list") node = mdListDom(b);
+    else if (b.t === "table") {
+      const row = (cells, tag) => el("tr", {}, ...cells.map((c) => { const td = el(tag); mdInlineDom(c, td); return td; }));
+      node = el("div", { cls: "md-table" }, el("table", {}, el("thead", {}, row(b.head, "th")), el("tbody", {}, ...b.rows.map((r) => row(r, "td")))));
+    }
+    if (node) parent.append(node);
+  }
+}
+const mdCache = new Map();
+// renderMd(text): a <div class="md"> holding the text as markdown
+function renderMd(text) {
+  const key = String(text ?? "");
+  let tpl = mdCache.get(key);
+  if (!tpl) {
+    if (mdCache.size >= 600) mdCache.clear();         // ponytail: drop-all cap; an LRU if repaints ever show it
+    tpl = el("div", { cls: "md" });
+    mdBlockDom(mdParse(key), tpl);
+    mdCache.set(key, tpl);
+  }
+  return tpl.cloneNode(true);
+}
+// transcript events: a person's or an agent's words render as markdown; tool calls, results and errors stay raw.
+// fleet.prose cuts at 4000 characters and saveGone at 2000, each ending in "…": a cut text stays plain, as a fence
+// cut in half would render as garbage.
+const cutText = (t, n) => (t.length > n ? `${t.slice(0, n - 1)}…` : t);
+const MD_KINDS = new Set(["you", "claude", "gemini", "peer_in", "peer_out"]);
+const proseNode = (kind, text) => (MD_KINDS.has(kind) && !(text.length >= 1999 && text.endsWith("…")) ? renderMd(text) : text);
+
 // ------------------------------------------------------------------ tooltip
 const tip = $("tip");
 function showTip(e, text) {
@@ -986,7 +1260,7 @@ async function loadDetail() {
   else {
     const items = doc.events.map((e, i) => {
       const key = `${e.ts}|${e.kind}|${e.text.slice(0, 40)}|${i - doc.events.length}`;
-      const li = el("li", { cls: `${e.kind}${state.feedKeys.size && !state.feedKeys.has(key) && !reduced ? " new" : ""}`, text: e.text, title: e.ts ? new Date(e.ts).toLocaleString() : null });
+      const li = el("li", { cls: `${e.kind}${state.feedKeys.size && !state.feedKeys.has(key) && !reduced ? " new" : ""}`, title: e.ts ? new Date(e.ts).toLocaleString() : null }, proseNode(e.kind, e.text));
       li.dataset.key = key;
       return li;
     });
@@ -1120,7 +1394,7 @@ function folderLabel(p) {
 function saveGone() {
   const recs = [...state.tiles.values()].filter((t) => t.gone).sort((a, b) => a.gone - b.gone).map((t) => ({
     p: t.p, gone: t.gone,
-    events: (t.events || []).slice(-60).map((e) => ({ ts: e.ts, kind: e.kind, text: String(e.text ?? "").slice(0, 2000) })),
+    events: (t.events || []).slice(-60).map((e) => ({ ts: e.ts, kind: e.kind, text: cutText(String(e.text ?? ""), 2000) })),
   }));
   put("g-gone", JSON.stringify(recs));
 }
@@ -1294,7 +1568,7 @@ function paintTile(t, doc) {
   const prev = new Set([...t.feed.children].map((li) => li.dataset.k));
   t.feed.replaceChildren(...(events.length ? events.map((e) => {
     const k = `${e.ts}|${e.kind}|${e.text.slice(0, 40)}`;
-    const li = el("li", { cls: `${e.kind}${fresh && !prev.has(k) && !reduced ? " new" : ""}`, text: e.text, title: e.ts ? new Date(e.ts).toLocaleString() : null });
+    const li = el("li", { cls: `${e.kind}${fresh && !prev.has(k) && !reduced ? " new" : ""}`, title: e.ts ? new Date(e.ts).toLocaleString() : null }, proseNode(e.kind, e.text));
     li.dataset.k = k;
     return li;
   }) : [el("li", { cls: "result", text: "no transcript yet" })]));
@@ -1737,7 +2011,7 @@ function paintMeshMessages() {
         el("span", { cls: "dim", text: `[${m.transport || "uds"}]` }),
         needsBadge(m),
       );
-      const body = el("div", { cls: "msg-body", text: m.body });
+      const body = el("div", { cls: "msg-body" }, renderMd(m.body));
       return el("li", { cls: fresh ? "new" : "", "data-id": m.id }, head, body);
     }));
   }
@@ -1775,7 +2049,7 @@ async function loadPeerContext() {
   const feed = $("mesh-ctx-feed");
   const atBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 40;
   feed.replaceChildren(...(events.length
-    ? events.map((e) => el("li", { cls: e.kind, text: e.text, title: e.ts ? new Date(e.ts).toLocaleString() : null }))
+    ? events.map((e) => el("li", { cls: e.kind, title: e.ts ? new Date(e.ts).toLocaleString() : null }, proseNode(e.kind, e.text)))
     : [el("li", { cls: "result", text: "no matching context events yet" })]));
   if (atBottom) feed.scrollTop = feed.scrollHeight;
 }
@@ -1955,16 +2229,15 @@ async function loadTask(ref) {
     el("span", { cls: "dim", text: ` · filed by ${o.created_by_name} ${age(o.created_ts)} ago${o.parent ? ` · part of ${o.parent}` : ""}` }),
     o.children?.total ? el("span", { cls: "dim", text: ` · accepted ${o.children.accepted}/${o.children.total}` }) : null,
   ].filter((n) => n !== null));
-  const logLine = (l) => `${clock(l.ts)} ${l.agent_name} [${l.kind}]`
+  const logHead = (l) => `${clock(l.ts)} ${l.agent_name} [${l.kind}]`
     + `${!l.status_to ? "" : l.kind === "create" ? ` as ${l.status_to}` : ` ${l.status_from || "–"} → ${l.status_to}`}`
-    + `${l.owner_to ? ` owner → ${l.owner_to}` : ""}`
-    + `${l.body ? `\n${l.body}` : ""}`;
+    + `${l.owner_to ? ` owner → ${l.owner_to}` : ""}`;
   const logCls = (k) => (k === "dead" ? "error" : k === "message" ? "peer_out" : k === "status" || k === "assign" ? "tool" : "claude");
   $("mesh-ctx-feed").replaceChildren(
-    el("li", { cls: "you", text: o.body || "(no body)" }),
+    el("li", { cls: "you" }, o.body ? renderMd(o.body) : "(no body)"),
     el("li", { cls: "result", text: o.files?.length ? `files: ${o.files.join(", ")}` : "files: none" }),
     ...(log.length
-      ? log.map((l) => el("li", { cls: logCls(l.kind), text: logLine(l), title: new Date(l.ts * 1000).toLocaleString() }))
+      ? log.map((l) => el("li", { cls: logCls(l.kind), title: new Date(l.ts * 1000).toLocaleString() }, logHead(l), l.body ? renderMd(l.body) : null))
       : [el("li", { cls: "result", text: "no log entries yet" })]),
   );
   $("mesh-ctx-feed").scrollTop = 0;                    // the log is newest first
@@ -2473,7 +2746,7 @@ async function openChat(id) {
   add("kept", null, el("dd", {}, kept(c), el("span", { cls: "dim", text: doc.read_from ? `  (reading the ${doc.read_from})` : "" })));
   $("chat-head").replaceChildren(el("div", { cls: "title", text: c.title }), kv);
   const feed = $("chat-feed");
-  feed.replaceChildren(...(doc.events.length ? doc.events.map((e) => el("li", { cls: e.kind, text: e.text, title: e.ts ? new Date(e.ts).toLocaleString() : null }))
+  feed.replaceChildren(...(doc.events.length ? doc.events.map((e) => el("li", { cls: e.kind, title: e.ts ? new Date(e.ts).toLocaleString() : null }, proseNode(e.kind, e.text)))
     : [el("li", { cls: "result", text: "nothing readable in this transcript" })]));
   feed.scrollTop = feed.scrollHeight;
   $("chat-actions").hidden = false;
@@ -2906,7 +3179,7 @@ function paintThread() {
           el("span", { cls: "dim", text: OPERATOR.has(m.to_name) ? "you" : m.to_name }),
           m.channel ? el("span", { cls: "violet", text: m.channel }) : null,
           needsBadge(m), resolve),
-        el("div", { cls: "msg-body", text: m.body }));
+        el("div", { cls: "msg-body" }, renderMd(m.body)));
     }));
     if (atBottom || feed.dataset.key !== t.key) feed.scrollTop = feed.scrollHeight;
     feed.dataset.key = t.key;

@@ -394,3 +394,37 @@ details table td:first-child, details table th:first-child { text-align: left; }
 .own-stalled { color: var(--amber); border-style: dotted; }   /* stopped on an API error; an unknown state stays neutral */
 .plan tr.group { cursor: default; }
 .plan tr.group:hover th { background: none; }
+/* plan table: fixed columns, so TASK and LAST share what is left and cut with an ellipsis, rather than the table
+   growing past the box (it still scrolls below 640px) */
+.plan { table-layout: fixed; min-width: 640px; }
+.plan th:nth-child(1) { width: 6ch; } .plan th:nth-child(3) { width: 14ch; } .plan th:nth-child(4) { width: 22ch; }
+.plan th:nth-child(5) { width: 7ch; }
+.plan td { overflow: hidden; text-overflow: ellipsis; }
+.plan td.task, .plan td.last { max-width: none; }
+
+/* markdown (renderMd): agents' words as blocks, in the theme's colours; wide code and tables scroll inside */
+.md { display: inline-block; vertical-align: top; width: 100%; text-indent: 0; white-space: normal; overflow-wrap: anywhere; }
+.md > :first-child { margin-top: 0; } .md > :last-child { margin-bottom: 0; }
+.md p, .md ul, .md ol, .md pre, .md blockquote, .md .md-table, .md h1, .md h2, .md h3, .md h4, .md hr { margin: 4px 0; }
+.md h1, .md h2, .md h3, .md h4 { color: var(--hi); font-weight: 700; line-height: 1.35; }
+.md h1 { font-size: 15px; } .md h2 { font-size: 14px; } .md h3, .md h4 { font-size: 13px; }
+.md h4 { color: var(--fg); }
+.md ul, .md ol { padding-left: 2.4ch; }
+.md ol { list-style: none; padding-left: 1ch; }
+.md li { padding: 0; text-indent: 0; border: 0; white-space: normal; }    /* undo .feed li / .contact-feed li */
+.md li::before { content: none; display: none; }
+.md-n { color: var(--dim); margin-right: 1ch; }
+.md code { color: var(--cyan); }
+.md pre { overflow-x: auto; max-width: 100%; padding: 4px 8px; background: var(--bg); border: 1px solid var(--line);
+          white-space: pre; overflow-wrap: normal; }
+.md pre code { color: var(--fg); }
+.md blockquote { padding-left: 1ch; border-left: 2px solid var(--line); color: var(--dim); }
+.md hr { border: 0; border-top: 1px dashed var(--dim); }
+.md li ul, .md li ol { margin: 0; padding-left: 4.4ch; }   /* a nested list sits under its parent item's text */
+.md-table { overflow-x: auto; max-width: 100%; }
+.md table { width: auto; }
+.md th, .md td { border: 1px solid var(--line); padding: 1px 6px; white-space: normal; text-align: left; vertical-align: top;
+                 overflow-wrap: normal; }
+.md th { color: var(--hi); }
+.md a { color: var(--cyan); text-decoration: underline; }
+.md strong { color: var(--hi); }
