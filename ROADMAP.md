@@ -186,22 +186,23 @@ stat per worktree, an apply or merge button, and never deleting a worktree with 
 
 ## 13. Context policy per role — M
 
-Evidence from this build: impl-claude's first slice ran 37 messages on 5.1M cache-read tokens (about 140k re-read
-per step); its last 40 minutes ran 83 messages on 54M (about 650k per step). impl-gallery did a whole slice from a
-fresh start in 38 messages and 4M. A long-lived worker pays for its history on every tool call, and the fresh
-reviewer found five bugs that two long-context agents had missed.
+Evidence: on 2026-11-10 impl-claude's first slice re-read about 140k tokens per step and its last 40 minutes about
+650k; a fresh impl-gallery did a whole slice in 4M, and a fresh reviewer found five bugs two long-context agents had
+missed. On 2026-11-11 the architect reused builders across slices again; tokens re-read per step, first 20 steps
+against last 20: impl-claude 88k to 662k (128.7M read, 12 slices in one session), arch-claude 131k to 583k,
+impl-plan 97k to 420k, impl-backend 92k to 397k, against engram-fable, one job then ended, 157k to 172k.
 
-Policy to build: implementers and reviewers are one task, one session (a fresh spawn with a self-contained brief;
-elastic squads already works this way). The integrator and the architect keep continuity and compact at a slice
-boundary once context passes a threshold (never mid-slice, never after every small fix); their plan and queue live
-outside the context, so a clear is safe. Pieces:
+What the 2026-11-11 build unblocked: the handoff is a task ref and its log (item 9); "between tasks" is a task
+reaching `accepted`; a cheap fresh agent is an elastic spawn with the role's allowed models and efforts; typing
+into a console at the right moment is what `recover.py` already does. Pieces:
 
-- context size per agent in FLEET and on the heatmap (`sessions.context` is stored), with a warning threshold;
-- a per-role `context_policy` (`fresh-per-task` | `compact-at-N%` | `none`);
-- an architect action "retire and respawn with handoff";
-- `/compact` typed at a slice boundary (Almanac already types `/model` into a console; untested).
+- context size per agent in FLEET and on the PLAN owner chip, with a threshold (`sessions.context` is stored);
+- a per-role `context_policy`: `fresh-per-task` | `compact-at-N` (at a task boundary only) | `none`;
+- a lead action that respawns an owner on the same task with its log, which is also the recovery step beyond
+  `continue` for a stalled agent.
 
-Depends on 9 and 10 for the handoff. Item 10 (Engram for Almanac) should be designed around this.
+Check first: whether a typed `/compact` works through Almanac's console send path, and what a Gemini agent has
+instead. The next squad's brief is `docs/next-squad-brief.md`.
 
 ## 14. Findings ledger: is review worth its tokens — M
 
