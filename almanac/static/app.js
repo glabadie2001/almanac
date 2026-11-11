@@ -63,7 +63,7 @@ const meshState = {
   seenMsgIds: new Set(), ctxSig: "", squadFilter: "", open: [], pair: null, squadChosen: false,
 };
 // MESH plan: the selected squad's tasks (GET /api/mesh/objects), refetched only when objects_rev or the squad changes
-const planState = { key: null, rev: undefined, rows: [], note: "", stale: true, sig: "", group: get("plan-group", "tree") };
+const planState = { key: null, rev: undefined, rows: [], note: "", stale: true, sig: "", seq: 0, group: get("plan-group", "tree") };
 // feed filters shared by FLEET, GALLERY and the MESH context stream: [kinds= value, label]
 const KIND_SETS = [["", "all"], ["you,claude,gemini,peer_in,peer_out", "dialog"], ["peer_in,peer_out", "contacts"], ["tool,result,error", "tools"]];
 function fillKindSeg(id, current) {
@@ -1605,7 +1605,7 @@ async function loadMesh() {
     return tr;
   }));
 
-  if (!meshState.selPeer && meshState.peers.length) {
+  if (!meshState.selPeer && !meshState.selTask && meshState.peers.length) {   // an open task keeps the pane
     const p0 = meshState.peers[0];
     selectPeer(p0.name || String(p0.pid), p0.session_id, false);
     loadPeerContext();
@@ -1801,38 +1801,40 @@ async function planGet(path) {
 async function loadPlan(rev) {
   const sq = meshState.squadFilter;
   if (!planState.stale && sq === planState.key && rev === planState.rev) return;
-  if (sq !== planState.key) { planState.rows = []; planState.note = "loading plan…"; }
+  const seq = ++planState.seq;                         // only the newest fetch paints
+  if (sq !== planState.key) { planState.rows = []; planState.note = "loading plan…"; paintPlan(); }
   planState.stale = false; planState.key = sq; planState.rev = rev;
   if (!sq) { planState.note = "pick a squad above to see its plan"; paintPlan(); return; }
   let doc;
   try {
     doc = await planGet(`/api/mesh/objects?squad=${encodeURIComponent(sq)}&kind=task&limit=500`);
   } catch (err) {
-    if (sq !== meshState.squadFilter) return;
+    if (seq !== planState.seq || sq !== meshState.squadFilter) return;
     planState.stale = true;                            // retried on the next poll, only while it fails
     planState.note = `plan unavailable: ${err.message}`;
     paintPlan();
     return;
   }
-  if (sq !== meshState.squadFilter) return;            // the squad changed while this was in flight
+  if (seq !== planState.seq || sq !== meshState.squadFilter) return;   // a newer fetch or another squad
   planState.rows = doc?.objects || [];
-  planState.note = "";
+  planState.note = doc ? "" : "this server predates tasks: restart Almanac";
   paintPlan();
   if (meshState.selTask) loadTask(meshState.selTask);
 }
 
-// busy / idle / ended follow the roster on every poll (it is fresher than the fetched rows: a live owner is busy or
-// idle, an absent one has ended); any other value the door sends (stalled, later ones) is drawn as sent
+// the roster decides on every poll, as it is fresher than the fetched rows: a live owner is stalled (stopped on an API
+// error), busy or idle, and an absent one has ended. The rows are only fetched after a roster poll, so the door's own
+// owner_state is never needed here.
 function planOwnerState(o) {
   if (!o.owner_name) return "none";
-  if (o.owner_state && !["busy", "idle", "ended"].includes(o.owner_state)) return o.owner_state;
   const p = meshState.peers.find((q) => (o.owner_session ? q.session_id === o.owner_session : q.name === o.owner_name));
-  return p ? (active(p) ? "busy" : "idle") : "ended";
+  return !p ? "ended" : p.stalled ? "stalled" : active(p) ? "busy" : "idle";
 }
 const statusPill = (s) => el("span", { cls: `flag st-${slug(s)}`, text: s || "–" });
 function ownerChip(o) {
   const own = planOwnerState(o);
-  return el("span", { cls: `flag own-${slug(own)}`, text: o.owner_name || "unowned",
+  const plain = ["none", "busy", "idle", "ended"].includes(own);   // colour says these; any other state is spelled out
+  return el("span", { cls: `flag own-${slug(own)}`, text: plain ? o.owner_name || "unowned" : `${o.owner_name} · ${own}`,
     title: own === "none" ? "nobody owns this task" : `${o.owner_name}: ${own}` });
 }
 function planLast(l) {
@@ -1847,7 +1849,7 @@ function planRow(o, depth, byOwner) {
     byOwner ? (o.parent ? el("span", { cls: "dim", text: `${o.parent} › ` }) : null) : (depth ? el("span", { cls: "dim", text: "└ " }) : null),
     o.title,
     o.children?.total ? el("span", { cls: "dim", text: ` · accepted ${o.children.accepted}/${o.children.total}` }) : null);
-  if (!byOwner && depth) task.style.paddingLeft = `${8 + depth * 16}px`;   // CSSOM: the CSP allows no style attribute
+  if (!byOwner && depth) task.style.paddingLeft = `${8 + Math.min(depth, 6) * 16}px`;   // CSSOM: the CSP allows no style attribute
   const tr = el("tr", { tabindex: "0", "data-ref": o.ref, cls: meshState.selTask === o.ref ? "sel" : "" },
     el("td", { cls: "cyan", text: o.ref }),
     task,
