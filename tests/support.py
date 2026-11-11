@@ -94,3 +94,14 @@ class Fixture(unittest.TestCase):
         except ValueError:
             doc = raw_body
         return status, out_headers, doc
+
+
+def runner_probe(root: Path, *, gemini=True, claude=False) -> dict:
+    """A Service `probe` that sees only a fake home under `root`: no real agy or claude on this machine decides a
+    test. With `gemini`, `<root>/home/.gemini/bin/agy.exe` exists."""
+    home = Path(root) / "home"
+    for wanted, path in ((gemini, home / ".gemini" / "bin" / "agy.exe"), (claude, home / ".local" / "bin" / "claude.exe")):
+        if wanted:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"")
+    return dict(home=home, env={}, which=lambda name: None)

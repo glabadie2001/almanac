@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import statistics
 import threading
@@ -39,6 +40,8 @@ create table if not exists usage (message_id text primary key, session text, ts 
                                   input integer, cache_create integer, cache_read integer, output integer);
 create index if not exists usage_ts on usage(ts);
 create table if not exists meta (key text primary key, value text);
+create table if not exists turns (session text not null, start_ts real not null, end_ts real not null, kind text,
+                                  primary key (session, start_ts));
 create table if not exists actions (id integer primary key autoincrement, ts real, action text, pid integer,
                                     session text, name text, ok integer, detail text, who text);
 create table if not exists messages (
@@ -94,11 +97,19 @@ create table if not exists spawned_agents (
     worktree_path text,
     pid integer,
     created_ts real not null,
-    channels text
+    channels text,
+    spawned_by text
 );
 """
-SPAWNED_COLUMNS = "session_id, agent_name, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, created_ts, channels"
+SPAWNED_COLUMNS = "session_id, agent_name, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, created_ts, channels, spawned_by"
 SHELL = ("Bash", "PowerShell", "run_command")
+EDIT_TOOLS = ("Edit", "Write", "NotebookEdit", "MultiEdit", "replace_file_content", "write_to_file",
+              "multi_replace_file_content")   # Claude Code's and Gemini's file-editing tools
+ANY_ROLE = "*"                # a squad's spawn_role that lets its architect add any role the operator defined
+NEEDS = (None, "reply", "blocking")        # a message may ask for an answer; `blocking` means the sender cannot go on
+OPERATOR_NAMES = ("operator", "almanac-hub")  # the human, by every name the hub answers to in the journal
+MESSAGE_COLUMNS = ("id, msg_id, ts, from_name, from_session, from_provider, to_name, to_session, to_provider, "
+                   "channel, squad_id, body, transport, needs, answered_ts, answered_by, read_ts")
 DUPLICATE_WINDOW = 900      # seconds: a transcript copy of a message the hub journaled this recently is the same message
 
 ARCHITECT = (
@@ -115,6 +126,10 @@ IMPLEMENTER = (
     "a slice is done, report to the architect and reviewer over `mesh_send`: files touched, the test command and "
     "its result, and anything you could not do."
 )
+# a role's `allowed_commands`: exact command lines its runner may run. For Gemini they become agy allow rules (agy's
+# default mode, all this account gets, denies every other shell command); for Claude agents the field is
+# informational for now. The shipped reviewers get the lines a review needs.
+REVIEWER_COMMANDS = ["git status --short", "git diff", "git diff --stat", "python -m unittest discover tests"]
 REVIEWER = (
     "You are the Cross-Model Peer Reviewer: you do not edit code. Read the implementer's diff and live context "
     "(`mesh_context_stream`), run the tests yourself, and probe edge cases. Send findings (file:line, what breaks, "
@@ -136,6 +151,8 @@ DEFAULT_ROLES = (
         permission_mode="auto",
         channels=["#squad", "#architecture"],
         system_prompt=ARCHITECT,
+        may_page_operator=True,
+        may_spawn=True,
     ),
     dict(
         id="architect-claude",
@@ -147,6 +164,8 @@ DEFAULT_ROLES = (
         permission_mode="auto",
         channels=["#squad", "#architecture"],
         system_prompt=ARCHITECT,
+        may_page_operator=True,
+        may_spawn=True,
     ),
     dict(
         id="implementer-claude",
@@ -180,6 +199,7 @@ DEFAULT_ROLES = (
         permission_mode="auto",
         channels=["#squad", "#review"],
         system_prompt=REVIEWER,
+        allowed_commands=REVIEWER_COMMANDS,
     ),
     dict(
         id="reviewer-claude",
@@ -191,6 +211,7 @@ DEFAULT_ROLES = (
         permission_mode="auto",
         channels=["#squad", "#review"],
         system_prompt=REVIEWER,
+        allowed_commands=REVIEWER_COMMANDS,
     ),
 )
 
@@ -252,7 +273,33 @@ class Store:
                              ("provider", "text default 'claude'")):
             if column not in have:
                 self.db.execute(f"alter table sessions add column {column} {kind}")
+        # v5: a message can ask for an answer (`needs`), knows which message answered it, and when the operator read it
+        have = {r[1] for r in self.db.execute("pragma table_info(messages)")}
+        for column, kind in (("needs", "text"), ("answered_ts", "real"), ("answered_by", "integer"), ("read_ts", "real")):
+            if column not in have:
+                self.db.execute(f"alter table messages add column {column} {kind}")
+        self.db.execute("create index if not exists messages_open on messages(needs, answered_ts)")
+        if "may_page_operator" not in {r[1] for r in self.db.execute("pragma table_info(roles)")}:
+            self.db.execute("alter table roles add column may_page_operator integer default 0")
+        # v6: the model that issued each tool call; per-session lookups that the 2 s tile poll makes
+        if "model" not in {r[1] for r in self.db.execute("pragma table_info(calls)")}:
+            self.db.execute("alter table calls add column model text")
+        self.db.execute("create index if not exists calls_session on calls(session, ts)")
+        self.db.execute("create index if not exists usage_session on usage(session, ts)")
         self._rekey_spawned()
+        # v7: elastic squads. A squad may let an agent whose role may_spawn add members of one role, up to a limit;
+        # each spawn row says who added it (null: the operator)
+        if "spawned_by" not in {r[1] for r in self.db.execute("pragma table_info(spawned_agents)")}:
+            self.db.execute("alter table spawned_agents add column spawned_by text")
+        have = {r[1] for r in self.db.execute("pragma table_info(squads)")}
+        for column, kind in (("spawn_role", "text"), ("spawn_limit", "integer default 0")):
+            if column not in have:
+                self.db.execute(f"alter table squads add column {column} {kind}")
+        if "may_spawn" not in {r[1] for r in self.db.execute("pragma table_info(roles)")}:
+            self.db.execute("alter table roles add column may_spawn integer default 0")
+        # v8: exact shell command lines a role's runner may run (agy's allow rules; informational for Claude)
+        if "allowed_commands" not in {r[1] for r in self.db.execute("pragma table_info(roles)")}:
+            self.db.execute("alter table roles add column allowed_commands text default '[]'")
         self.db.execute("create index if not exists spawned_agents_name on spawned_agents(agent_name, created_ts)")
         row = self.db.execute("select value from meta where key = 'schema'").fetchone()
         version = int(row[0]) if row else 0
@@ -282,15 +329,34 @@ class Store:
                     new = next(r["system_prompt"] for r in DEFAULT_ROLES if r["id"] == rid)
                     self.db.execute("update roles set system_prompt = ?, updated_ts = ? where id = ? and system_prompt = ?",
                                     (new, time.time(), rid, old))
-        self.db.execute("insert or replace into meta values ('schema', '4')")
+        if version < 5:                      # v5: the shipped roles that may page the operator
+            for r in DEFAULT_ROLES:
+                if r.get("may_page_operator"):
+                    self.db.execute("update roles set may_page_operator = 1 where id = ?", (r["id"],))
+        if version < 6:
+            # v6: turns (worktime) and calls.model exist only from a read of the transcripts, so read them all once
+            # more; every row is keyed, so the re-read adds nothing twice
+            self.db.execute("delete from files")
+        if version < 7:                      # v7: the shipped roles that may add squad members
+            for r in DEFAULT_ROLES:
+                if r.get("may_spawn"):
+                    self.db.execute("update roles set may_spawn = 1 where id = ?", (r["id"],))
+        if version < 8:                      # v8: the shipped reviewers may run the commands a review needs
+            for r in DEFAULT_ROLES:
+                if r.get("allowed_commands"):
+                    self.db.execute("update roles set allowed_commands = ? where id = ? and coalesce(allowed_commands, '[]') = '[]'",
+                                    (json.dumps(r["allowed_commands"]), r["id"]))
+        self.db.execute("insert or replace into meta values ('schema', '8')")
         if self.db.execute("select count(*) from roles").fetchone()[0] == 0:
             now = time.time()
             for r in DEFAULT_ROLES:
                 self.db.execute(
-                    "insert into roles (id, title, provider, model, effort, workspace_mode, permission_mode, system_prompt, channels, updated_ts) "
-                    "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "insert into roles (id, title, provider, model, effort, workspace_mode, permission_mode, system_prompt, "
+                    "channels, updated_ts, may_page_operator, may_spawn, allowed_commands) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (r["id"], r["title"], r["provider"], r["model"], r["effort"], r["workspace_mode"],
-                     r["permission_mode"], r["system_prompt"], json.dumps(r["channels"]), now),
+                     r["permission_mode"], r["system_prompt"], json.dumps(r["channels"]), now,
+                     int(bool(r.get("may_page_operator"))), int(bool(r.get("may_spawn"))),
+                     json.dumps(r.get("allowed_commands") or [])),
                 )
         self.db.commit()
 
@@ -312,7 +378,7 @@ class Store:
             self.db.execute(
                 f"insert or ignore into spawned_agents ({SPAWNED_COLUMNS}) select coalesce(session_id, 'legacy:' || agent_name), "
                 "agent_name, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, created_ts, "
-                f"{'channels' if 'channels' in old else 'null'} from spawned_agents_by_name")
+                f"{'channels' if 'channels' in old else 'null'}, null from spawned_agents_by_name")
             self.db.execute("drop table spawned_agents_by_name")
             self.db.commit()
         except BaseException:
@@ -349,10 +415,10 @@ class Store:
                 new_offset = self._read_file(path, root, offset, stats, provider=provider)
                 self.db.execute("insert or replace into files values (?, ?, ?, ?)", (key, st.st_size, st.st_mtime_ns, new_offset))
                 stats["read"] += 1
+            self.last_ingest = dict(stats, at=time.time(), seconds=round(time.monotonic() - started, 2))
+            # under the lock like every other write: the HTTP and hub threads share this connection
+            self.db.execute("insert or replace into meta values ('last_ingest', ?)", (json.dumps(self.last_ingest),))
             self.db.commit()
-        self.last_ingest = dict(stats, at=time.time(), seconds=round(time.monotonic() - started, 2))
-        self.db.execute("insert or replace into meta values ('last_ingest', ?)", (json.dumps(self.last_ingest),))
-        self.db.commit()
         return self.last_ingest
 
     def _read_file(self, path: Path, root: Path, offset: int, stats: dict, *, provider: str = "claude") -> int:
@@ -392,6 +458,8 @@ class Store:
         ts_raw = rec.get("timestamp")
         ts = parse_ts(ts_raw)
         main = not rec.get("isSidechain")
+        if main and session and ts:
+            self._turn(session, ts, kind, (rec.get("message") or {}).get("content"))
         if session and ts:
             self.db.execute(
                 "insert into sessions (id, project, first_ts, last_ts, sidechain, version, cwd, provider) values (?, ?, ?, ?, ?, ?, ?, ?) "
@@ -400,6 +468,10 @@ class Store:
                 "cwd = coalesce(excluded.cwd, cwd), provider = coalesce(excluded.provider, provider)",
                 (session, project, ts, ts, int(not main), rec.get("version"), rec.get("cwd") if main else None, prov))
         msg = rec.get("message") or {}
+        if prov == "gemini" and msg.get("model"):
+            # agy echoes the wire id (`gemini-4-carbon-high`) on tool calls and the base id on usage; one model
+            from almanac.gemini_host import split_agy_model_effort
+            msg = dict(msg, model=split_agy_model_effort(msg["model"])[0] or msg["model"])
         content = msg.get("content")
         if main and session and kind == "user":
             text = content if isinstance(content, str) else next(
@@ -418,14 +490,19 @@ class Store:
                     journaled = self.db.execute(
                         "select 1 from messages where transport != 'uds-transcript' and from_name = ? and body = ? "
                         "and ts between ? and ? and (to_session = ? or to_name = ? "
-                        "or (transport = 'uds-broadcast' and squad_id is ?)) limit 1",
+                        "or (transport = 'uds-broadcast' and (squad_id is ? or squad_id is null))) limit 1",
                         (sender, body, stamp - DUPLICATE_WINDOW, stamp + DUPLICATE_WINDOW, session, to[0], to[1])).fetchone()
                     if not journaled:
-                        self.db.execute(
-                            "insert or ignore into messages (msg_id, ts, from_name, to_name, to_session, to_provider, channel, squad_id, body, transport) "
-                            "values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'uds-transcript')",
-                            (det_id, stamp, sender, to[0], session, prov, parsed_peer.get("channel"), to[1], body),
+                        cur = self.db.execute(
+                            "insert or ignore into messages (msg_id, ts, from_name, to_name, to_session, to_provider, channel, squad_id, body, transport, needs) "
+                            "values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'uds-transcript', ?)",
+                            (det_id, stamp, sender, to[0], session, prov, parsed_peer.get("channel"), to[1], body,
+                             parsed_peer.get("needs")),
                         )
+                        if cur.rowcount:
+                            self._close_answered(cur.lastrowid, stamp, sender, to[0], to[1])
+                            if parsed_peer.get("needs"):
+                                self._close_if_answered(cur.lastrowid, stamp, sender, to[0], to[1])
                 elif not str(text).startswith("<"):
                     self.db.execute("update sessions set first_prompt = coalesce(first_prompt, ?) where id = ?",
                                     (" ".join(str(text).split())[:200], session))
@@ -446,7 +523,8 @@ class Store:
                     continue
                 tool = block.get("name") or "?"
                 cmd = (block.get("input") or {}).get("command") if tool in SHELL else None
-                self._call(ts_raw, ts, session, tool, block.get("id"), cmd)
+                model = msg.get("model") if msg.get("model") not in (None, "<synthetic>") else None
+                self._call(ts_raw, ts, session, tool, block.get("id"), cmd, model=model)
                 stats["calls"] += 1
         else:
             for block in content if isinstance(content, list) else []:
@@ -458,9 +536,31 @@ class Store:
                     (result_chars(block.get("content")), int(bool(block.get("is_error"))), ts, ts, block["tool_use_id"]))
                 stats["results"] += 1
 
-    def _call(self, ts_raw, ts, session, tool, tool_use_id, cmd, source="live"):
+    def _turn(self, session: str, ts: float, kind: str, content) -> None:
+        """Worktime. A user record that carries a prompt opens a turn at its time; every other main-thread record
+        stretches the newest turn that began at or before it (or opens an 'other' turn if there is none).
+        Keyed and max-only, so reading a transcript again changes nothing."""
+        text, prompt = (content, True) if isinstance(content, str) else (None, False)
+        if kind == "user" and isinstance(content, list):
+            blocks = [b for b in content if isinstance(b, dict)]
+            # any user record that is not a tool result is a prompt, with text or without (an image-only prompt
+            # must not stretch the previous turn across the idle gap before it)
+            prompt = not any(b.get("type") == "tool_result" for b in blocks)
+            text = next((b.get("text") for b in blocks if b.get("type") == "text"), None) if prompt else None
+        if kind == "user" and prompt:
+            opens = ("peer" if text and uds.parse_cross_session(str(text)) else "other" if text is None or str(text).startswith("<")
+                     else "prompt")
+            self.db.execute("insert or ignore into turns values (?, ?, ?, ?)", (session, ts, ts, opens))
+            return
+        cur = self.db.execute(
+            "update turns set end_ts = max(end_ts, ?) where session = ? and start_ts = "
+            "(select max(start_ts) from turns where session = ? and start_ts <= ?)", (ts, session, session, ts))
+        if not cur.rowcount:
+            self.db.execute("insert or ignore into turns values (?, ?, ?, 'other')", (session, ts, ts))
+
+    def _call(self, ts_raw, ts, session, tool, tool_use_id, cmd, source="live", model=None):
         row = dict(natural=natural_key(ts_raw, tool, cmd), tool_use_id=tool_use_id, session=session, ts=ts, tool=tool,
-                   family=None, head=None, cmd_len=None, search=0, tests=0, http=0, edit=0, source=source)
+                   family=None, head=None, cmd_len=None, search=0, tests=0, http=0, edit=0, source=source, model=model)
         if cmd is not None:
             row.update(family=classify.family(cmd), head=classify.head(cmd), cmd_len=len(cmd), **classify.adoption(cmd))
         cols = ", ".join(row)
@@ -469,6 +569,8 @@ class Store:
             # a legacy row for the same call steps aside for the live one, which has sizes and waits
             self.db.execute("delete from calls where natural = ? and source = 'legacy'", (row["natural"],))
             self.db.execute(f"insert or ignore into calls ({cols}) values ({marks})", tuple(row.values()))
+            if model and tool_use_id:          # a re-read corrects a row: no model before v6, or a Gemini wire id
+                self.db.execute("update calls set model = ? where tool_use_id = ? and model is not ?", (model, tool_use_id, model))
         else:
             self.db.execute(f"insert or ignore into calls ({cols}) values ({marks})", tuple(row.values()))
 
@@ -490,20 +592,32 @@ class Store:
 
     # ------------------------------------------------------------------ report
 
-    def report(self, days: int = 30, bucket: str = "day", now: float | None = None) -> dict:
+    def report(self, days: int = 30, bucket: str = "day", now: float | None = None, provider: str | None = None) -> dict:
         """Everything the dashboard draws: tiles (this period vs the one before), a series per bucket,
-        the family table and the tool table. `days` 0 means everything."""
+        the family table, the tool table and the per-model and per-provider tables. `days` 0 means everything.
+        `provider` ('claude' or 'gemini') keeps only calls and usage of sessions from that provider; legacy calls
+        (no session, no provider) then drop out. Coverage stays the whole database either way."""
         if bucket not in ("day", "week"):
             raise ValueError("bucket is day or week")
+        if provider not in REPORT_PROVIDERS:
+            raise ValueError("provider is claude or gemini")
         now = now or time.time()
+        call_prov = "case when c.source = 'legacy' then null else coalesce(s.provider, 'claude') end"
+        only = " and c.source = 'live' and coalesce(s.provider, 'claude') = ?" if provider else ""
+        only_usage = " and coalesce(s.provider, 'claude') = ?" if provider else ""
         with self.lock:
             first = self.db.execute("select min(ts) from calls").fetchone()[0]
             span = days * 86400 if days > 0 else max(86400, now - (first or now) + 86400)
             start, prev = now - span, now - 2 * span
-            calls = self.db.execute("select ts, tool, family, search, tests, http, edit, out_chars, seconds, session, source "
-                                    "from calls where ts >= ? order by ts", (prev,)).fetchall()
-            usage = self.db.execute("select ts, input, cache_create, cache_read, output, session from usage where ts >= ?",
-                                    (prev,)).fetchall()
+            # columns 0..10 are what the older helpers index; model, is_error and provider ride at the end
+            calls = self.db.execute(
+                "select c.ts, c.tool, c.family, c.search, c.tests, c.http, c.edit, c.out_chars, c.seconds, c.session, "
+                f"c.source, c.model, c.is_error, {call_prov} from calls c left join sessions s on s.id = c.session "
+                f"where c.ts >= ?{only} order by c.ts", (prev, provider) if provider else (prev,)).fetchall()
+            usage = self.db.execute(
+                "select u.ts, u.input, u.cache_create, u.cache_read, u.output, u.session, u.model, "
+                "coalesce(s.provider, 'claude') from usage u left join sessions s on s.id = u.session "
+                f"where u.ts >= ?{only_usage}", (prev, provider) if provider else (prev,)).fetchall()
             totals = self.db.execute("select count(*), sum(source = 'legacy'), count(distinct session) from calls").fetchone()
             last = self.db.execute("select value from meta where key = 'last_ingest'").fetchone()
         cur_calls = [c for c in calls if c[0] >= start]
@@ -511,13 +625,15 @@ class Store:
         cur_usage = [u for u in usage if u[0] >= start]
         old_usage = [u for u in usage if u[0] < start]
         return {
-            "range": dict(days=days, bucket=bucket, start=start, end=now),
+            "range": dict(days=days, bucket=bucket, start=start, end=now, provider=provider),
             "coverage": dict(first=first, calls=totals[0] or 0, legacy_calls=totals[1] or 0, sessions=totals[2] or 0),
             "last_ingest": json.loads(last[0]) if last else None,
             "tiles": tiles(cur_calls, old_calls, cur_usage, old_usage),
             "series": series(cur_calls, cur_usage, start, now, bucket),
             "families": family_table(cur_calls, old_calls),
             "tools": tool_table(cur_calls),
+            "models": model_table(cur_calls, old_calls, cur_usage, old_usage),
+            "providers": provider_table(cur_calls, old_calls, cur_usage, old_usage),
         }
 
     def log_action(self, action: str, pid: int, row: dict | None, ok: bool, detail: str, who: str = "") -> dict:
@@ -541,7 +657,173 @@ class Store:
                                   "from usage where session = ?", (session,)).fetchone()
             calls = self.db.execute("select count(*), sum(out_chars) from calls where session = ?", (session,)).fetchone()
         return dict(messages=row[0] or 0, input=row[1] or 0, cache_create=row[2] or 0, cache_read=row[3] or 0,
-                    output=row[4] or 0, calls=calls[0] or 0, read_back_kb=round((calls[1] or 0) / 1000, 1))
+                    output=row[4] or 0, calls=calls[0] or 0, read_back_kb=round((calls[1] or 0) / 1000, 1),
+                    **self.work_summary(session))
+
+    # ------------------------------------------------------------------ topology and swimlane (slice 4)
+
+    def message_graph(self, squad_id: str) -> list[dict]:
+        """Who wrote to whom in a squad: one edge per (from, to), broadcasts kept as their `@...` / `#...` target and
+        the hub's names folded into `operator`, with the count, the newest time and the flags still open on it."""
+        with self.lock:
+            rows = self.db.execute(
+                "select from_name, to_name, count(*), max(ts), "
+                "sum(needs = 'reply' and answered_ts is null), sum(needs = 'blocking' and answered_ts is null) "
+                "from messages where squad_id = ? group by from_name, to_name", (squad_id,)).fetchall()
+        edges: dict[tuple, dict] = {}
+        for frm, to, count, last, reply, blocking in rows:
+            key = ("operator" if frm in OPERATOR_NAMES else frm, "operator" if to in OPERATOR_NAMES else to)
+            e = edges.setdefault(key, {"from": key[0], "to": key[1], "count": 0, "last_ts": 0.0,
+                                       "open": {"reply": 0, "blocking": 0}})
+            e["count"] += count
+            e["last_ts"] = max(e["last_ts"], last or 0.0)
+            e["open"]["reply"] += reply or 0
+            e["open"]["blocking"] += blocking or 0
+        return sorted(edges.values(), key=lambda e: (-e["count"], e["from"], e["to"]))
+
+    def timeline_messages(self, *, squad_id: str | None = None, sessions=(), start: float, end: float,
+                          limit: int = 1000) -> list[dict]:
+        """Messages for the swimlane inside [start, end], oldest first (the newest `limit`): a squad's, or those to or
+        from any of `sessions`."""
+        sessions = [s for s in sessions if s][:20]
+        if squad_id:
+            where, params = "squad_id = ?", [squad_id]
+        elif sessions:
+            marks = ",".join("?" * len(sessions))
+            where, params = f"(from_session in ({marks}) or to_session in ({marks}))", [*sessions, *sessions]
+        else:
+            return []
+        with self.lock:
+            rows = self.db.execute(
+                f"select id, ts, from_name, to_name, needs, answered_ts, channel, body from messages where {where} "
+                "and ts between ? and ? order by ts desc limit ?", (*params, start, end, int(limit))).fetchall()
+        return [{"id": r[0], "ts": r[1], "from": "operator" if r[2] in OPERATOR_NAMES else r[2],
+                 "to": "operator" if r[3] in OPERATOR_NAMES else r[3], "needs": r[4], "answered_ts": r[5],
+                 "channel": r[6], "preview": " ".join(str(r[7] or "").split())[:120]} for r in reversed(rows)]
+
+    def timeline_marks(self, sessions, *, start: float, end: float, limit: int = 2000) -> list[dict]:
+        """Tool errors and file edits per session inside [start, end], oldest first (the newest `limit`). An edit is
+        an edit tool (Claude's or Gemini's) or a shell call classified as one; an error wins over an edit."""
+        sessions = [s for s in sessions if s][:20]
+        if not sessions:
+            return []
+        marks = ",".join("?" * len(sessions))
+        tools = ",".join("?" * len(EDIT_TOOLS))
+        with self.lock:
+            rows = self.db.execute(
+                f"select ts, session, is_error from calls where session in ({marks}) and ts between ? and ? "
+                f"and (is_error = 1 or tool in ({tools}) or family = 'edit') order by ts desc limit ?",
+                (*sessions, start, end, *EDIT_TOOLS, int(limit))).fetchall()
+        return [{"ts": r[0], "session": r[1], "kind": "error" if r[2] else "edit"} for r in reversed(rows)]
+
+    # ------------------------------------------------------------------ worktime
+
+    def worktime(self, sessions, *, start=None, end=None, bucket_s=None, open_until=None) -> dict:
+        """When each session worked, waited and sat idle, and how the sessions overlapped.
+
+        A turn runs from a prompt (typed, a peer message, a harness wrapper) to the last record before the next one.
+        Inside a turn, time in a `mesh_wait` call is waiting; the rest is work. Idle is the session's own span (first
+        turn to last activity, clipped to the range) minus its turns. Known limit: time a tool sits on a human
+        permission prompt counts as work, because the transcript cannot tell it from a slow tool; and a Gemini agent
+        that waits through `call_mcp_tool(ToolName="mesh_wait")` is not seen by `is_wait_tool`, so that wait is work too.
+        `open_until` {session: ts} stretches a session's last turn to ts (ingest lags a live, busy session)."""
+        sessions = [s for s in dict.fromkeys(sessions or []) if s][:20]
+        open_until = open_until or {}
+        if not sessions:
+            return dict(range=None, agents=[], overlap=None)
+        marks = ",".join("?" * len(sessions))
+        with self.lock:
+            turn_rows = self.db.execute(f"select session, start_ts, end_ts from turns where session in ({marks}) "
+                                        "order by session, start_ts", sessions).fetchall()
+            call_rows = self.db.execute(f"select session, ts, tool, seconds, is_error from calls where session in ({marks}) "
+                                        "and ts is not null", sessions).fetchall()
+            usage_rows = self.db.execute(f"select session, ts, output from usage where session in ({marks}) and ts is not null",
+                                         sessions).fetchall()
+        turns = {s: [] for s in sessions}
+        for s, a, b in turn_rows:
+            turns[s].append([a, b])
+        # a busy session whose newest prompt is not ingested yet: stretch its last turn only if that turn ended
+        # moments ago; otherwise the idle gap before the new work would count as work, so open a provisional turn
+        # from its first activity after that end (or the last OPEN_TURN_S seconds) to now
+        open_from: dict[str, float] = {}
+        for s, until in open_until.items():
+            if s not in turns or not until:
+                continue
+            spans = turns[s]
+            if spans and until - spans[-1][1] <= OPEN_STRETCH_S:
+                spans[-1][1] = max(spans[-1][1], until)
+                open_from[s] = spans[-1][0]
+                continue
+            after = spans[-1][1] if spans else None
+            later = [r[1] for r in call_rows + usage_rows if r[0] == s and (after is None or r[1] > after)]
+            begin = min(later) if later else until - OPEN_TURN_S
+            if begin < until:
+                spans.append([begin, until])
+                open_from[s] = begin
+        firsts = [iv[0][0] for iv in turns.values() if iv]
+        lasts = [max(b for _, b in iv) for iv in turns.values() if iv]
+        lasts += [r[1] for r in call_rows] + [r[1] for r in usage_rows]
+        start = start if start is not None else (min(firsts) if firsts else None)
+        end = end if end is not None else (max(lasts) if lasts else None)
+        if start is None or end is None or end <= start:
+            return dict(range=dict(start=start, end=end, bucket_s=bucket_s, n=0),
+                        agents=[_empty_agent(s) for s in sessions], overlap=None)
+        bucket_s = bucket_s or default_bucket(end - start)
+        n = max(1, math.ceil((end - start) / bucket_s))
+        clip = lambda iv: [(max(a, start), min(b, end)) for a, b in iv if b > start and a < end]   # noqa: E731
+        agents, work_by = [], {}
+        for s in sessions:
+            spans = clip(turns[s])
+            in_turn = merge_intervals(spans)
+            wait_iv = [(ts, ts + sec) for ss, ts, tool, sec, _ in call_rows if ss == s and is_wait_tool(tool) and sec]
+            if s in open_from:                         # a mesh_wait still waiting (no result yet) in the open turn
+                wait_iv += [(ts, open_until[s]) for ss, ts, tool, sec, _ in call_rows
+                            if ss == s and is_wait_tool(tool) and sec is None and ts >= open_from[s]]
+            waits = merge_intervals(clip(wait_iv))
+            waiting = intersect_intervals(in_turn, waits)
+            work = subtract_intervals(in_turn, waits)
+            work_by[s] = work
+            calls = [r for r in call_rows if r[0] == s and start <= r[1] <= end]
+            out = [r for r in usage_rows if r[0] == s and start <= r[1] <= end]
+            seen = [t for t in [iv[0] for iv in turns[s]] + [r[1] for r in calls] + [r[1] for r in out] if start <= t <= end]
+            first = min(seen) if seen else None
+            last = max([b for _, b in spans] + seen) if seen or spans else None
+            wall = (last - first) if first is not None and last is not None else 0.0
+            turn_s = _total(in_turn)
+            events, output = [0] * n, [0] * n
+            for r in calls:
+                events[_bucket(r[1], start, bucket_s, n)] += 1
+            for r in out:
+                i = _bucket(r[1], start, bucket_s, n)
+                events[i] += 1
+                output[i] += int(r[2] or 0)
+            agents.append(dict(
+                session_id=s, first_ts=first, last_ts=last, wall_s=round(wall, 1), work_s=round(_total(work), 1),
+                wait_s=round(_total(waiting), 1), idle_s=round(max(0.0, wall - turn_s), 1), turns=len(spans),
+                longest_turn_s=round(max((b - a for a, b in spans), default=0.0), 1), calls=len(calls),
+                tool_errors=sum(1 for r in calls if r[4]), output_tokens=sum(int(r[2] or 0) for r in out),
+                work=[round(v, 1) for v in bucket_seconds(work, start, bucket_s, n)],
+                wait=[round(v, 1) for v in bucket_seconds(waiting, start, bucket_s, n)], events=events, output=output))
+        overlap = concurrency(work_by, start=start, end=end)
+        working = [round(sum(a["work"][i] for a in agents) / bucket_s, 2) for i in range(n)]
+        max_working = [0] * n
+        for a, b, count in overlap.pop("segments"):
+            if count:
+                for i in range(_bucket(a, start, bucket_s, n), _bucket(max(a, b - 1e-9), start, bucket_s, n) + 1):
+                    max_working[i] = max(max_working[i], count)
+        overlap.update(working=working, max_working=max_working)
+        return dict(range=dict(start=start, end=end, bucket_s=bucket_s, n=n), agents=agents, overlap=overlap)
+
+    def work_summary(self, session: str) -> dict:
+        """Work, wait and turn count for one session (the FLEET detail and tile heads)."""
+        with self.lock:
+            spans = self.db.execute("select start_ts, end_ts from turns where session = ?", (session,)).fetchall()
+            waits = self.db.execute("select ts, seconds, tool from calls where session = ? and seconds is not null "
+                                    "and tool like '%mesh_wait'", (session,)).fetchall()
+        in_turn = merge_intervals(spans)
+        wait_iv = merge_intervals([(ts, ts + sec) for ts, sec, tool in waits if is_wait_tool(tool)])
+        return dict(work_s=round(_total(subtract_intervals(in_turn, wait_iv)), 1),
+                    wait_s=round(_total(intersect_intervals(in_turn, wait_iv)), 1), turns=len(spans))
 
     def chats(self, query: str = "", limit: int = 300) -> list[dict]:
         """Every main session Almanac has seen, newest first: title, folder, model, context, replies, output tokens."""
@@ -621,20 +903,29 @@ class Store:
         channel: str | None = None,
         squad_id: str | None = None,
         transport: str = "uds",
+        needs: str | None = None,
     ) -> dict:
+        needs = needs or None
+        if needs not in NEEDS:
+            raise ValueError("needs must be 'reply', 'blocking' or empty")
         mid = msg_id or f"m:{hashlib.sha1(f'{time.time_ns()}|{from_name}|{to_name}'.encode()).hexdigest()[:20]}"
         stamp = ts if ts is not None else time.time()
         with self.lock:
             cur = self.db.execute(
                 "insert or ignore into messages "
-                "(msg_id, ts, from_name, from_session, from_provider, to_name, to_session, to_provider, channel, squad_id, body, transport) "
-                "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (mid, stamp, from_name, from_session, from_provider, to_name, to_session, to_provider, channel, squad_id, body, transport),
+                "(msg_id, ts, from_name, from_session, from_provider, to_name, to_session, to_provider, channel, squad_id, body, transport, needs) "
+                "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (mid, stamp, from_name, from_session, from_provider, to_name, to_session, to_provider, channel, squad_id,
+                 body, transport, needs),
             )
+            if cur.rowcount:
+                row_id = cur.lastrowid
+                self._close_answered(row_id, stamp, from_name, to_name, squad_id)
+                if needs:
+                    self._close_if_answered(row_id, stamp, from_name, to_name, squad_id)
+            else:
+                row_id = (self.db.execute("select id from messages where msg_id = ?", (mid,)).fetchone() or (0,))[0]
             self.db.commit()
-            row_id = cur.lastrowid if cur.rowcount else (
-                self.db.execute("select id from messages where msg_id = ?", (mid,)).fetchone() or (0,)
-            )[0]
         entry = dict(
             id=row_id,
             msg_id=mid,
@@ -649,10 +940,58 @@ class Store:
             squad_id=squad_id,
             body=body,
             transport=transport,
+            needs=needs,
+            answered_ts=None,
+            answered_by=None,
+            read_ts=None,
         )
         with self.msg_cond:
             self.msg_cond.notify_all()
         return entry
+
+    def _close_answered(self, row_id: int, ts: float, sender: str, to: str, squad_id: str | None) -> int:
+        """Message `row_id` (sender -> to) was just journaled: close every earlier open flagged message that `to`
+        sent to `sender`, or that `to` broadcast in a squad the reply does not contradict. Only a direct message
+        answers; a broadcast closes nothing. Runs inside the caller's lock and transaction."""
+        if not to or not sender or to[0] in "@#" or sender == to:
+            return 0
+        senders = OPERATOR_NAMES if to in OPERATOR_NAMES else (to,)          # who asked: the reply's recipient
+        askees = OPERATOR_NAMES if sender in OPERATOR_NAMES else (sender,)   # whom they asked: the reply's sender
+        if set(senders) & set(askees):
+            return 0
+        cur = self.db.execute(
+            "update messages set answered_ts = ?, answered_by = ? "
+            "where needs is not null and answered_ts is null and id < ? and ts <= ? "
+            f"and from_name in ({','.join('?' * len(senders))}) "
+            f"and (to_name in ({','.join('?' * len(askees))}) or substr(to_name, 1, 1) in ('@', '#')) "
+            "and (squad_id is null or ? is null or squad_id = ?)",
+            (ts, row_id, row_id, ts + ANSWER_SKEW_S, *senders, *askees, squad_id, squad_id))
+        return cur.rowcount
+
+    def _close_if_answered(self, row_id: int, ts: float, sender: str, to: str, squad_id: str | None) -> int:
+        """The flagged message `row_id` (sender -> to) was just journaled: if its answer is already in the journal,
+        close it now. That happens when the question came by native SendMessage (journaled only at the next
+        ingest) and the answer went through the hub first. The answer is a direct message to the asker from the
+        recipient (from anyone, for a question broadcast in a squad), no older than the question. Runs inside the
+        caller's lock and transaction. No clock tolerance here, unlike `_close_answered`: a late question's
+        transcript time is at or before when it was really sent, so its real answer is never older, and a window
+        backwards would let a message the recipient sent just before the question close it."""
+        if not to or not sender:
+            return 0
+        askers = OPERATOR_NAMES if sender in OPERATOR_NAMES else (sender,)
+        if to[0] in "@#":
+            who, who_params = f"from_name not in ({','.join('?' * len(askers))})", list(askers)
+        else:
+            repliers = OPERATOR_NAMES if to in OPERATOR_NAMES else (to,)
+            who, who_params = f"from_name in ({','.join('?' * len(repliers))})", list(repliers)
+        row = self.db.execute(
+            f"select id, ts from messages where id != ? and ts >= ? and to_name in ({','.join('?' * len(askers))}) "
+            f"and {who} and (squad_id is null or ? is null or squad_id = ?) order by ts asc, id asc limit 1",
+            (row_id, ts, *askers, *who_params, squad_id, squad_id)).fetchone()
+        if row is None:
+            return 0
+        return self.db.execute("update messages set answered_ts = ?, answered_by = ? where id = ? and answered_ts is null",
+                               (row[1], row[0], row_id)).rowcount
 
     def messages(
         self,
@@ -674,35 +1013,108 @@ class Store:
         if squad_id:
             clauses.append("squad_id = ?")
             params.append(squad_id)
+        return self._message_rows(clauses, params, since_id, limit)
+
+    def _message_rows(self, clauses: list[str], params: list, since_id: int, limit: int) -> list[dict]:
+        """Rows matching `clauses`: the newest `limit` (oldest first), or with `since_id` the first `limit` after it."""
         lim = max(1, min(500, int(limit)))
         order = "asc" if since_id > 0 else "desc"
-        sql = (
-            "select id, msg_id, ts, from_name, from_session, from_provider, to_name, to_session, to_provider, "
-            f"channel, squad_id, body, transport from messages where {' and '.join(clauses)} order by id {order} limit ?"
-        )
-        params.append(lim)
+        sql = f"select {MESSAGE_COLUMNS} from messages where {' and '.join(clauses) or '1'} order by id {order} limit ?"
         with self.lock:
-            rows = self.db.execute(sql, params).fetchall()
+            rows = self.db.execute(sql, [*params, lim]).fetchall()
         if order == "desc":
             rows = list(reversed(rows))
-        return [
-            dict(
-                id=r[0],
-                msg_id=r[1],
-                ts=r[2],
-                from_name=r[3],
-                from_session=r[4],
-                from_provider=r[5],
-                to_name=r[6],
-                to_session=r[7],
-                to_provider=r[8],
-                channel=r[9],
-                squad_id=r[10],
-                body=r[11],
-                transport=r[12],
-            )
-            for r in rows
-        ]
+        return [_message(r) for r in rows]
+
+    def message(self, row_id: int) -> dict | None:
+        with self.lock:
+            row = self.db.execute(f"select {MESSAGE_COLUMNS} from messages where id = ?", (int(row_id),)).fetchone()
+        return _message(row) if row else None
+
+    def resolve_message(self, row_id: int) -> bool:
+        """Close an open flagged message by hand (answered_by 0)."""
+        with self.lock:
+            cur = self.db.execute("update messages set answered_ts = ?, answered_by = 0 "
+                                  "where id = ? and needs is not null and answered_ts is null", (time.time(), int(row_id)))
+            self.db.commit()
+        return cur.rowcount > 0
+
+    def open_needs(self, squad_id: str | None = None, to_name: str | None = None) -> list[dict]:
+        """Open flagged messages, oldest first. `to_name` 'operator' also matches the hub's other names."""
+        clauses, params = ["needs is not null", "answered_ts is null"], []
+        if squad_id:
+            clauses.append("squad_id = ?")
+            params.append(squad_id)
+        if to_name:
+            names = OPERATOR_NAMES if to_name in OPERATOR_NAMES else (to_name,)
+            clauses.append(f"to_name in ({','.join('?' * len(names))})")
+            params.extend(names)
+        with self.lock:
+            rows = self.db.execute(f"select {MESSAGE_COLUMNS} from messages where {' and '.join(clauses)} "
+                                   "order by id asc limit 500", params).fetchall()
+        return [_message(r) for r in rows]
+
+    # -- the operator's inbox: messages to the operator (by any of the hub's names) and from it
+
+    def operator_counts(self, squad_id: str | None = None) -> dict:
+        to_op = f"to_name in ({','.join('?' * len(OPERATOR_NAMES))})"
+        squad = " and squad_id = ?" if squad_id else ""
+        params = [*OPERATOR_NAMES, *([squad_id] if squad_id else [])]
+        with self.lock:
+            unread = self.db.execute(f"select count(*) from messages where {to_op} and read_ts is null{squad}",
+                                     params).fetchone()[0]
+            rows = self.db.execute(f"select needs, count(*), min(ts) from messages where {to_op} and needs is not null "
+                                   f"and answered_ts is null{squad} group by needs", params).fetchall()
+            latest = self.db.execute("select coalesce(max(id), 0) from messages").fetchone()[0]
+        by = {r[0]: r for r in rows}
+        blocking = by.get("blocking")
+        return dict(unread=unread or 0,
+                    open=dict(reply=by["reply"][1] if "reply" in by else 0, blocking=blocking[1] if blocking else 0),
+                    oldest_blocking_ts=blocking[2] if blocking else None, latest_id=int(latest or 0))
+
+    def operator_inbox(self, *, squad_id: str | None = None, since_id: int = 0, limit: int = 100) -> dict:
+        """Counts, plus (unless `limit` is 0) the messages to or from the operator, oldest first."""
+        doc = self.operator_counts(squad_id)
+        doc["messages"] = []
+        if int(limit) > 0:
+            marks = ",".join("?" * len(OPERATOR_NAMES))
+            # what the operator broadcast (launch notices, joins, @squad / #channel posts) stays in the contact stream:
+            # it is no conversation, and a reply there would broadcast again
+            clauses = ["id > ?", f"(to_name in ({marks}) or (from_name in ({marks}) and substr(to_name, 1, 1) not in ('@', '#')))"]
+            params: list = [max(0, int(since_id)), *OPERATOR_NAMES, *OPERATOR_NAMES]
+            if squad_id:
+                clauses.append("squad_id = ?")
+                params.append(squad_id)
+            doc["messages"] = self._message_rows(clauses, params, int(since_id), limit)
+        return doc
+
+    def mark_read(self, ids: list[int] | None = None, upto: int | None = None) -> int:
+        """Mark messages to the operator read, by id or every one up to `upto`. Returns rows changed."""
+        to_op = f"to_name in ({','.join('?' * len(OPERATOR_NAMES))})"
+        now = time.time()
+        with self.lock:
+            if upto is not None:
+                cur = self.db.execute(f"update messages set read_ts = ? where read_ts is null and {to_op} and id <= ?",
+                                      (now, *OPERATOR_NAMES, int(upto)))
+            else:
+                wanted = [int(i) for i in (ids or [])][:500]
+                if not wanted:
+                    return 0
+                cur = self.db.execute(f"update messages set read_ts = ? where read_ts is null and {to_op} "
+                                      f"and id in ({','.join('?' * len(wanted))})", (now, *OPERATOR_NAMES, *wanted))
+            self.db.commit()
+        return cur.rowcount
+
+    def last_operator_exchange(self, agent: str, squad_id: str | None = None) -> dict | None:
+        """The newest direct message between the operator and `agent`, either way, not in another squad."""
+        marks = ",".join("?" * len(OPERATOR_NAMES))
+        with self.lock:
+            row = self.db.execute(
+                f"select {MESSAGE_COLUMNS} from messages where ((from_name in ({marks}) and to_name = ?) "
+                f"or (from_name = ? and to_name in ({marks}))) and (squad_id is null or ? is null or squad_id = ?) "
+                "order by id desc limit 1",
+                (*OPERATOR_NAMES, agent, agent, *OPERATOR_NAMES, squad_id, squad_id)).fetchone()
+        return _message(row) if row else None
 
     def latest_message_id(self) -> int:
         with self.lock:
@@ -736,8 +1148,8 @@ class Store:
     def roles(self) -> list[dict]:
         with self.lock:
             rows = self.db.execute(
-                "select id, title, provider, model, effort, workspace_mode, permission_mode, system_prompt, channels, updated_ts "
-                "from roles order by id"
+                "select id, title, provider, model, effort, workspace_mode, permission_mode, system_prompt, channels, updated_ts, "
+                "may_page_operator, may_spawn, allowed_commands from roles order by id"
             ).fetchall()
         out = []
         for r in rows:
@@ -757,6 +1169,9 @@ class Store:
                     system_prompt=r[7] or "",
                     channels=ch if isinstance(ch, list) else [],
                     updated_ts=r[9],
+                    may_page_operator=bool(r[10]),
+                    may_spawn=bool(r[11]),
+                    allowed_commands=[str(c) for c in _json_list(r[12])],
                 )
             )
         return out
@@ -794,15 +1209,27 @@ class Store:
         if isinstance(raw_channels, str):
             raw_channels = [c.strip() for c in raw_channels.split(",") if c.strip()]
         channels = [str(c).strip() for c in raw_channels if str(c).strip()][:20]
+        # absent: an update keeps what the role had, a new role may not page the operator
+        page = doc.get("may_page_operator")
+        page = None if page is None else int(page is True or str(page).strip().lower() in ("1", "true", "yes", "on"))
+        grow = doc.get("may_spawn")
+        grow = None if grow is None else int(grow is True or str(grow).strip().lower() in ("1", "true", "yes", "on"))
+        cmds = doc.get("allowed_commands")              # a list, or one command per line; absent keeps what it was
+        if isinstance(cmds, str):
+            cmds = cmds.splitlines()
+        cmds = None if cmds is None else json.dumps([str(c).strip() for c in cmds if str(c).strip()][:40])
         now = time.time()
         with self.lock:
             self.db.execute(
-                "insert into roles (id, title, provider, model, effort, workspace_mode, permission_mode, system_prompt, channels, updated_ts) "
-                "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "insert into roles (id, title, provider, model, effort, workspace_mode, permission_mode, system_prompt, channels, "
+                "updated_ts, may_page_operator, may_spawn, allowed_commands) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "on conflict(id) do update set title=excluded.title, provider=excluded.provider, model=excluded.model, "
                 "effort=excluded.effort, workspace_mode=excluded.workspace_mode, permission_mode=excluded.permission_mode, "
-                "system_prompt=excluded.system_prompt, channels=excluded.channels, updated_ts=excluded.updated_ts",
-                (rid, title, provider, model, effort, wmode, pmode, prompt, json.dumps(channels), now),
+                "system_prompt=excluded.system_prompt, channels=excluded.channels, updated_ts=excluded.updated_ts, "
+                "may_page_operator=coalesce(?, roles.may_page_operator), may_spawn=coalesce(?, roles.may_spawn), "
+                "allowed_commands=coalesce(?, roles.allowed_commands)",
+                (rid, title, provider, model, effort, wmode, pmode, prompt, json.dumps(channels), now, page or 0, grow or 0,
+                 cmds or "[]", page, grow, cmds),
             )
             self.db.commit()
         return self.role(rid)
@@ -813,25 +1240,71 @@ class Store:
             self.db.commit()
         return cur.rowcount > 0
 
-    def create_squad(self, squad_id: str, name: str, cwd: str, brief: str = "") -> dict:
+    def _spawn_settings(self, spawn_role, spawn_limit) -> tuple[str | None, int]:
+        role = str(spawn_role).strip() if spawn_role else None
+        if role and role != ANY_ROLE and self.role(role) is None:
+            raise ValueError(f"unknown role {role!r}")
+        try:
+            limit = int(spawn_limit or 0)
+        except (TypeError, ValueError):
+            raise ValueError("spawn_limit is a whole number 0..20") from None
+        if not 0 <= limit <= 20:
+            raise ValueError("spawn_limit is a whole number 0..20")
+        return role, limit
+
+    def create_squad(self, squad_id: str, name: str, cwd: str, brief: str = "", *, spawn_role: str | None = None,
+                     spawn_limit: int = 0) -> dict:
+        """`spawn_role` / `spawn_limit`: the role (or `*`, any defined role) and how many members an agent whose role
+        may_spawn can add to this squad (elastic squads). 0 means agents add nobody; the operator always can."""
+        role, limit = self._spawn_settings(spawn_role, spawn_limit)
         now = time.time()
         with self.lock:
             self.db.execute(
-                "insert or replace into squads (id, name, cwd, brief, created_ts, status) values (?, ?, ?, ?, ?, 'active')",
-                (squad_id, name, cwd, brief, now),
+                "insert or replace into squads (id, name, cwd, brief, created_ts, status, spawn_role, spawn_limit) "
+                "values (?, ?, ?, ?, ?, 'active', ?, ?)",
+                (squad_id, name, cwd, brief, now, role, limit),
             )
             self.db.commit()
-        return dict(id=squad_id, name=name, cwd=cwd, brief=brief, created_ts=now, status="active")
+        return dict(id=squad_id, name=name, cwd=cwd, brief=brief, created_ts=now, status="active", spawn_role=role,
+                    spawn_limit=limit, spawn_used=0)
 
-    def squads(self, limit: int = 50) -> list[dict]:
+    _KEEP = object()
+
+    def update_squad(self, squad_id: str, *, spawn_role=_KEEP, spawn_limit=_KEEP) -> dict | None:
+        """Change what agents may add to a running squad. Left out = unchanged. None if there is no such squad."""
+        current = self.squad(squad_id)
+        if current is None:
+            return None
+        role, limit = self._spawn_settings(current["spawn_role"] if spawn_role is self._KEEP else spawn_role,
+                                           current["spawn_limit"] if spawn_limit is self._KEEP else spawn_limit)
+        with self.lock:
+            self.db.execute("update squads set spawn_role = ?, spawn_limit = ? where id = ?", (role, limit, squad_id))
+            self.db.commit()
+        return self.squad(squad_id)
+
+    def squad(self, squad_id: str) -> dict | None:
+        found = self.squads(limit=1, squad_id=squad_id) if squad_id else []
+        return found[0] if found else None
+
+    def spawn_of(self, agent_name: str) -> dict | None:
+        """The newest spawn row for a handle (handles are reused across squads), however many spawns there are."""
+        found = self.spawned(limit=1, agent_name=agent_name) if agent_name else []
+        return found[0] if found else None
+
+    def squads(self, limit: int = 50, *, squad_id: str | None = None) -> list[dict]:
+        """The newest `limit` squads with their agents, oldest agent first; with `squad_id`, just that one."""
+        where, params = ("where id = ? ", [squad_id]) if squad_id else ("", [])
         with self.lock:
             rows = self.db.execute(
-                "select id, name, cwd, brief, created_ts, status from squads order by created_ts desc limit ?",
-                (max(1, min(200, int(limit))),),
+                "select id, name, cwd, brief, created_ts, status, spawn_role, coalesce(spawn_limit, 0), "
+                "(select count(*) from spawned_agents a where a.squad_id = squads.id and a.spawned_by is not null) "
+                f"from squads {where}order by created_ts desc limit ?",
+                (*params, max(1, min(200, int(limit)))),
             ).fetchall()
             agents_rows = self.db.execute(
-                "select agent_name, session_id, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, created_ts "
-                "from spawned_agents order by created_ts asc"
+                "select agent_name, session_id, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, created_ts, "
+                f"spawned_by from spawned_agents {'where squad_id = ? ' if squad_id else ''}order by created_ts asc",
+                params,
             ).fetchall()
         by_squad: dict[str, list[dict]] = {}
         for a in agents_rows:
@@ -849,6 +1322,7 @@ class Store:
                         worktree_path=a[8],
                         pid=a[9],
                         created_ts=a[10],
+                        spawned_by=a[11],
                     )
                 )
         return [
@@ -859,6 +1333,9 @@ class Store:
                 brief=r[3],
                 created_ts=r[4],
                 status=r[5],
+                spawn_role=r[6],
+                spawn_limit=r[7],
+                spawn_used=r[8],
                 agents=by_squad.get(r[0], []),
             )
             for r in rows
@@ -878,6 +1355,7 @@ class Store:
         worktree_path: str | None,
         pid: int,
         channels: list[str] | None = None,
+        spawned_by: str | None = None,
     ) -> dict:
         if not session_id:
             raise ValueError("a spawn record needs its session id")
@@ -885,10 +1363,10 @@ class Store:
         with self.lock:
             self.db.execute(
                 "insert or replace into spawned_agents "
-                "(agent_name, session_id, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, created_ts, channels) "
-                "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(agent_name, session_id, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, created_ts, channels, "
+                "spawned_by) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (agent_name, session_id, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, now,
-                 json.dumps(list(channels or []))),
+                 json.dumps(list(channels or [])), spawned_by),
             )
             self.db.commit()
         return dict(
@@ -903,6 +1381,7 @@ class Store:
             worktree_path=worktree_path,
             pid=pid,
             created_ts=now,
+            spawned_by=spawned_by,
         )
 
     def update_spawn_model(
@@ -948,20 +1427,20 @@ class Store:
                 by_prov[key].append(ms)
         return by_prov
 
-    def spawned(self, squad_id: str | None = None, limit: int = 100) -> list[dict]:
+    def spawned(self, squad_id: str | None = None, limit: int = 100, *, agent_name: str | None = None) -> list[dict]:
+        """Spawn rows, newest first, optionally of one squad and/or one handle."""
+        clauses, params = [], []
+        for column, value in (("squad_id", squad_id), ("agent_name", agent_name)):
+            if value:
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        where = f"where {' and '.join(clauses)} " if clauses else ""
         with self.lock:
-            if squad_id:
-                rows = self.db.execute(
-                    "select agent_name, session_id, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, created_ts, channels "
-                    "from spawned_agents where squad_id = ? order by created_ts desc limit ?",
-                    (squad_id, limit),
-                ).fetchall()
-            else:
-                rows = self.db.execute(
-                    "select agent_name, session_id, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, created_ts, channels "
-                    "from spawned_agents order by created_ts desc limit ?",
-                    (limit,),
-                ).fetchall()
+            rows = self.db.execute(
+                "select agent_name, session_id, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, created_ts, "
+                f"channels, spawned_by from spawned_agents {where}order by created_ts desc limit ?",
+                (*params, limit),
+            ).fetchall()
         return [
             dict(
                 agent_name=a[0],
@@ -976,9 +1455,16 @@ class Store:
                 pid=a[9],
                 created_ts=a[10],
                 channels=_json_list(a[11]),
+                spawned_by=a[12],
             )
             for a in rows
         ]
+
+
+def _message(r) -> dict:
+    return dict(id=r[0], msg_id=r[1], ts=r[2], from_name=r[3], from_session=r[4], from_provider=r[5], to_name=r[6],
+                to_session=r[7], to_provider=r[8], channel=r[9], squad_id=r[10], body=r[11], transport=r[12],
+                needs=r[13], answered_ts=r[14], answered_by=r[15], read_ts=r[16])
 
 
 def _json_list(raw) -> list:
@@ -1028,6 +1514,24 @@ def _pair_share(rows, index):
     return _ratio(new, new + old) if new + old else None
 
 
+REPORT_PROVIDERS = (None, "claude", "gemini")
+# report rows: calls are (ts, tool, family, search, tests, http, edit, out_chars, seconds, session, source, model,
+# is_error, provider); usage is (ts, input, cache_create, cache_read, output, session, model, provider)
+C_MODEL, C_ERROR, C_PROV = 11, 12, 13
+U_MODEL, U_PROV = 6, 7
+
+
+def _errors(rows) -> int:
+    return sum(1 for r in rows if r[C_ERROR])
+
+
+def _error_rate(rows):
+    """Errors over the calls whose result arrived (is_error set). A call still waiting, a legacy call, or a period
+    with no results at all does not count as a success: no results gives None, never 0."""
+    done = [r[C_ERROR] for r in rows if r[C_ERROR] is not None]
+    return _ratio(sum(1 for e in done if e), len(done))
+
+
 def tiles(cur, old, cur_usage, old_usage) -> list[dict]:
     return [
         dict(id="kb_per_call", label="KB read back per tool call", value=_kb_per_call(cur), previous=_kb_per_call(old),
@@ -1037,6 +1541,8 @@ def tiles(cur, old, cur_usage, old_usage) -> list[dict]:
         dict(id="shell_min", label="Shell wait per session", value=_shell_min_per_session(cur),
              previous=_shell_min_per_session(old), unit="min", better="down"),
         dict(id="adoption", label="Helper adoption", value=_adoption(cur), previous=_adoption(old), unit="%", better="up"),
+        dict(id="error_rate", label="Tool error rate", value=_error_rate(cur), previous=_error_rate(old), unit="%",
+             better="down"),
     ]
 
 
@@ -1075,7 +1581,7 @@ def series(calls, usage, start, end, bucket) -> list[dict]:
             context_tokens=sum(u[1] + u[2] + u[3] for u in us),
             shell_min=round(sum(r[8] for r in shell if r[8] is not None and r[8] < 3600) / 60, 1),
             families=families, adoption={p: _pair_share(rows, 3 + i) for i, p in enumerate(classify.PAIRS)},
-            legacy=sum(r[10] == "legacy" for r in rows)))
+            legacy=sum(r[10] == "legacy" for r in rows), errors=_errors(rows), error_rate=_error_rate(rows)))
     return out
 
 
@@ -1112,3 +1618,194 @@ def tool_table(cur) -> list[dict]:
     for row in table.values():
         row["out_kb"] = round(row["out_kb"], 1)
     return sorted(table.values(), key=lambda r: -r["calls"])[:15]
+
+
+def _metrics(calls, usage) -> dict:
+    """The per-model / per-provider columns for one group of call rows and usage rows."""
+    return dict(
+        sessions=len({r[9] for r in calls} | {u[5] for u in usage}), messages=len(usage),
+        output_tokens=sum(u[4] for u in usage), context_tokens=sum(u[1] + u[2] + u[3] for u in usage),
+        ctx_per_out=_ctx_per_out(usage), calls=len(calls), kb_per_call=_kb_per_call(calls),
+        tool_errors=_errors(calls), error_rate=_error_rate(calls), shell_min=_shell_min_per_session(calls))
+
+
+def _grouped(calls, usage, call_key, usage_key) -> dict:
+    groups: dict = {}
+    for r in calls:
+        groups.setdefault(call_key(r), ([], []))[0].append(r)
+    for u in usage:
+        groups.setdefault(usage_key(u), ([], []))[1].append(u)
+    return groups
+
+
+def _model_call_key(r):
+    if r[10] == "legacy":
+        return ("legacy", None, None)
+    return ("model", r[C_PROV], r[C_MODEL]) if r[C_MODEL] else ("unattributed", None, None)
+
+
+def _model_usage_key(u):
+    return ("model", u[U_PROV], u[U_MODEL]) if u[U_MODEL] and u[U_MODEL] != "<synthetic>" else ("unattributed", None, None)
+
+
+def _with_previous(row: dict, before: dict | None) -> dict:
+    row["previous"] = {k: (before or {}).get(k) for k in ("ctx_per_out", "kb_per_call", "error_rate")}
+    return row
+
+
+def model_table(cur, old, cur_usage, old_usage) -> list[dict]:
+    """One row per (provider, model), busiest output first. Calls take the model of the message that issued them
+    (calls.model) and tokens the model of their own message (usage.model), so a session that switches model mid-way
+    splits between both rows. Calls with no model sit in one `unattributed` row; seeded legacy calls (no session,
+    model or sizes) in one `legacy` row that carries only its call count. Both go last."""
+    now = _grouped(cur, cur_usage, _model_call_key, _model_usage_key)
+    then = _grouped(old, old_usage, _model_call_key, _model_usage_key)
+    rows = []
+    for (kind, prov, model), (calls, usage) in now.items():
+        if kind == "legacy":
+            rows.append(dict(kind="legacy", provider=None, model=None, calls=len(calls)))
+            continue
+        before = then.get((kind, prov, model))
+        row = dict(kind=kind, provider=prov, model=model, **_metrics(calls, usage))
+        rows.append(_with_previous(row, _metrics(*before) if before else None))
+    order = {"model": 0, "unattributed": 1, "legacy": 2}
+    return sorted(rows, key=lambda r: (order[r["kind"]], -(r.get("output_tokens") or 0), -r["calls"],
+                                       r["provider"] or "", r["model"] or ""))
+
+
+def provider_table(cur, old, cur_usage, old_usage) -> list[dict]:
+    """The model table's metrics per provider. Legacy calls have no provider and are left out."""
+    live, live_old = [r for r in cur if r[10] != "legacy"], [r for r in old if r[10] != "legacy"]
+    now = _grouped(live, cur_usage, lambda r: r[C_PROV], lambda u: u[U_PROV])
+    then = _grouped(live_old, old_usage, lambda r: r[C_PROV], lambda u: u[U_PROV])
+    rows = [_with_previous(dict(provider=prov, **_metrics(*group)), _metrics(*then[prov]) if prov in then else None)
+            for prov, group in now.items()]
+    return sorted(rows, key=lambda r: (-r["output_tokens"], -r["calls"], r["provider"] or ""))
+
+
+# ---------------------------------------------------------------------- worktime pieces (plain functions, testable)
+
+BUCKETS = (10, 30, 60, 120, 300, 600, 900, 1800, 3600)
+SLIVER_S = 0.5      # a working interval this short (a crashed agent's millisecond turn) is noise, not overlap
+ANSWER_SKEW_S = 2.0    # hub times are float, native transcript times can be whole seconds
+OPEN_STRETCH_S = 120   # a busy session's last turn is stretched to now only if it ended this recently
+OPEN_TURN_S = 30       # else a provisional turn covers the last this-many seconds
+MAX_BUCKETS = 240
+
+
+def default_bucket(span_s: float) -> int:
+    """The smallest bucket that draws `span_s` in at most MAX_BUCKETS columns."""
+    return next((b for b in BUCKETS if span_s / b <= MAX_BUCKETS), BUCKETS[-1])
+
+
+def is_wait_tool(tool: str | None) -> bool:
+    """`mesh_wait` as Gemini names it, or as Claude Code names an MCP tool (`mcp__almanac-mesh__mesh_wait`)."""
+    t = str(tool or "")
+    return t == "mesh_wait" or t.endswith("__mesh_wait") or t.endswith("_mesh_wait")
+
+
+def merge_intervals(intervals) -> list[tuple[float, float]]:
+    """Sorted, non-overlapping; touching intervals join, empty or backwards ones drop."""
+    out: list[list[float]] = []
+    for a, b in sorted((float(a), float(b)) for a, b in intervals if b is not None and a is not None and b > a):
+        if out and a <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return [(a, b) for a, b in out]
+
+
+def subtract_intervals(keep, remove) -> list[tuple[float, float]]:
+    """`keep` minus `remove`; both are merged first."""
+    out = []
+    remove = merge_intervals(remove)
+    for a, b in merge_intervals(keep):
+        cur = a
+        for c, d in remove:
+            if d <= cur or c >= b:
+                continue
+            if c > cur:
+                out.append((cur, c))
+            cur = max(cur, d)
+            if cur >= b:
+                break
+        if cur < b:
+            out.append((cur, b))
+    return out
+
+
+def intersect_intervals(x, y) -> list[tuple[float, float]]:
+    return subtract_intervals(x, subtract_intervals(x, y))
+
+
+def _total(intervals) -> float:
+    return sum(b - a for a, b in intervals)
+
+
+def _bucket(ts: float, start: float, bucket_s: float, n: int) -> int:
+    return min(n - 1, max(0, int((ts - start) // bucket_s)))
+
+
+def bucket_seconds(intervals, start: float, bucket_s: float, n: int) -> list[float]:
+    """Seconds of `intervals` that fall in each of `n` buckets of `bucket_s` from `start`; the rest is cut off."""
+    out = [0.0] * n
+    end = start + bucket_s * n
+    for a, b in merge_intervals(intervals):
+        a, b = max(a, start), min(b, end)
+        while a < b:
+            i = int((a - start) // bucket_s)
+            edge = min(b, start + (i + 1) * bucket_s)
+            out[min(i, n - 1)] += edge - a
+            a = edge
+    return out
+
+
+def concurrency(work_by_agent: dict, *, start: float | None = None, end: float | None = None) -> dict:
+    """Exact overlap of working intervals (a sweep line, not buckets): seconds with k agents working (`by_count`,
+    0 included when a range is given), each pair's shared seconds, each agent's seconds working alone, the peak,
+    and the constant-count segments [(a, b, k)] that the caller buckets."""
+    marks = []
+    for agent, iv in work_by_agent.items():
+        for a, b in merge_intervals(iv):
+            if b - a >= SLIVER_S:                      # the one sliver rule: noise never enters the sweep, so every
+                marks += [(a, 1, agent), (b, -1, agent)]   # figure below (counts, pairs, peak, segments) agrees
+    marks.sort(key=lambda m: (m[0], m[1]))          # at a shared instant, an end comes before a start
+    lo = start if start is not None else (marks[0][0] if marks else 0.0)
+    hi = end if end is not None else (marks[-1][0] if marks else 0.0)
+    by_count: dict[int, float] = {}
+    pairs: dict[tuple, float] = {}
+    solo = {agent: 0.0 for agent in work_by_agent}
+    segments: list[tuple[float, float, int]] = []
+    active: set = set()
+    prev = lo
+    for t, step, agent in marks + [(hi, 0, None)]:
+        t = min(max(t, lo), hi)
+        if t > prev:
+            k = len(active)
+            span = t - prev
+            by_count[k] = by_count.get(k, 0.0) + span
+            segments.append((prev, t, k))
+            if k == 1:
+                solo[next(iter(active))] += span
+            names = sorted(active)
+            for i, a in enumerate(names):
+                for b in names[i + 1:]:
+                    pairs[(a, b)] = pairs.get((a, b), 0.0) + span
+            prev = t
+        if step == 1:
+            active.add(agent)
+        elif step == -1:
+            active.discard(agent)
+    peak = max((k for _, _, k in segments), default=0)
+    any_s = sum(s for k, s in by_count.items() if k >= 1)
+    return dict(
+        by_count={k: round(s, 1) for k, s in sorted(by_count.items()) if s > 0},
+        pairs=sorted((dict(a=a, b=b, overlap_s=round(s, 1)) for (a, b), s in pairs.items() if s > 0),
+                     key=lambda p: -p["overlap_s"]),
+        solo_s={a: round(s, 1) for a, s in solo.items()}, peak=peak, any_s=round(any_s, 1),
+        parallel_s=round(sum(s for k, s in by_count.items() if k >= 2), 1), segments=segments)
+
+
+def _empty_agent(session: str) -> dict:
+    return dict(session_id=session, first_ts=None, last_ts=None, wall_s=0.0, work_s=0.0, wait_s=0.0, idle_s=0.0, turns=0,
+                longest_turn_s=0.0, calls=0, tool_errors=0, output_tokens=0, work=[], wait=[], events=[], output=[])

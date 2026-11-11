@@ -44,6 +44,18 @@ def project_slug(cwd: str) -> str:
 # call its own mesh tools cannot talk. The server id is `<plugin>_<server>` from spawner.stage_agy_mesh_bundle.
 MESH_GRANTS = json.dumps({"permissions": {"allow": [f"mcp(almanac-mesh_almanac-mesh/{t['name']})" for t in mcp_mesh.MCP_TOOLS]}},
                          separators=(",", ":"))
+MODE_FALLBACK = "is not available for this account"   # agy's warning when it ignores `--mode auto`
+
+
+def grants(allowed_commands=()) -> str:
+    """agy's `--settings`: the mesh tools, plus one `command(<line>)` allow rule per exact command line. agy matches
+    those character for character (`command(git --version)` works, `command(git)` and `command(git *)` do not), and
+    in its default mode, which is all this account gets, it denies every other shell command."""
+    cmds = [str(c).strip() for c in allowed_commands or () if str(c).strip()]
+    if not cmds:
+        return MESH_GRANTS
+    allow = json.loads(MESH_GRANTS)["permissions"]["allow"] + [f"command({c})" for c in cmds]
+    return json.dumps({"permissions": {"allow": allow}}, separators=(",", ":"))
 
 
 def map_agy_permission_flags(permission_mode: str) -> list[str]:
@@ -243,6 +255,7 @@ class GeminiHost:
         in_memory_uds: bool = False,
         runner_fn=None,
         quiet: bool = False,
+        allowed_commands: list[str] | None = None,
     ):
         self.name = name
         self.cwd = str(Path(cwd).resolve())
@@ -259,6 +272,8 @@ class GeminiHost:
         self.channels = list(channels or [])
         self.system_prompt = system_prompt.strip()
         self.add_dirs = list(add_dirs or [])
+        self.allowed_commands = [str(c) for c in allowed_commands or [] if str(c).strip()]
+        self.mode_note: str | None = None
         self.quiet = quiet
         self._runner_fn = runner_fn
         self._turn_index = 0
@@ -357,7 +372,7 @@ class GeminiHost:
             argv += ["--effort", wire_effort]
         if self.conversation_id:
             argv += ["--conversation", self.conversation_id]
-        argv += map_agy_permission_flags(self.permission_mode) + ["--settings", MESH_GRANTS]
+        argv += map_agy_permission_flags(self.permission_mode) + ["--settings", grants(self.allowed_commands)]
         for d in self.add_dirs:
             argv += ["--add-dir", d]
         env = dict(os.environ)
@@ -376,7 +391,31 @@ class GeminiHost:
             bufsize=1,
             env=env,
         )
+        # drain stderr (a full pipe would stall agy) and catch its mode fallback, so the roster can show it
+        threading.Thread(target=self._read_stderr, args=(self._proc,), name=f"agy-stderr-{self.name}", daemon=True).start()
         return self._proc
+
+    def _read_stderr(self, proc) -> None:
+        stream = getattr(proc, "stderr", None)
+        while stream is not None and not self.stop_event.is_set():
+            try:
+                line = stream.readline()
+            except (OSError, ValueError):
+                return
+            if not isinstance(line, str) or not line:   # EOF (or not a text stream at all): stop
+                return
+            text = line.strip()
+            if not text:
+                continue
+            self._log(f"  [agy] {text[:300]}")
+            if MODE_FALLBACK in text and self.mode_note != text[:300]:
+                self.note_mode(text[:300])
+
+    def note_mode(self, note: str) -> None:
+        """Publish agy's mode fallback in this host's session record (the roster's `mode_note`)."""
+        self.mode_note = note
+        self.peer.mode_note = note
+        self.peer.set_status(self.peer.status)
 
     def _run_agy_turn(self, turn_prompt: str) -> tuple[str, list[dict], dict, str | None]:
         """Send one NDJSON user turn to `agy` and stream events until the terminal `result` event."""
@@ -439,7 +478,8 @@ class GeminiHost:
                             "effort": self.effort,
                             "message": {
                                 "id": f"msg_{secrets.token_hex(8)}",
-                                "model": seen_model or "gemini",
+                                # the base id, as the turn-end usage record writes it: one BY MODEL row
+                                "model": split_agy_model_effort(seen_model)[0] or "gemini",
                                 "content": [
                                     {
                                         "type": "tool_use",
@@ -531,6 +571,9 @@ class GeminiHost:
             )
         except Exception as exc:
             err_msg = f"Gemini runner error: {exc}"
+            if isinstance(exc, FileNotFoundError):
+                err_msg = (f"Gemini runner not found at {self.agy_bin}: install agy or set \"gemini\" in Almanac's "
+                           f"config.json, then relaunch this agent ({exc})")
             self._log(f"\n✕ {err_msg}\n")
             self._append_record(
                 {
@@ -619,6 +662,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--initial-prompt-file", type=Path, default=None)
     parser.add_argument("--inbox", type=Path, default=None)
     parser.add_argument("--add-dir", action="append", dest="add_dirs", default=[])
+    parser.add_argument("--allow-command", action="append", dest="allowed_commands", default=[])
     parser.add_argument("--log-file", type=Path, default=None)
     parser.add_argument("--headless", action="store_true")
     args = parser.parse_args(argv)
@@ -642,6 +686,7 @@ def main(argv: list[str] | None = None) -> int:
             channels=args.channels,
             system_prompt=sys_prompt,
             add_dirs=args.add_dirs,
+            allowed_commands=args.allowed_commands,
             inbox_path=args.inbox,
             quiet=args.headless,
         )

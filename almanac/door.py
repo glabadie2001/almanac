@@ -2,25 +2,44 @@
 Gemini agent sessions on this PC, unified `uds-messaging` orchestration, plus the efficiency report and probes.
 
 GET  /api/fleet              every Claude/Gemini session, classified, joined to its session record (cached ~1.5 s)
-GET  /api/session?pid=N      one process with its transcript tail, model/effort and token totals
-GET  /api/sessions?pids=a,b  the same for many at once (the gallery), `limit` events each
+GET  /api/session?pid=N      one process with its transcript tail, model/effort and token totals (`kinds=` filters
+                             the feed by event kind before `limit` cuts it)
+GET  /api/sessions?pids=a,b  the same for many at once (the gallery), `limit` events each, `kinds=` likewise
 GET  /api/mesh               live cross-model peer roster, contact stream messages, squads, and roles
 GET  /api/mesh/messages      contact stream messages (`peer`, `channel`, `squad`, `since_id`, `limit`)
 GET  /api/mesh/wait          long-poll wakeup for incoming contact stream messages
 GET  /api/mesh/context       normalized context stream of any peer (`peer`, `limit`, `kinds`)
-POST /api/mesh/send          deliver over Claude's `uds-messaging` protocol (direct or `@squad`/`@all`/`#channel`)
+GET  /api/mesh/graph?squad=  topology: the squad's agents (ended ones too), operator and channels; message edges with
+                             counts and open flags
+POST /api/mesh/send          deliver over Claude's `uds-messaging` protocol (direct or `@squad`/`@all`/`#channel`);
+                             `needs` reply|blocking flags it open until answered; an agent reaches `operator` only
+                             if its role may page the operator, or to answer the operator's last message
+GET  /api/worktime           per agent: work / wait / idle seconds and per-bucket heat, plus how the agents overlapped
+                             (`squad=` or `sessions=a,b,c`, optional `bucket=` seconds); `messages` and `marks`
+                             (errors, edits) for the swimlane
+GET  /api/health             runners found or missing (and where Almanac looked), hub up, last ingest error
+GET  /api/operator/inbox     messages to and from the operator, unread and open-flag counts (`limit=0`: counts only)
+POST /api/operator/read      {ids:[..]} or {upto:id}: mark messages to the operator read
+POST /api/operator/resolve   {id}: close an open flagged message by hand
 GET  /api/roles              list agent role definitions (POST upserts, DELETE `?id=` deletes)
 POST /api/spawn              launch a Claude or Gemini agent with role, workspace mode, and mesh wiring
-GET  /api/squads             list multi-agent squads (POST launches a squad)
+GET  /api/squads             list multi-agent squads (POST launches one; `spawn_role` + `spawn_limit` let its
+                             architect add members later)
+POST /api/squad              {id, spawn_role?, spawn_limit?}: what agents may add to a running squad (operator only)
+POST /api/squad/member       {squad_id, role_id, agent_name?, task?, model?, ...}: the operator adds a member (no limit)
+POST /api/mesh/spawn         {task, name?, role?}: an agent whose role may_spawn adds one member of the squad's
+                             spawn_role (or of `role` when spawn_role is `*`), within spawn_limit (403 or 400 with
+                             the reason otherwise)
 GET  /api/models             known & CLI-discovered Claude and Gemini model identifiers
 POST /api/model {pid, created, model}  set or switch the model on a live Claude or Gemini session
 POST /api/kill  {pid, created}         end the process tree
 POST /api/send  {pid, created, text}   send via `uds-messaging` when available, else console keystrokes
 GET  /api/actions            the kill/send/spawn/squad log
-GET  /api/report?days=&bucket=         the efficiency report
+GET  /api/report?days=&bucket=&provider=  the efficiency report (provider: claude | gemini; omit for all)
 POST /api/ingest             read the transcripts now
 
-Every route but /ident and /healthz needs the door token (bearer) or the signed-in browser cookie.
+Every route but /ident and /healthz needs the door token (bearer) or the signed-in browser cookie. An agent's own
+token opens /api/mesh and below only, so /api/operator stays the operator's.
 """
 import json
 import logging
@@ -37,6 +56,7 @@ PAGES = {"/": ("index.html", "text/html"), "/app.js": ("app.js", "application/ja
          "/app.css": ("app.css", "text/css")}
 FLEET_TTL = 1.5
 LIVE_INTERVAL = 30       # seconds between transcript reads while a spawned agent runs
+RUNNER_TTL = 10          # seconds a runner probe is trusted; then it looks again
 _CLAUDE_BIN_CACHE: dict[tuple[str, int], list[str]] = {}
 _CLAUDE_BIN_MODEL_RE = re.compile(rb"\bclaude-(?:fable|mythos|opus|sonnet|haiku)-\d+(?:-\d+)?\b")
 
@@ -68,7 +88,7 @@ class Service:
     """The store, the fleet scanner, the uds-messaging hub, and the background ingest loop."""
 
     def __init__(self, store, transcripts, interval=300, fleet=None, state=None, claude="claude", gemini="agy",
-                 prices=None, namer=None):
+                 prices=None, namer=None, probe=None):
         self.store, self.transcripts, self.interval = store, Path(transcripts), interval
         self.fleet = fleet
         # absolute: paths built from it are handed to an agent that runs in the chat's folder, not ours
@@ -77,7 +97,12 @@ class Service:
         self.gemini_transcripts = self.state / "gemini" / "projects" if self.state else None
         if self.fleet is not None and self.gemini_transcripts is not None and self.gemini_transcripts not in self.fleet.extra_projects:
             self.fleet.extra_projects.append(self.gemini_transcripts)
-        self.claude, self.gemini, self.prices = claude, gemini, prices
+        # the configured runners; `claude` / `gemini` resolve them on use (`runners`), so an install made while
+        # Almanac runs is found on the next spawn. `probe` passes home/env/which to the finders (tests).
+        self.claude_configured, self.gemini_configured, self.prices = claude, gemini, prices
+        self.probe = dict(probe or {})
+        self._runners: tuple[float, dict] | None = None
+        self._runners_lock = threading.Lock()
         self.launched: dict[str, int] = {}          # session id -> pid of a session Almanac started
         self.model_overrides: dict[str, dict] = {}  # "pid:created" -> {"model": str, "effort": str|None, "ts": float}
         self._models_cache: tuple[float, dict] | None = None
@@ -90,7 +115,41 @@ class Service:
         self.wake = threading.Event()               # set by a spawn: read again now, then on the short interval
         self.ingesting = threading.Lock()
         self.fleet_lock = threading.Lock()
+        self.spawn_lock = threading.Lock()            # an agent's limit check and its spawn are one step
         self.error = ""
+
+    def runners(self, fresh: bool = False) -> dict:
+        """{claude|gemini: {path, ok, searched}}, probed at most every RUNNER_TTL seconds. `path` is the configured
+        value when nothing was found, so callers that only need a string keep working."""
+        from almanac import config
+        with self._runners_lock:
+            if not fresh and self._runners and time.monotonic() - self._runners[0] < RUNNER_TTL:
+                return self._runners[1]
+            doc = {}
+            shims: list[str] = []
+            found, searched = config.find_claude(self.claude_configured, shims=shims, **self.probe)
+            doc["claude"] = dict(path=found or str(self.claude_configured or ""), ok=bool(found), searched=searched,
+                                 reason=None if found or not shims else
+                                 f"found {shims[0]}, a .cmd shim: Almanac will not launch it because cmd.exe would "
+                                 "re-parse prompts; point \"claude\" at claude.exe")
+            found, searched = config.find_gemini(self.gemini_configured, **self.probe)
+            doc["gemini"] = dict(path=found or str(self.gemini_configured or ""), ok=bool(found), searched=searched,
+                                 reason=None)
+            self._runners = (time.monotonic(), doc)
+            return doc
+
+    @property
+    def claude(self) -> str:
+        return self.runners()["claude"]["path"]
+
+    @property
+    def gemini(self) -> str:
+        return self.runners()["gemini"]["path"]
+
+    def health(self) -> dict:
+        last = self.store.last_ingest or {}
+        return dict(runners=self.runners(), hub=self.hub_peer is not None,
+                    ingest_error=self.error or last.get("error") or None)
 
     def ingest(self):
         if not self.ingesting.acquire(blocking=False):
@@ -114,16 +173,20 @@ class Service:
         finally:
             self.ingesting.release()
 
-    def _enrich_process_models(self, procs: list[dict]) -> None:
+    def _enrich_process_models(self, procs: list[dict], *, prune: bool = False) -> None:
+        """Fill model, effort, role and squad on process rows from the overrides and spawn records. `prune` drops
+        the overrides of processes not in `procs`, so only a caller holding the whole fleet may pass it: a
+        single-row caller (/api/session, /api/sessions) would wipe every other live session's override."""
         if not procs:
             return
         spawned_rows = self.store.spawned(limit=200)
         by_sid = {s["session_id"]: s for s in spawned_rows if s.get("session_id")}
         by_name = {s["agent_name"]: s for s in reversed(spawned_rows) if s.get("agent_name")}   # newest wins
-        live_keys = {f"{p['pid']}:{p['created']}" for p in procs}
-        for k in list(self.model_overrides):
-            if k not in live_keys:
-                self.model_overrides.pop(k, None)
+        if prune:
+            live_keys = {f"{p['pid']}:{p['created']}" for p in procs}
+            for k in list(self.model_overrides):
+                if k not in live_keys:
+                    self.model_overrides.pop(k, None)
         for p in procs:
             if p.get("role") != "session":
                 continue
@@ -143,6 +206,24 @@ class Service:
                 p["agent_role"] = sp["role_id"]
             if not p.get("squad_id") and sp.get("squad_id"):
                 p["squad_id"] = sp["squad_id"]
+            if not p.get("worktree_path") and sp.get("worktree_path"):
+                p["worktree_path"] = sp["worktree_path"]
+            if p.get("worktree_path") and "worktree_of" not in p:
+                # the repo this worktree belongs to, read once from its `.git` file ("gitdir: <repo>/.git/worktrees/<name>")
+                wt = p["worktree_path"]
+                cache = self.__dict__.setdefault("_worktree_of", {})
+                if wt not in cache:
+                    repo = None
+                    try:
+                        line = (Path(wt) / ".git").read_text(encoding="utf-8", errors="replace").strip()
+                        if line.startswith("gitdir:"):
+                            gitdir = Path(line[len("gitdir:"):].strip())
+                            if gitdir.parent.name == "worktrees" and gitdir.parent.parent.name == ".git":
+                                repo = str(gitdir.parent.parent.parent)
+                    except OSError:
+                        pass
+                    cache[wt] = repo
+                p["worktree_of"] = cache[wt]
 
     def fleet_now(self):
         if self.fleet is None:
@@ -150,7 +231,7 @@ class Service:
         with self.fleet_lock:
             if time.time() - self.fleet.last.get("at", 0) > FLEET_TTL:
                 self.fleet.snapshot()
-            self._enrich_process_models(self.fleet.last.get("processes", []))
+            self._enrich_process_models(self.fleet.last.get("processes", []), prune=True)
             return self.fleet.last
 
     def available_models(self) -> dict:
@@ -279,7 +360,7 @@ class Service:
         if self.fleet is None:
             return False, "process scanning is off", None, None, None
         doc = self.fleet.snapshot()
-        self._enrich_process_models(doc.get("processes", []))
+        self._enrich_process_models(doc.get("processes", []), prune=True)
         row = next((p for p in doc.get("processes", []) if p["pid"] == pid and p["created"] == str(created)), None)
         if row is None:
             return False, f"process {pid} is no longer running (or PID was reused)", None, None, None
@@ -461,15 +542,24 @@ class Service:
                 or any(pid in pids for pid in self.launched.values()))
 
     def _on_hub_message(self, msg: dict) -> None:
-        """Record any `<cross-session-message>` sent directly to `almanac-hub` by a Claude or Gemini peer."""
+        """Record any `<cross-session-message>` sent directly to `almanac-hub` by a Claude or Gemini peer: the
+        sender's words (the `[needs: ...]` line the PeerServer keeps on `body` comes off) with its flag."""
+        from almanac import uds
+        body = msg.get("body") or ""
+        if msg.get("needs"):
+            _, body = uds.split_needs(body)          # the same rule the transcript read applies
+        sender = msg.get("from_name") or "peer"
+        spawn = self.store.spawn_of(sender) or {}
         self.store.record_message(
             msg_id=msg.get("msg_id"),
             ts=msg.get("ts"),
-            from_name=msg.get("from_name") or "peer",
+            from_name=sender,
             to_name="almanac-hub",
             channel=msg.get("channel"),
-            body=msg.get("body") or "",
+            squad_id=spawn.get("squad_id"),
+            body=body,
             transport="uds",
+            needs=msg.get("needs"),
         )
 
     def start(self, *, enable_uds_hub: bool = True, in_memory_uds: bool = False):
@@ -540,6 +630,8 @@ class Service:
                     status=p.get("status") or "idle",
                     cwd=p.get("cwd") or sp.get("cwd"),
                     worktree_path=sp.get("worktree_path"),
+                    spawned_by=sp.get("spawned_by"),
+                    mode_note=urec.get("mode_note"),       # e.g. agy fell back from `--mode auto`
                     has_uds=bool(p.get("has_uds")),
                     pipe=p.get("pipe"),
                     cpu=p.get("cpu"),
@@ -557,7 +649,14 @@ class Service:
         if self.fleet is not None:
             row = self.fleet.resolve_session(peer)
             if row is not None:
-                det = self.fleet.detail(row["pid"], limit=max(lim * 3, 60) if kind_set else lim)
+                # resolve_session is not enriched: take role and squad from the spawn row, as the roster does
+                # (kept off _enrich_process_models: this needs only role and squad, not the model overrides)
+                spawns = self.store.spawned(limit=500)
+                sp = next((s for s in spawns if row.get("session_id") and s.get("session_id") == row["session_id"]), None) \
+                    or next((s for s in spawns if s["agent_name"] == row.get("name")), {})
+                row = dict(row, agent_role=row.get("agent_role") or sp.get("role_id"),
+                           squad_id=row.get("squad_id") or sp.get("squad_id"))
+                det = self.fleet.detail(row["pid"], limit=FEED_WINDOW if kind_set else lim)
                 if det is not None:
                     evs = [e for e in det["events"] if e["kind"] in kind_set][-lim:] if kind_set else det["events"][-lim:]
                     sid = row.get("session_id")
@@ -614,22 +713,35 @@ class Service:
         from_name: str = "operator",
         channel: str | None = None,
         squad_id: str | None = None,
+        needs: str | None = None,
         write_fn=None,
+        exclude=(),
     ) -> dict:
-        """Deliver a message over Claude's `uds-messaging` protocol (with broadcast fan-out and SQLite journaling)."""
+        """Deliver a message over Claude's `uds-messaging` protocol (with broadcast fan-out and SQLite journaling).
+        `needs` ('reply' or 'blocking') flags it as wanting an answer: the delivered text opens with a marker line,
+        the journal keeps the sender's words and the flag, and the flag stays open until the recipient answers."""
         from almanac import uds
+        from almanac.store import NEEDS
         target = str(to or "").strip()
         body = str(text or "").strip()
+        if not channel:                                # a channel line typed into the body is the channel
+            channel, body = uds.split_channel(body)
+        typed, body = uds.split_needs(body)             # a marker typed into the body is the flag
+        body = body.strip()
         if not target or not body:
             raise ValueError("'to' and 'text' are required")
+        needs = str(needs).strip().lower() if needs else typed   # an explicit needs wins
+        if needs not in NEEDS:
+            raise ValueError("needs must be 'reply', 'blocking' or empty")
         sender = str(from_name or "operator").strip()
+        wire = uds.needs_marker(needs, sender) + body       # what the recipient sees; the journal keeps `body`
         hub_pipe = self.hub_peer.pipe_path if self.hub_peer else None
 
         # Lookup sender metadata if sender is a known peer
         all_peers = self.mesh_peers()
         sender_peer = next((p for p in all_peers if p["name"] == sender or p.get("session_id") == sender), None)
         # a sender that is not a live session is still known by its newest spawn record
-        known = sender_peer or next((s for s in self.store.spawned(limit=200) if s["agent_name"] == sender), {})
+        known = sender_peer or self.store.spawn_of(sender) or {}
         eff_squad = squad_id or known.get("squad_id")
         if sender == "operator" and target == "@squad" and not eff_squad:
             live = {p["squad_id"] for p in all_peers if p.get("squad_id")}
@@ -645,6 +757,7 @@ class Service:
                 squad_id=eff_squad,
                 body=body,
                 transport="hub",
+                needs=needs,
             )
             return dict(ok=True, delivered=["operator"], failed=[], message=entry)
 
@@ -663,6 +776,8 @@ class Service:
             for p in all_peers:
                 if p["name"] == sender or (p.get("session_id") and p.get("session_id") == sender):
                     continue
+                if p["name"] in exclude or (p.get("session_id") and p.get("session_id") in exclude):
+                    continue                           # e.g. a newcomer is not told it joined (its kickoff says so)
                 if target == "@squad" and p.get("squad_id") != eff_squad:
                     continue
                 if target.startswith("#") and (
@@ -676,7 +791,7 @@ class Service:
                 ok, msg_detail, _ = self.fleet.send(
                     r["pid"],
                     r["created"],
-                    body,
+                    wire,
                     from_name=sender,
                     from_pipe=hub_pipe,
                     channel=eff_channel,
@@ -695,6 +810,7 @@ class Service:
                 squad_id=eff_squad,
                 body=body,
                 transport="uds-broadcast",
+                needs=needs,
             )
             return dict(ok=True, delivered=delivered, failed=failed, message=entry)
 
@@ -707,7 +823,7 @@ class Service:
             ok, detail_msg, _ = self.fleet.send(
                 recipient["pid"],
                 recipient["created"],
-                body,
+                wire,
                 from_name=sender,
                 from_pipe=hub_pipe,
                 channel=channel,
@@ -726,6 +842,7 @@ class Service:
                 squad_id=eff_squad or recipient.get("squad_id"),
                 body=body,
                 transport="uds" if recipient.get("has_uds") else "console",
+                needs=needs,
             )
             return dict(ok=True, delivered=[recipient["name"]], transport=entry["transport"], message=entry)
 
@@ -735,7 +852,7 @@ class Service:
             res = uds.send_peer(
                 sessions_dir,
                 target,
-                body,
+                wire,
                 from_name=sender,
                 from_pipe=hub_pipe,
                 channel=channel,
@@ -755,8 +872,78 @@ class Service:
             squad_id=eff_squad,
             body=body,
             transport="uds",
+            needs=needs,
         )
         return dict(ok=True, delivered=[res["target_name"]], transport="uds", message=entry)
+
+    def may_spawn(self, agent_name: str, role_id: str | None = None) -> tuple[bool, str, dict | None, dict | None, int]:
+        """(ok, reason, squad, role to add, http status): may this agent add a member to its squad through
+        mesh_spawn? Its newest spawn row must name a squad that is active; its role must have may_spawn; the squad's
+        spawn_role must resolve: a fixed role (an agent naming another is refused) or `*`, where the agent must name
+        a defined role; slots must be left (spawn_used < spawn_limit, whatever roles were added); that role's runner
+        must be found. Role mistakes are 400 (the request is wrong), the rest 403. The caller holds `spawn_lock`
+        across this check and the spawn, so two calls cannot both take the last slot.
+        Advisory, like agent tokens: an agent runs as this user and could reach the door another way."""
+        from almanac.store import ANY_ROLE
+        spawn = self.store.spawn_of(agent_name)
+        if not spawn or not spawn.get("squad_id"):
+            return False, f"{agent_name} is not in a squad", None, None, 403
+        squad = self.store.squad(spawn["squad_id"])
+        if squad is None:
+            return False, f"squad {spawn['squad_id']} no longer exists", None, None, 403
+        if squad.get("status") != "active":
+            return False, f"squad {squad['id']} is {squad.get('status')}; nobody can join it", squad, None, 403
+        mine = self.store.role(spawn["role_id"]) if spawn.get("role_id") else None
+        if not mine or not mine.get("may_spawn"):
+            return False, f"role {spawn.get('role_id') or '(none)'} may not add squad members", squad, None, 403
+        allowed = squad.get("spawn_role")
+        if not allowed:
+            return False, f"the operator has not chosen a role agents may add to squad {squad['id']}", squad, None, 403
+        wanted = str(role_id or "").strip() or None
+        if allowed == ANY_ROLE:
+            target = self.store.role(wanted) if wanted else None
+            if target is None:
+                ids = ", ".join(r["id"] for r in self.store.roles())
+                what = f"no role {wanted!r}" if wanted else "name the role to add"
+                return False, f"{what}: squad {squad['id']} may add any of {ids}", squad, None, 400
+        else:
+            if wanted and wanted != allowed:
+                return False, f"squad {squad['id']} may add only {allowed}, not {wanted}", squad, None, 400
+            target = self.store.role(allowed)
+            if target is None:
+                return False, f"squad {squad['id']}'s spawn role {allowed!r} no longer exists", squad, None, 403
+        used, limit = squad.get("spawn_used") or 0, squad.get("spawn_limit") or 0
+        if limit <= 0:
+            return False, f"0/0: the operator allows no agent-added members in squad {squad['id']} (limit 0)", squad, target, 403
+        if used >= limit:
+            return False, f"{used}/{limit} used; ask the operator to raise the limit", squad, target, 403
+        runner = self.runners().get(target["provider"]) or {}
+        if not runner.get("ok"):
+            return False, (f"{target['provider']} runner not found; looked in: {'; '.join(runner.get('searched') or [])}"), \
+                squad, target, 403
+        return True, f"{used}/{limit} used", squad, target, 200
+
+    def may_page_operator(self, agent_name: str) -> tuple[bool, str]:
+        """(allowed, hint): may this agent address the operator? Yes when its newest spawn has no role (or the role
+        is gone), when its role has `may_page_operator`, or when the newest direct message between it and the
+        operator came from the operator: answering is not paging, and it buys one reply per operator message.
+        Advisory only: the hub's named pipe does not check senders, and an agent can read the door's secret."""
+        from almanac.store import OPERATOR_NAMES
+        spawn = self.store.spawn_of(agent_name)
+        role = self.store.role(spawn["role_id"]) if spawn and spawn.get("role_id") else None
+        if role is None or role.get("may_page_operator"):
+            return True, ""
+        squad = spawn.get("squad_id")
+        last = self.store.last_operator_exchange(agent_name, squad)
+        if last and last["from_name"] in OPERATOR_NAMES:
+            return True, ""
+        pagers = {r["id"] for r in self.store.roles() if r.get("may_page_operator")}
+        relays = sorted(p["name"] for p in self.mesh_peers()
+                        if p.get("name") != agent_name and squad and p.get("squad_id") == squad and p.get("agent_role") in pagers)
+        via = (f"ask {' or '.join(relays)} to relay it" if relays
+               else "no live squadmate's role may page the operator; post it to #squad")
+        return False, (f"role {role['id']!r} does not page the operator: {via}. "
+                       "You may always answer a message the operator sends you.")
 
 
 def _live_sessions(service) -> dict:
@@ -815,6 +1002,10 @@ def resume_chat(service, session_id, remote=True):
     from almanac import archive, resume
     if not isinstance(session_id, str) or not resume.SESSION_ID.match(session_id):
         raise ValueError("id must be a session id")
+    from almanac import config
+    shim = service.runners()["claude"].get("reason")
+    if shim or config.is_shim(service.claude):          # cmd.exe would re-parse the title and settings path
+        return False, shim or f"{service.claude} is a .cmd / .bat shim; point \"claude\" at claude.exe", {}
     meta = service.store.chat(session_id)
     if meta is None:
         return False, "Almanac has never seen that chat", {}
@@ -843,6 +1034,112 @@ def resume_chat(service, session_id, remote=True):
     note = f"; restored {len(restored)} file(s) from the archive" if restored else ""
     return True, f"claude --resume started as pid {pid} in {meta['cwd']}{' with Remote Control' if remote else ''}{note}", \
         dict(extra, pid=pid, restored=restored)
+
+
+def worktime(service, query) -> dict | None:
+    """GET /api/worktime: `squad=<id>` (its members, from its launch) or `sessions=a,b,c` (at most 20), optional
+    `bucket=` seconds. Each agent is labelled from its spawn record and the fleet; a busy session's last turn is
+    stretched to now, since ingest runs behind it. None for an unknown squad."""
+    squad_id = (query.get("squad") or "").strip()
+    start = None
+    if squad_id:
+        squad = service.store.squad(squad_id)
+        if squad is None:
+            return None
+        spawns = squad["agents"]                        # in hand already, oldest first: no capped scan
+        sessions = [s["session_id"] for s in spawns]
+        start = squad["created_ts"]
+    else:
+        sessions = [s.strip() for s in query.get("sessions", "").split(",") if s.strip()]
+        spawns = service.store.spawned(limit=1000)       # labels only
+    sessions = list(dict.fromkeys(sessions))[:20]
+    bucket = query.get("bucket")
+    bucket = int(bucket) if bucket else None
+    if bucket is not None and not 1 <= bucket <= 86400:
+        raise ValueError("bucket is 1..86400 seconds")
+    procs = {p["session_id"]: p for p in service.fleet_now().get("processes", []) if p.get("session_id")}
+    live = {sid: pid for sid, pid in _live_sessions(service).items() if sid in sessions}
+    now = time.time()
+    busy = {sid: now for sid in live if (procs.get(sid) or {}).get("status") not in (None, "idle")}
+    doc = service.store.worktime(sessions, start=start, end=now if live else None, bucket_s=bucket, open_until=busy)
+    by_sid = {s["session_id"]: s for s in spawns}
+    for a in doc["agents"]:
+        sp = by_sid.get(a["session_id"]) or {}
+        proc = procs.get(a["session_id"]) or {}
+        a.update(agent_name=sp.get("agent_name") or proc.get("name") or a["session_id"][:8], role_id=sp.get("role_id"),
+                 provider=sp.get("provider") or proc.get("provider") or "claude", model=sp.get("model") or proc.get("model"),
+                 live=a["session_id"] in live, status=proc.get("status") if a["session_id"] in live else "ended")
+    doc["squad_id"] = squad_id or None
+    # the swimlane on the heatmap: messages between the agents, and each agent's tool errors and file edits
+    rng = doc.get("range") or {}
+    if rng.get("n"):
+        doc["messages"] = service.store.timeline_messages(squad_id=squad_id or None, sessions=sessions,
+                                                          start=rng["start"], end=rng["end"])
+        doc["marks"] = service.store.timeline_marks(sessions, start=rng["start"], end=rng["end"])
+    else:
+        doc["messages"], doc["marks"] = [], []
+    return doc
+
+
+def role_class(role_id: str | None, title: str | None = "") -> str:
+    """architect | implementer | reviewer | other, from the role's id and title: the topology's columns."""
+    text = f"{role_id or ''} {title or ''}".lower()
+    return next((c for c, word in (("architect", "architect"), ("implementer", "implement"), ("reviewer", "review"))
+                 if word in text), "other")
+
+
+def mesh_graph(service, squad_id: str | None) -> dict | None:
+    """GET /api/mesh/graph: the topology. Nodes are the squad's agents in spawn order (one that exited stays, live
+    false), the operator, and every channel or outside party its messages name; edges are message_graph's. With no
+    squad, the live peers and the operator, and no edges. None for an unknown squad."""
+    squad = service.store.squad(squad_id) if squad_id else None
+    if squad_id and squad is None:
+        return None
+    peers = service.mesh_peers(squad_id=squad_id)
+    live_by_sid = {p["session_id"]: p for p in peers if p.get("session_id")}
+    titles = {r["id"]: r["title"] for r in service.store.roles()}
+    newest: dict[str, dict] = {}
+    for a in (squad or {}).get("agents", []):           # oldest first: the first spawn sets the order, the newest wins
+        newest[a["agent_name"]] = a
+
+    def node(name, *, kind="agent", sid=None, provider=None, rid=None, live=None, worktree=None, by=None):
+        return dict(id=name, kind=kind, session_id=sid, provider=provider, role_id=rid,
+                    role_class=role_class(rid, titles.get(rid)) if kind == "agent" else kind,
+                    live=bool(live), status=(live or {}).get("status") or ("ended" if kind == "agent" else None),
+                    worktree=worktree, last_event=(live or {}).get("last_event"), spawned_by=by)
+
+    nodes = [node(n, sid=a["session_id"], provider=a["provider"], rid=a.get("role_id"), live=live_by_sid.get(a["session_id"]),
+                  worktree=a.get("worktree_path"), by=a.get("spawned_by")) for n, a in newest.items()]
+    known = {n["id"] for n in nodes}
+    for p in peers:                                      # a live peer with no spawn row in this squad
+        if p["name"] not in known:
+            nodes.append(node(p["name"], sid=p.get("session_id"), provider=p.get("provider"), rid=p.get("agent_role"),
+                              live=p, worktree=p.get("worktree_path")))
+            known.add(p["name"])
+    nodes.append(node("operator", kind="operator"))
+    known.add("operator")
+    edges = service.store.message_graph(squad_id) if squad_id else []
+    for name in sorted({e["from"] for e in edges} | {e["to"] for e in edges}):
+        if name not in known:
+            nodes.append(node(name, kind="channel") if name[:1] in "@#" else node(name))
+            known.add(name)
+    return dict(squad_id=squad_id, nodes=nodes, edges=edges)
+
+
+FEED_WINDOW = 100_000      # with a kind filter, filter everything in the transcript tail, then keep the newest `limit`
+
+
+def _kinds(query) -> set[str] | None:
+    """`kinds=you,claude,...` as a set; None when absent (every kind)."""
+    found = {k.strip() for k in str(query.get("kinds", "")).split(",") if k.strip()}
+    return found or None
+
+
+def _cut_events(found: dict, limit: int, kinds: set[str] | None) -> None:
+    events = found.get("events") or []
+    if kinds:
+        events = [e for e in events if e.get("kind") in kinds]
+    found["events"] = events[-limit:]
 
 
 def _pid(body):
@@ -881,7 +1178,10 @@ def make_handler(service, token, *, hosts=()):
                     days = int(query.get("days", "30"))
                     if not 0 <= days <= 3650:
                         raise ValueError("days is 0..3650")
-                    return self._send(200, service.store.report(days, query.get("bucket", "day")))
+                    provider = query.get("provider") or None
+                    if provider not in ("claude", "gemini", None):
+                        raise ValueError("provider is claude or gemini")
+                    return self._send(200, service.store.report(days, query.get("bucket", "day"), provider=provider))
                 if path == "/api/fleet":
                     doc = service.fleet_now()
                     titles = service.store.titles([p["session_id"] for p in doc.get("processes", []) if p.get("session_id")])
@@ -892,8 +1192,10 @@ def make_handler(service, token, *, hosts=()):
                     return self._send(200, service.names)
                 if path == "/api/session":
                     pid = int(query.get("pid", "0"))
+                    kinds = _kinds(query)
+                    limit = max(1, min(400, int(query.get("limit", "40"))))
                     service.fleet_now()
-                    found = service.fleet.detail(pid) if service.fleet else None
+                    found = service.fleet.detail(pid, FEED_WINDOW if kinds else limit) if service.fleet else None
                     if found is None:
                         return self._send(404, {"error": f"no Claude process {pid}"})
                     service._enrich_process_models([found["process"]])
@@ -902,14 +1204,16 @@ def make_handler(service, token, *, hosts=()):
                         found["meta"] = dict(found.get("meta") or {}, model=ov["model"], effort=ov.get("effort") or (found.get("meta") or {}).get("effort"))
                     sid = found["process"].get("session_id")
                     found["usage"] = service.store.session_usage(sid) if sid else None
+                    _cut_events(found, limit, kinds)
                     return self._send(200, found)
                 if path == "/api/sessions":
                     pids = [int(p) for p in query.get("pids", "").split(",") if p.strip()][:40]
                     limit = max(1, min(120, int(query.get("limit", "40"))))
+                    kinds = _kinds(query)
                     service.fleet_now()
                     out = []
                     for pid in pids:
-                        found = service.fleet.detail(pid, limit) if service.fleet else None
+                        found = service.fleet.detail(pid, FEED_WINDOW if kinds else limit) if service.fleet else None
                         if found is None:
                             out.append(dict(pid=pid, gone=True))
                             continue
@@ -919,6 +1223,7 @@ def make_handler(service, token, *, hosts=()):
                             found["meta"] = dict(found.get("meta") or {}, model=ov["model"], effort=ov.get("effort") or (found.get("meta") or {}).get("effort"))
                         sid = found["process"].get("session_id")
                         found["usage"] = service.store.session_usage(sid) if sid else None
+                        _cut_events(found, limit, kinds)
                         # many tiles, polled every 2s: a tile shows the top of each event, the session view all of it
                         found["events"] = [dict(e, text=e["text"][:400]) for e in found["events"]]
                         out.append(found)
@@ -950,8 +1255,22 @@ def make_handler(service, token, *, hosts=()):
                             squads=service.store.squads(limit=20),
                             roles=service.store.roles(),
                             hub_pipe=service.hub_peer.pipe_path if service.hub_peer else None,
+                            open=service.store.open_needs(squad_id=squad_q),
                         ),
                     )
+                if path == "/api/health":
+                    return self._send(200, service.health())
+                if path == "/api/worktime":
+                    doc = worktime(service, query)
+                    return self._send(200 if doc is not None else 404, doc if doc is not None else {"error": "no such squad"})
+                if path == "/api/operator/inbox":
+                    return self._send(200, service.store.operator_inbox(
+                        squad_id=query.get("squad") or None,
+                        since_id=int(query.get("since_id", "0")),
+                        limit=max(0, min(500, int(query.get("limit", "100"))))))
+                if path == "/api/mesh/graph":
+                    graph = mesh_graph(service, query.get("squad") or None)
+                    return self._send(200 if graph is not None else 404, graph if graph is not None else {"error": "no such squad"})
                 if path == "/api/mesh/messages":
                     msgs = service.store.messages(
                         peer=query.get("peer") or None,
@@ -999,39 +1318,131 @@ def make_handler(service, token, *, hosts=()):
                 return self._send(200, dict(ok=True, role=role_doc))
             if method == "POST" and path == "/api/mesh/send":
                 body = self._body()
-                if self.agent and str(body.get("to") or "").strip() == "@all":
+                target = str(body.get("to") or "").strip()
+                if self.agent and target == "@all":
                     raise ValueError("@all is the operator's: an agent posts to a peer, @squad or a #channel")
+                if self.agent and target in ("operator", "almanac-hub", "hub"):
+                    allowed, hint = service.may_page_operator(self.agent)
+                    if not allowed:
+                        return self._send(403, dict(ok=False, error=hint))
                 res = service.mesh_send(
-                    to=body.get("to") or "",
+                    to=target,
                     text=body.get("text") or body.get("message") or "",
                     from_name=self.agent or body.get("from_name") or "operator",   # an agent speaks only as itself
                     channel=body.get("channel"),
                     squad_id=None if self.agent else body.get("squad_id"),   # an agent's squad is its own
+                    needs=body.get("needs"),
                 )
                 return self._send(200 if res.get("ok") else 409, res)
+            if method == "POST" and path == "/api/mesh/spawn":
+                # elastic squads: an agent adds one member of the role the operator chose, within the operator's limit;
+                # everything but the task and the name comes from that role, never from the agent's body
+                from almanac import spawner
+                body = self._body()
+                task = str(body.get("task") or "").strip()
+                if len(task) < 20:
+                    raise ValueError("task is required: at least 20 characters saying what the new member is to do")
+                port = getattr(self.server, "server_port", 8812)
+                overrides = {}
+                with service.spawn_lock:
+                    if self.agent:
+                        ok, reason, squad, role, code = service.may_spawn(self.agent, body.get("role") or body.get("role_id"))
+                        if not ok:
+                            service.store.log_action("spawn", 0, dict(name=body.get("name")), False,
+                                                     f"mesh_spawn refused: {reason}", self._who())
+                            return self._send(code, dict(ok=False, error=reason))
+                        squad_id, role_id, by = squad["id"], role["id"], self.agent
+                    else:
+                        squad_id, role_id, by = body.get("squad_id"), body.get("role_id") or body.get("role"), None
+                        if not squad_id or not role_id:
+                            raise ValueError("the operator names squad_id and role_id")
+                        overrides = {k: body[k] for k in ("model", "effort", "workspace_mode", "permission_mode") if body.get(k)}
+                    try:
+                        res = spawner.join_squad(service, almanac_url=f"http://127.0.0.1:{port}", token=token,
+                                                 squad_id=squad_id, role_id=role_id, task=task, agent_name=body.get("name"),
+                                                 spawned_by=by, **overrides)
+                    except (RuntimeError, OSError) as exc:
+                        res = dict(ok=False, agent_name=body.get("name"), role_id=role_id, error=str(exc))
+                service.store.log_action(
+                    "spawn", res.get("pid") or 0, dict(session_id=res.get("session_id"), name=res.get("agent_name")),
+                    bool(res.get("ok")),
+                    f"{res.get('agent_name')} joined {squad_id} as {role_id} (mesh_spawn)" if res.get("ok") else str(res.get("error")),
+                    self._who())
+                return self._send(200 if res.get("ok") else 409, res)
+            if method == "POST" and path == "/api/squad":
+                body = self._body()
+                sid = str(body.get("id") or body.get("squad_id") or "").strip()
+                if not sid:
+                    raise ValueError("id is required")
+                doc = service.store.update_squad(sid, **{k: body[k] for k in ("spawn_role", "spawn_limit") if k in body})
+                if doc is None:
+                    return self._send(404, dict(ok=False, error=f"no squad {sid}"))
+                service.store.log_action("squad", 0, dict(name=sid), True,
+                                         f"agents may add {doc['spawn_role'] or 'nobody'} up to {doc['spawn_limit']} "
+                                         f"({doc['spawn_used']} used)", self._who())
+                return self._send(200, dict(ok=True, squad=doc))
+            if method == "POST" and path == "/api/squad/member":
+                from almanac import spawner
+                body = self._body()
+                port = getattr(self.server, "server_port", 8812)
+                overrides = {k: body[k] for k in ("model", "effort", "workspace_mode", "permission_mode") if body.get(k)}
+                # the same lock as mesh_spawn: an operator add and an agent add must not pick the same free handle
+                with service.spawn_lock:
+                    try:
+                        res = spawner.join_squad(service, almanac_url=f"http://127.0.0.1:{port}", token=token,
+                                                 squad_id=str(body.get("squad_id") or ""), role_id=str(body.get("role_id") or ""),
+                                                 task=str(body.get("task") or ""), agent_name=body.get("agent_name") or body.get("name"),
+                                                 spawned_by=None, **overrides)      # the operator's adds never use the limit
+                    except (RuntimeError, OSError) as exc:
+                        res = dict(ok=False, agent_name=body.get("agent_name"), role_id=body.get("role_id"), error=str(exc))
+                service.store.log_action(
+                    "spawn", res.get("pid") or 0, dict(session_id=res.get("session_id"), name=res.get("agent_name")),
+                    bool(res.get("ok")),
+                    f"{res.get('agent_name')} added to {body.get('squad_id')} as {body.get('role_id')}" if res.get("ok")
+                    else str(res.get("error")), self._who())
+                return self._send(200 if res.get("ok") else 409, res)
+            if method == "POST" and path == "/api/operator/read":
+                body = self._body()
+                upto = body.get("upto")
+                ids = body.get("ids")
+                if upto is None and not isinstance(ids, list):
+                    raise ValueError("send {\"ids\": [..]} or {\"upto\": id}")
+                changed = service.store.mark_read(ids=ids, upto=int(upto) if upto is not None else None)
+                return self._send(200, dict(service.store.operator_counts(), ok=True, marked=changed))
+            if method == "POST" and path == "/api/operator/resolve":
+                row_id = self._body().get("id")
+                if not isinstance(row_id, int) or isinstance(row_id, bool):
+                    raise ValueError("id must be a message id")
+                if not service.store.resolve_message(row_id):
+                    return self._send(404, dict(ok=False, error=f"no open flagged message {row_id}"))
+                return self._send(200, dict(service.store.operator_counts(), ok=True, message=service.store.message(row_id)))
             if method == "POST" and path == "/api/spawn":
                 from almanac import spawner
                 body = self._body()
                 port = getattr(self.server, "server_port", 8812)
-                res = spawner.spawn_agent(
-                    service,
-                    almanac_url=f"http://127.0.0.1:{port}",
-                    token=token,
-                    cwd=body.get("cwd") or "",
-                    agent_name=body.get("agent_name") or body.get("name"),
-                    role_id=body.get("role_id"),
-                    provider=body.get("provider"),
-                    model=body.get("model"),
-                    effort=body.get("effort"),
-                    workspace_mode=body.get("workspace_mode"),
-                    permission_mode=body.get("permission_mode"),
-                    system_prompt=body.get("system_prompt"),
-                    initial_prompt=body.get("initial_prompt") or body.get("prompt"),
-                    channels=body.get("channels"),
-                    squad_id=body.get("squad_id"),
-                    remote=bool(body.get("remote", False)),
-                    headless=bool(body.get("headless", False)),
-                )
+                try:
+                    res = spawner.spawn_agent(
+                        service,
+                        almanac_url=f"http://127.0.0.1:{port}",
+                        token=token,
+                        cwd=body.get("cwd") or "",
+                        agent_name=body.get("agent_name") or body.get("name"),
+                        role_id=body.get("role_id"),
+                        provider=body.get("provider"),
+                        model=body.get("model"),
+                        effort=body.get("effort"),
+                        workspace_mode=body.get("workspace_mode"),
+                        permission_mode=body.get("permission_mode"),
+                        system_prompt=body.get("system_prompt"),
+                        initial_prompt=body.get("initial_prompt") or body.get("prompt"),
+                        channels=body.get("channels"),
+                        squad_id=body.get("squad_id"),
+                        remote=bool(body.get("remote", False)),
+                        headless=bool(body.get("headless", False)),
+                    )
+                except (RuntimeError, OSError) as exc:     # a worktree git refuses, a runner that will not start
+                    res = dict(ok=False, agent_name=body.get("agent_name") or body.get("name"), provider=body.get("provider"),
+                               role_id=body.get("role_id"), error=str(exc))
                 service.store.log_action(
                     "spawn",
                     res.get("pid") or 0,
@@ -1055,13 +1466,16 @@ def make_handler(service, token, *, hosts=()):
                     cwd=body.get("cwd") or "",
                     brief=body.get("brief") or "",
                     members=body.get("members") or [],
+                    spawn_role=body.get("spawn_role") or None,
+                    spawn_limit=body.get("spawn_limit") or 0,
                 )
                 service.store.log_action(
                     "squad",
                     0,
                     dict(name=res["squad"]["name"]),
                     bool(res.get("ok")),
-                    f"launched {res['launched']} agent(s) in {res['squad']['cwd']}",
+                    f"launched {res['launched']} agent(s) in {res['squad']['cwd']}"
+                    + "".join(f"; {a.get('agent_name')} failed: {a.get('error')}" for a in res["squad"]["agents"] if not a.get("ok")),
                     self._who(),
                 )
                 return self._send(200 if res.get("ok") else 409, res)
@@ -1113,11 +1527,24 @@ def make_handler(service, token, *, hosts=()):
                     ok, message, row = service.fleet.kill(pid, created)
                     action = "kill"
                 else:
+                    from almanac import uds
+                    from almanac.store import NEEDS
                     text = body.get("text")
-                    if not isinstance(text, str) or not text.strip():
+                    if not isinstance(text, str):
                         raise ValueError("text is required")
+                    # one text for the wire and the journal, split the way the transcript read splits it, so the
+                    # recipient's copy is recognised as this row: a typed channel line, then a typed flag
+                    channel, text = uds.split_channel(text.strip())
+                    typed, text = uds.split_needs(text)
+                    text = text.strip()
+                    if not text:
+                        raise ValueError("text is required")
+                    needs = str(body.get("needs") or "").strip().lower() or typed
+                    if needs not in NEEDS:
+                        raise ValueError("needs must be 'reply', 'blocking' or empty")
                     hub_pipe = service.hub_peer.pipe_path if service.hub_peer else None
-                    ok, message, row = service.fleet.send(pid, created, text, from_name=self._who(), from_pipe=hub_pipe)
+                    ok, message, row = service.fleet.send(pid, created, uds.needs_marker(needs, self._who()) + text,
+                                                          from_name=self._who(), from_pipe=hub_pipe, channel=channel)
                     action = "send"
                     if ok and row:
                         service.store.record_message(
@@ -1126,10 +1553,12 @@ def make_handler(service, token, *, hosts=()):
                             to_session=row.get("session_id"),
                             to_provider=row.get("provider"),
                             squad_id=row.get("squad_id"),
-                            body=text.strip(),
+                            channel=channel,
+                            body=text,
                             transport="uds" if row.get("has_uds") else "console",
+                            needs=needs,
                         )
-                    message = f"{message}: {text.strip()[:200]}" if ok else message
+                    message = f"{message}: {text[:200]}" if ok else message
                 entry = service.store.log_action(action, pid, row, ok, message, self._who())
                 with service.fleet_lock:
                     service.fleet.last["at"] = 0        # the next look rescans

@@ -38,13 +38,19 @@ def main(argv=None):
     from almanac.fleet import Fleet
     from almanac.namer import Namer
     from almanac.resume import Prices
+    from almanac.config import is_shim
+    # never name chats through a .cmd shim: cmd.exe would re-parse the command line
     namer = Namer(model=settings["naming_model"], claude=settings["claude"],
-                  workdir=args.state.resolve() / "namer-cwd") if settings["naming"] else None
+                  workdir=args.state.resolve() / "namer-cwd") if settings["naming"] and not is_shim(settings["claude"]) else None
     gemini_projects = args.state.resolve() / "gemini" / "projects"
     service = Service(store, settings["transcripts"], settings["interval"],
                       fleet=Fleet(Path(settings["transcripts"]).parent, extra_projects=[gemini_projects]),
-                      state=args.state, claude=settings["claude"], gemini=settings["gemini"],
+                      state=args.state, claude=settings["claude_configured"], gemini=settings["gemini_configured"],
                       prices=Prices(settings["prices"]), namer=namer)
+    for kind, runner in service.runners().items():
+        if not runner["ok"]:
+            logging.warning("%s runner not found; looked in: %s; set \"%s\" in config.json",
+                            kind, "; ".join(runner["searched"]), kind)
     if args.ingest:
         print(service.ingest())
         return 0

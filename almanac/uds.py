@@ -39,11 +39,53 @@ ERROR_BROKEN_PIPE = 109
 ERROR_NO_DATA = 232
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
+# greedy to the LAST closing tag: there is one wrapper per user record, and a message may itself quote the tag
 CROSS_SESSION_RE = re.compile(
-    r"<cross-session-message\s+([^>]*)>([\s\S]*?)</cross-session-message>"
+    r"<cross-session-message\s+([^>]*)>([\s\S]*)</cross-session-message>"
 )
 ATTR_RE = re.compile(r'([a-zA-Z0-9_-]+)="([^"]*)"')
 CHANNEL_PREFIX_RE = re.compile(r"^\[channel:\s*([^\]]+)\]\r?\n")
+NEEDS_TAG_RE = re.compile(r"^\[needs:\s*(reply|blocking)\][ \t]*")
+NEEDS_LINES = {
+    "blocking": "[needs: blocking] {sender} cannot continue until you answer: reply to them directly with mesh_send.",
+    "reply": "[needs: reply] {sender} wants an answer: reply to them directly with mesh_send when you can.",
+}
+# the hub's own marker line for any sender: the whole line goes, never kept as words of the message
+_CANONICAL = {needs: re.compile("^" + re.escape(line).replace(re.escape("{sender}"), ".+?") + "$")
+              for needs, line in NEEDS_LINES.items()}
+
+
+def split_needs(body: str) -> tuple[str | None, str]:
+    """(flag, body without it) for a body that opens with a `[needs: ...]` tag. One rule for the sender's side
+    (mesh_send, /api/send) and the reader's (`parse_cross_session`), so the journal and a transcript copy agree:
+    if the rest of that first line is the hub's canonical sentence, the whole line goes; otherwise only the tag
+    goes, and what follows it on the line (trimmed) is the message's first line. `[WIP] x` is not a tag."""
+    body = body or ""
+    tag = NEEDS_TAG_RE.match(body)
+    if not tag:
+        return None, body
+    needs = tag.group(1)
+    first, newline, rest = body.partition("\n")
+    first = first.rstrip("\r")
+    if _CANONICAL[needs].match(first):
+        return needs, rest
+    words = first[tag.end():].strip()
+    return needs, (words + newline + rest) if words else rest
+
+
+def split_channel(body: str) -> tuple[str | None, str]:
+    """(channel, body without it) for a body that opens with a `[channel: #x]` line, as a channel post is
+    delivered. Used by `parse_cross_session` and by mesh_send for a channel line typed into a direct message."""
+    match = CHANNEL_PREFIX_RE.match(body or "")
+    return (match.group(1).strip(), body[match.end():]) if match else (None, body or "")
+
+
+def needs_marker(needs: str | None, sender: str) -> str:
+    """The line put at the top of a flagged message as delivered. Claude Code shows the `<cross-session-message>`
+    wrapper but may drop attributes it does not know, so the flag rides in the body; the journal keeps the
+    sender's own words and `parse_cross_session` strips the line again."""
+    line = NEEDS_LINES.get(needs or "")
+    return line.format(sender=sender) + "\n" if line else ""
 
 # In-process pipe registry used when `in_memory=True` (unit tests) or as a fast loopback fallback in tests.
 _MEM_LOCK = threading.Lock()
@@ -141,17 +183,16 @@ def parse_cross_session(raw: str) -> dict | None:
         body = body[:-2]
     elif body.endswith("\n"):
         body = body[:-1]
-    channel = attrs.get("from-channel")
-    ch_match = CHANNEL_PREFIX_RE.match(body)
-    if ch_match:
-        channel = channel or ch_match.group(1).strip()
-        body = body[ch_match.end():]
+    typed_channel, body = split_channel(body)
+    channel = attrs.get("from-channel") or typed_channel
+    needs, body = split_needs(body)
     return dict(
         from_pipe=(attrs.get("from") or "").removeprefix("uds:") or None,
         from_name=attrs.get("from-name") or None,
         from_mode=attrs.get("from-mode") or None,
         channel=channel or None,
         body=body,
+        needs=needs,
     )
 
 
@@ -185,6 +226,7 @@ def discover_peers(sessions_dir: Path, *, alive_fn=None) -> list[dict]:
                 effort=doc.get("effort"),
                 role_name=doc.get("roleName"),
                 squad_id=doc.get("squadId"),
+                mode_note=doc.get("modeNote"),
                 channels=doc.get("channels") if isinstance(doc.get("channels"), list) else [],
                 status=doc.get("status"),
                 kind=doc.get("kind"),
@@ -439,6 +481,7 @@ class PeerServer:
             "effort": self.effort,
             "roleName": self.role_name,
             "squadId": self.squad_id,
+            "modeNote": getattr(self, "mode_note", None),
             "channels": self.channels,
             "transcriptPath": self.transcript_path,
         }
@@ -525,7 +568,9 @@ class PeerServer:
                 channel=parsed.get("channel"),
                 to_name=self.name,
                 to_session=self.session_id,
-                body=parsed["body"],
+                # the flag line stays on what the agent reads (a Gemini host re-wraps `body` into its prompt)
+                body=needs_marker(parsed.get("needs"), parsed["from_name"] or "peer") + parsed["body"],
+                needs=parsed.get("needs"),
             )
             if self.inbox_path is not None:
                 self.inbox_path.parent.mkdir(parents=True, exist_ok=True)

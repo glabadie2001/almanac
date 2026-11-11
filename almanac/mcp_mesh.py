@@ -101,7 +101,8 @@ MCP_TOOLS = [
         "name": "mesh_send",
         "description": (
             "Send a message over the Claude uds-messaging Named Pipe protocol to a specific peer (Claude or Gemini), "
-            "'@squad' (your squad), '@all' (every live session), or a '#channel'."
+            "'operator' (the human running the squad, if your role may page them), '@squad' (your squad), "
+            "or a '#channel' (its subscribers in your squad). '@all' is the operator's. Set `needs` when you want an answer."
         ),
         "inputSchema": {
             "type": "object",
@@ -118,12 +119,45 @@ MCP_TOOLS = [
                     "type": "string",
                     "description": "Optional channel tag (e.g. '#architecture', '#review').",
                 },
-                "from_name": {
+                "needs": {
                     "type": "string",
-                    "description": "Optional sender name override (defaults to your registered agent name).",
+                    "enum": ["reply", "blocking"],
+                    "description": (
+                        "Flag the message as needing an answer: 'reply' = wants an answer, not urgent; 'blocking' = you "
+                        "(or the squad) cannot continue until it is answered. It stays open until the recipient sends "
+                        "you a direct message. Omit for an ordinary message."
+                    ),
                 },
             },
             "required": ["to", "message"],
+        },
+    },
+    {
+        "name": "mesh_spawn",
+        "description": (
+            "Add one member to your squad, if your role may add members. The role it gets (with its model, "
+            "workspace and permission mode) and how many may be added are the operator's choice, shown in mesh_roster "
+            "as the squad's spawn_role, spawn_limit and spawn_used; you only give the task. Refused with the reason "
+            "when the limit is used up. The squad is told who joined."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "The new member's slice: what to build, which files it may touch, how to test it, whom to report to.",
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Optional handle; by default the role's short form plus a number, e.g. impl-claude-2.",
+                },
+                "role": {
+                    "type": "string",
+                    "description": ("The role id to add. Required when the squad's spawn_role is '*' (any role; ids in mesh_roster's "
+                                    "roles); when the squad allows one role, leave it out or name that role."),
+                },
+            },
+            "required": ["task"],
         },
     },
     {
@@ -226,6 +260,8 @@ class MeshClient:
             return {
                 "peers": doc.get("peers") or [],
                 "squads": doc.get("squads") or [],
+                "open": doc.get("open") or [],
+                "roles": [dict(id=r.get("id"), title=r.get("title"), provider=r.get("provider")) for r in doc.get("roles") or []],
                 "hub_pipe": doc.get("hub_pipe"),
             }
         if name == "mesh_context_stream":
@@ -265,8 +301,19 @@ class MeshClient:
                 "from_name": str(args.get("from_name") or self.self_name),
                 "channel": args.get("channel"),
                 "squad_id": args.get("squad_id") or self.squad_id,
+                "needs": args.get("needs") or None,
             }
             return self._api("/api/mesh/send", method="POST", body=payload)
+        if name == "mesh_spawn":
+            task = str(args.get("task") or "").strip()
+            if not task:
+                raise ValueError("'task' is required")
+            payload = {"task": task}
+            if args.get("name"):
+                payload["name"] = str(args["name"])
+            if args.get("role"):
+                payload["role"] = str(args["role"])
+            return self._api("/api/mesh/spawn", method="POST", body=payload, timeout=120.0)
         if name == "mesh_wait":
             timeout_s = max(1.0, min(300.0, float(args.get("timeout_seconds") or 120.0)))
             since = int(args["since_id"]) if args.get("since_id") is not None else self._ensure_cursor()
@@ -368,6 +415,12 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
     p_send.add_argument("message", nargs="+")
     p_send.add_argument("--channel")
     p_send.add_argument("--from", dest="from_name")
+    p_send.add_argument("--needs", choices=("reply", "blocking"))
+
+    p_spawn = sp.add_parser("spawn")
+    p_spawn.add_argument("task", nargs="+")
+    p_spawn.add_argument("--name")
+    p_spawn.add_argument("--role")
 
     p_wait = sp.add_parser("wait")
     p_wait.add_argument("--timeout", type=float, default=120.0)
@@ -385,10 +438,13 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
             "mesh_contact_stream",
             {"peer": ns.peer, "channel": ns.channel, "squad_id": ns.squad_id, "since_id": ns.since_id, "limit": ns.limit},
         )
+    elif ns.cmd == "spawn":
+        res = client.call_tool("mesh_spawn", {"task": " ".join(ns.task), "name": ns.name, "role": ns.role})
     elif ns.cmd == "send":
         res = client.call_tool(
             "mesh_send",
-            {"to": ns.to, "message": " ".join(ns.message), "channel": ns.channel, "from_name": ns.from_name},
+            {"to": ns.to, "message": " ".join(ns.message), "channel": ns.channel, "from_name": ns.from_name,
+             "needs": ns.needs},
         )
     else:
         res = client.call_tool("mesh_wait", {"timeout_seconds": ns.timeout, "channel": ns.channel, "since_id": ns.since_id})

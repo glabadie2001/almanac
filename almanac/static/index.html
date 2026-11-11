@@ -15,6 +15,8 @@
     <span class="brand">ALMANAC<span class="dim">//</span>MISSION-CONTROL</span>
     <span id="mesh-pill" class="dim">claude + gemini // uds</span>
     <span class="grow"></span>
+    <button type="button" id="inbox-btn" class="inbox-btn" title="operator inbox (7)" aria-label="operator inbox, 0 unread">[✉ 0]</button>
+    <span id="alerts" class="alerts" role="status" aria-live="polite"></span>
     <span id="link" class="link">● LINK</span>
     <span id="clock" class="dim">--:--:--</span>
   </header>
@@ -25,6 +27,7 @@
     <button type="button" id="tab-chats" role="tab" data-tab="chats" aria-selected="false">[4] CHATS</button>
     <button type="button" id="tab-telemetry" role="tab" data-tab="telemetry" aria-selected="false">[5] TELEMETRY</button>
     <button type="button" id="tab-log" role="tab" data-tab="log" aria-selected="false">[6] LOG</button>
+    <button type="button" id="tab-inbox" role="tab" data-tab="inbox" aria-selected="false">[7] INBOX</button>
     <span class="grow"></span>
     <button type="button" id="help-btn" class="dim" aria-label="Keyboard help">[?] KEYS</button>
   </nav>
@@ -123,6 +126,14 @@
           <div class="member-head dim" aria-hidden="true"><span>role</span><span>handle</span><span>model</span><span>effort</span><span>isolation</span><span></span></div>
           <div id="squad-members" class="member-rows"></div>
         </div>
+        <div class="field">
+          <label for="squad-spawn-role">architect may add</label>
+          <select id="squad-spawn-role" name="spawn_role"><option value="">(nobody)</option></select>
+        </div>
+        <div class="field">
+          <label for="squad-spawn-limit">up to</label>
+          <input id="squad-spawn-limit" name="spawn_limit" type="number" min="0" max="20" step="1" value="0">
+        </div>
         <div class="form-actions span-all">
           <button type="submit" id="squad-submit" class="btn hi">[LAUNCH SQUAD ▸]</button>
           <button type="button" id="squad-cancel" class="btn dim">[CLOSE]</button>
@@ -141,6 +152,7 @@
       </div>
       <div class="box detail" data-title="SESSION" id="detail">
         <div id="detail-head" class="pad"><span class="dim">select a process ▸ j/k then enter</span></div>
+        <div class="pad bar-line feed-kinds"><span class="dim">show</span><span class="seg" id="fleet-kinds"></span></div>
         <ol id="feed" class="feed" aria-live="polite"></ol>
         <form id="say" class="say" autocomplete="off" hidden>
           <label for="say-text" class="hi">say&gt;</label>
@@ -162,11 +174,14 @@
   <section id="gallery" class="view" role="tabpanel" aria-labelledby="tab-gallery" hidden>
     <div class="line controls">
       <span class="dim">show</span>
-      <span class="seg" id="g-mode"><button type="button" data-v="all">all sessions</button><button type="button" data-v="pinned">pinned</button></span>
+      <span class="seg" id="g-mode"><button type="button" data-v="all">all sessions</button><button type="button" data-v="pinned">pinned</button><button type="button" data-v="busy">busy</button><button type="button" data-v="squad">squad</button></span>
+      <select id="g-squad" class="inline-select" aria-label="squad to show" hidden><option value="">any squad</option></select>
       <span class="dim">cols</span>
       <span class="seg" id="g-cols"><button type="button" data-v="auto">auto</button><button type="button" data-v="1">1</button><button type="button" data-v="2">2</button><button type="button" data-v="3">3</button><button type="button" data-v="4">4</button><button type="button" data-v="6">6</button></span>
       <span class="dim">height</span>
       <span class="seg" id="g-height"><button type="button" data-v="s">S</button><button type="button" data-v="m">M</button><button type="button" data-v="l">L</button></span>
+      <span class="dim">feed</span>
+      <span class="seg" id="g-kinds"></span>
       <span id="g-count" class="dim"></span>
     </div>
     <div id="tiles-grid" class="gallery"></div>
@@ -232,6 +247,12 @@
               <option value="worktree">worktree</option>
             </select>
           </div>
+          <div class="field check-field">
+            <label for="role-page"><input type="checkbox" id="role-page" name="may_page_operator"> may page the operator ✉</label>
+          </div>
+          <div class="field check-field">
+            <label for="role-grow"><input type="checkbox" id="role-grow" name="may_spawn"> may add squad members ⊕</label>
+          </div>
           <div class="field span-all">
             <label for="role-prompt">role system prompt *</label>
             <textarea id="role-prompt" name="system_prompt" rows="3" required placeholder="Responsibilities, boundaries, verification standards, and how this role collaborates with peers…"></textarea>
@@ -247,6 +268,32 @@
       </div>
     </div>
 
+    <div id="mesh-strip" class="squad-strip" hidden>
+      <div id="mesh-strip-info" class="strip-row"></div>
+      <div id="mesh-strip-tools" class="strip-row">
+        <span id="strip-grow" class="dim"></span>
+        <button type="button" id="strip-edit" class="btn" aria-expanded="false" title="what the squad's architect may add">[LIMIT ✎]</button>
+        <button type="button" id="strip-add" class="btn cyan" aria-expanded="false">[+ ADD MEMBER]</button>
+        <form id="strip-edit-form" class="strip-row" autocomplete="off" hidden>
+          <label for="strip-role" class="dim">agents may add</label>
+          <select id="strip-role" class="inline-select"></select>
+          <label for="strip-limit" class="dim">up to</label>
+          <input id="strip-limit" class="inline-input num-input" type="number" min="0" max="20" step="1">
+          <button type="submit" class="btn hi">[SAVE]</button>
+        </form>
+        <form id="strip-add-form" class="strip-row" autocomplete="off" hidden>
+          <label for="strip-add-role" class="dim">role</label>
+          <select id="strip-add-role" class="inline-select"></select>
+          <label for="strip-add-name" class="dim">handle</label>
+          <input id="strip-add-name" class="inline-input" placeholder="(auto)" autocorrect="off" autocapitalize="none" spellcheck="false">
+          <label for="strip-add-task" class="dim">task</label>
+          <input id="strip-add-task" class="inline-input task-input" required placeholder="the slice: what, which files, how to test, whom to report to">
+          <button type="submit" class="btn hi">[ADD ▸]</button>
+        </form>
+        <span id="strip-msg" class="dim" role="status" aria-live="polite"></span>
+      </div>
+    </div>
+
     <div class="split mesh-split">
       <div class="mesh-col">
         <div class="box" data-title="LIVE PEER ROSTER">
@@ -257,16 +304,44 @@
           <p id="mesh-peers-empty" class="dim pad" hidden>no live peers on the mesh yet</p>
         </div>
 
+        <div class="box" data-title="TOPOLOGY // WHO TALKS TO WHOM" id="topo-box">
+          <div class="pad bar-line">
+            <span id="topo-scope" class="dim">loading topology…</span>
+            <span class="grow"></span>
+            <span class="dim">click a node: its context · an edge: those messages</span>
+          </div>
+          <div id="topo" class="topo"></div>
+        </div>
+
+        <div class="box" data-title="SQUAD TIMELINE // WORK HEATMAP" id="heat-box">
+          <div class="pad bar-line">
+            <span id="heat-scope" class="dim">loading worktime…</span>
+            <span class="grow"></span>
+            <span class="seg" id="heat-layers">
+              <button type="button" data-v="heat" aria-pressed="true">heat</button>
+              <button type="button" data-v="events" aria-pressed="false">heat + events</button>
+            </span>
+            <span class="dim">intensity</span>
+            <span class="seg" id="heat-mode">
+              <button type="button" data-v="events" aria-pressed="true">events</button>
+              <button type="button" data-v="output" aria-pressed="false">output tokens</button>
+            </span>
+          </div>
+          <div id="heat" class="heat"></div>
+          <div id="heat-legend" class="heat-legend" aria-hidden="true"></div>
+          <p id="heat-summary" class="pad heat-summary"></p>
+          <table id="heat-table" class="visually-hidden">
+            <caption>Worktime per agent</caption>
+            <thead><tr><th scope="col">agent</th><th scope="col">work</th><th scope="col">waiting</th><th scope="col">idle</th><th scope="col">turns</th><th scope="col">tool calls</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
         <div class="box detail mesh-ctx" data-title="PEER CONTEXT STREAM" id="mesh-ctx-box">
           <div class="pad bar-line">
             <div id="mesh-ctx-head" class="dim">click a peer above to inspect its live Context Stream (prompts, replies, tool calls, peer traffic)</div>
             <span class="grow"></span>
-            <span class="seg" id="mesh-ctx-kinds">
-              <button type="button" data-v="" aria-pressed="true">all</button>
-              <button type="button" data-v="you,claude,gemini,peer_in,peer_out">dialog</button>
-              <button type="button" data-v="peer_in,peer_out">contacts</button>
-              <button type="button" data-v="tool,result,error">tools</button>
-            </span>
+            <span class="seg" id="mesh-ctx-kinds"></span>
           </div>
           <ol id="mesh-ctx-feed" class="feed" aria-live="polite"></ol>
         </div>
@@ -279,6 +354,8 @@
             <button type="button" data-v="all" aria-pressed="true">all traffic</button>
             <button type="button" data-v="peer" aria-pressed="false">selected peer</button>
           </span>
+          <span id="mesh-pair-chip" class="alert-chip warn" hidden><span id="mesh-pair-text"></span>
+            <button type="button" id="mesh-pair-clear" class="chip-x" aria-label="show all messages again">✕</button></span>
           <label for="mesh-filter-ch" class="dim">channel</label>
           <input id="mesh-filter-ch" class="inline-input" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="#any">
           <span class="grow"></span>
@@ -296,6 +373,12 @@
             </datalist>
             <label for="mesh-channel" class="dim">ch&gt;</label>
             <input id="mesh-channel" name="channel" class="inline-input" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="#review">
+            <label for="mesh-needs" class="dim">needs&gt;</label>
+            <select id="mesh-needs" name="needs" class="inline-select" title="ask for an answer: the message stays open until the recipient replies to you">
+              <option value="">none</option>
+              <option value="reply">reply</option>
+              <option value="blocking">blocking</option>
+            </select>
             <button type="submit" id="mesh-send-btn" class="btn hi">[SEND UDS ▸]</button>
           </div>
           <label for="mesh-text" class="visually-hidden">Message body</label>
@@ -341,11 +424,14 @@
       <span class="seg" id="days"><button type="button" data-v="7">7d</button><button type="button" data-v="30">30d</button><button type="button" data-v="90">90d</button><button type="button" data-v="0">all</button></span>
       <span class="dim">bucket</span>
       <span class="seg" id="bucket"><button type="button" data-v="day">day</button><button type="button" data-v="week">week</button></span>
+      <span class="dim">provider</span>
+      <span class="seg" id="provider"><button type="button" data-v="all">all</button><button type="button" data-v="claude">claude</button><button type="button" data-v="gemini">gemini</button></span>
       <button type="button" id="rescan">[RESCAN]</button>
       <span id="ingest-status" class="dim"></span>
     </div>
     <div class="tiles" id="tiles"></div>
     <div class="box" data-title="TRENDS"><div id="trends" class="pad"></div></div>
+    <div class="box" data-title="BY MODEL"><div id="models" class="pad"></div></div>
     <div class="box" data-title="SHELL CALLS BY PURPOSE"><div id="families" class="pad"></div></div>
     <div class="box" data-title="HELPER ADOPTION"><div id="adoption" class="pad"></div></div>
     <div class="box" data-title="TOOLS"><div id="tools" class="pad"></div></div>
@@ -356,9 +442,47 @@
     <div class="box" data-title="ACTIONS"><ol id="log-list" class="log pad"></ol></div>
   </section>
 
+  <section id="inbox" class="view" role="tabpanel" aria-labelledby="tab-inbox" hidden>
+    <div class="line controls">
+      <label for="inbox-squad" class="dim">squad</label>
+      <select id="inbox-squad" class="inline-select"><option value="">all squads</option></select>
+      <span id="inbox-summary" class="dim"></span>
+      <span class="grow"></span>
+      <button type="button" id="inbox-notify" class="btn" aria-pressed="false" title="a browser notification when an agent is blocked on you">[NOTIFY ◇]</button>
+      <button type="button" id="inbox-refresh" class="btn">[REFRESH]</button>
+    </div>
+    <div class="split inbox-split">
+      <div class="box" data-title="THREADS">
+        <ol id="inbox-threads" class="threads" aria-label="Conversations with the operator"></ol>
+        <p id="inbox-empty" class="dim pad" hidden></p>
+      </div>
+      <div class="box detail" data-title="THREAD" id="inbox-thread-box">
+        <div id="inbox-head" class="pad dim">select a thread on the left</div>
+        <ol id="inbox-feed" class="feed contact-feed" aria-live="polite"></ol>
+        <form id="inbox-form" class="mesh-say" autocomplete="off" hidden>
+          <div class="mesh-say-top">
+            <span class="hi">reply&gt;</span>
+            <span id="inbox-to" class="cyan"></span>
+            <span class="grow"></span>
+            <label for="inbox-needs" class="dim">needs&gt;</label>
+            <select id="inbox-needs" class="inline-select">
+              <option value="">none</option>
+              <option value="reply">reply</option>
+              <option value="blocking">blocking</option>
+            </select>
+            <button type="submit" id="inbox-send" class="btn hi">[SEND ▸]</button>
+          </div>
+          <label for="inbox-text" class="visually-hidden">Reply</label>
+          <textarea id="inbox-text" rows="2" maxlength="8000" required placeholder="reply to this agent (Enter sends, Shift+Enter newline)"></textarea>
+          <div id="inbox-msg" class="dim" role="status" aria-live="polite"></div>
+        </form>
+      </div>
+    </div>
+  </section>
+
   <div id="help" class="help" hidden>
     <div class="box" data-title="KEYS">
-      <pre class="pad">1 2 3 4 5 6  fleet · gallery · mesh · chats · telemetry · log
+      <pre class="pad">1 2 3 4 5 6 7  fleet · gallery · mesh · chats · telemetry · log · inbox
 j k ↑ ↓      move through the fleet
 enter        open the selected process
 m            set model on the selected fleet session (or click MODEL cell)
@@ -373,6 +497,10 @@ esc          close / cancel
   </div>
   <ul id="model-picker" class="model-picker" role="listbox" aria-label="Available models" hidden></ul>
   <div class="tip" id="tip" role="status" hidden></div>
+  <div id="alert-box" class="box alert-box" data-title="ALERT" role="dialog" aria-modal="false" aria-labelledby="alert-box-text" hidden>
+    <pre id="alert-box-text" class="alert-text"></pre>
+    <button type="button" id="alert-box-close" class="btn">[CLOSE]</button>
+  </div>
 </main>
 </body>
 </html>

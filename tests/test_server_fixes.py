@@ -207,7 +207,7 @@ class MigrationTests(Fixture):
                          [("t2", "impl", "sq-1")])
         self.assertEqual(s.role("architect-claude")["system_prompt"], store_mod.ARCHITECT)
         self.assertEqual(s.role("reviewer-claude")["system_prompt"], "mine", "an edited brief is never overwritten")
-        self.assertEqual(s.db.execute("select count(*) from files").fetchone()[0], 1, "v4 does not force a re-read")
+        self.assertEqual(s.db.execute("select count(*) from files").fetchone()[0], 0, "v4 does not, but v6 forces one re-read")
         s.db.execute("update roles set system_prompt = ? where id = 'architect-gemini'", (store_mod.OLD_ARCHITECT,))
         s.db.commit()
         s.close()

@@ -2,6 +2,10 @@
   color-scheme: dark;
   --bg: #050806; --panel: #08100b; --fg: #b9f2c6; --hi: #3dff8b; --dim: #5d8f69; --line: #1c3a25;
   --amber: #ffb547; --red: #ff6158; --cyan: #63d8ff; --violet: #c792ea; --sel: #0f2a18; --glow: rgba(61, 255, 139, .35);
+  /* worktime heatmap: work ramp (one hue, 5 steps), waiting, parallel ramp (solo neutral, 2 / 3 / 4+);
+     validated with the dataviz palette script against --panel in each theme */
+  --heat-1: #226b40; --heat-2: #2a8a51; --heat-3: #31a962; --heat-4: #37cc75; --heat-5: #3dff8b; --heat-wait: #6a4fa0;
+  --par-1: #33463a; --par-2: #8f6a2a; --par-3: #c99335; --par-4: #ffb547;
   --mono: ui-monospace, "Cascadia Mono", "Cascadia Code", Consolas, "SF Mono", Menlo, monospace;
 }
 @media (prefers-color-scheme: light) {
@@ -9,12 +13,16 @@
     color-scheme: light;
     --bg: #f3f0e6; --panel: #faf8f1; --fg: #1d2c21; --hi: #08722f; --dim: #5f7465; --line: #c6d1c3;
     --amber: #8f5300; --red: #b8322a; --cyan: #0b6b94; --violet: #6b2fa0; --sel: #e2ecdf; --glow: transparent;
+    --heat-1: #6db683; --heat-2: #4a9c64; --heat-3: #2f824b; --heat-4: #1a6a37; --heat-5: #085426; --heat-wait: #a07fe0;
+    --par-1: #cdd5c9; --par-2: #d6a040; --par-3: #b97d14; --par-4: #6e4200;
   }
 }
 :root[data-theme="light"] {
   color-scheme: light;
   --bg: #f3f0e6; --panel: #faf8f1; --fg: #1d2c21; --hi: #08722f; --dim: #5f7465; --line: #c6d1c3;
   --amber: #8f5300; --red: #b8322a; --cyan: #0b6b94; --violet: #6b2fa0; --sel: #e2ecdf; --glow: transparent;
+  --heat-1: #6db683; --heat-2: #4a9c64; --heat-3: #2f824b; --heat-4: #1a6a37; --heat-5: #085426; --heat-wait: #a07fe0;
+  --par-1: #cdd5c9; --par-2: #d6a040; --par-3: #b97d14; --par-4: #6e4200;
 }
 
 * { box-sizing: border-box; }
@@ -238,6 +246,7 @@ td { padding: 2px 8px; white-space: nowrap; }
 .controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .seg button { padding: 0 4px; }
 .seg button[aria-pressed="true"] { color: var(--bg); background: var(--hi); text-shadow: none; }
+.seg.overridden { opacity: .45; }   /* the mesh scope while an edge's pair filter replaces it */
 .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
 .tile .big { font-size: 26px; color: var(--hi); font-weight: 700; }
 .tile .good { color: var(--hi); } .tile .bad { color: var(--red); }
@@ -263,3 +272,109 @@ details table td:first-child, details table th:first-child { text-align: left; }
   .crt, .link.down, .fleet tr.dying td, .fleet tr.fresh td, .feed .new, .confirm, .cursor::after, .tile-enter { animation: none !important; }
   .boot { display: none; }
 }
+
+/* header alerts: one chip per open problem, on every tab (setAlert / clearAlert in app.js) */
+.alerts { display: inline-flex; gap: 8px; flex-wrap: wrap; }
+.alerts:empty { display: none; }
+.alert-chip { font: inherit; background: none; border: 1px solid currentColor; padding: 0 6px; cursor: pointer; }
+.alert-chip.warn { color: var(--amber); }
+.alert-chip.crit { color: var(--red); animation: blink 1s steps(2) infinite; }
+.alert-box { position: fixed; top: 44px; right: 16px; z-index: 30; max-width: min(640px, calc(100vw - 32px)); padding: 14px 12px 10px; }
+.alert-text { white-space: pre-wrap; word-break: break-word; margin: 0 0 8px; }
+.run-missing { color: var(--amber); }
+@media (prefers-reduced-motion: reduce) { .alert-chip.crit { animation: none; } }
+
+/* operator channel: header badge, flags on messages, the squad strip, the inbox */
+.inbox-btn { font: inherit; background: none; border: 0; padding: 0; cursor: pointer; color: var(--dim); }
+.inbox-btn.hi { color: var(--hi); } .inbox-btn.amber { color: var(--amber); }
+.inbox-btn.crit { color: var(--red); font-weight: bold; }
+.flag { display: inline-block; margin-left: 6px; padding: 0 4px; border: 1px solid currentColor; font-size: 11px; line-height: 1.4; text-indent: 0; }
+.flag.blocking { color: var(--red); font-weight: bold; }
+.flag.reply { color: var(--amber); border-style: dotted; }
+.flag.done { color: var(--dim); border-color: transparent; }
+.squad-strip { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; border: 1px dashed var(--line); padding: 4px 8px; margin: 6px 0 0; }
+.squad-strip .flag { margin-left: 0; }
+.inbox-split { grid-template-columns: minmax(0, .8fr) minmax(0, 1.4fr); align-items: start; }
+.threads { list-style: none; margin: 0; padding: 4px 0; max-height: 64vh; overflow-y: auto; }
+.thread { display: block; width: 100%; text-align: left; font: inherit; color: var(--fg); background: none; border: 0;
+          border-bottom: 1px dotted var(--line); padding: 5px 10px; cursor: pointer; }
+.thread:hover, .thread:focus-visible { background: var(--sel); }
+.thread.sel { background: var(--sel); box-shadow: inset 2px 0 0 var(--hi); }
+.thread-head { display: flex; gap: 4px; align-items: baseline; }
+.thread-last { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
+.unread { color: var(--bg); background: var(--hi); padding: 0 4px; font-size: 11px; }
+#inbox-feed li.from-op .msg-body { color: var(--cyan); }
+.check-field label { display: flex; gap: 6px; align-items: center; color: var(--fg); font-size: inherit; padding-top: 16px; }
+.feed-kinds { padding-top: 0; padding-bottom: 2px; }
+@media (max-width: 760px) { .inbox-split { grid-template-columns: minmax(0, 1fr); } }
+
+/* worktime heatmap (MESH) */
+.heat { padding: 4px 10px 2px; overflow-x: hidden; }
+.heat svg { display: block; width: 100%; height: auto; font: 11px var(--mono); }
+.heat text { fill: var(--dim); }
+.heat .lbl { fill: var(--fg); } .heat .lbl-role { fill: var(--violet); }
+.heat .axis { stroke: var(--line); }
+.heat .row-hit { fill: transparent; cursor: pointer; }
+.heat .row-hit:focus-visible { outline: none; stroke: var(--hi); stroke-width: 1; }
+.heat-summary { margin: 0; font-size: 12px; }
+.heat-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: center; padding: 0 10px 6px; font-size: 11px; color: var(--dim); }
+.heat-legend .sw { display: inline-block; width: 12px; height: 10px; margin-right: 1px; vertical-align: -1px; }
+
+/* topology (MESH): fixed columns by role, curved edges; ended agents dashed, busy ones pulse */
+.topo { padding: 2px 10px 6px; overflow-x: auto; }   /* a graph wider than the box (columns keep a minimum) scrolls */
+.topo svg { display: block; width: 100%; height: auto; font: 11px var(--mono); }
+.topo .topo-col { fill: var(--dim); font-size: 10px; letter-spacing: .08em; }
+.topo-node rect { fill: var(--panel); stroke: var(--line); stroke-width: 1; }
+.topo-node.agent { cursor: pointer; }
+.topo-node.agent rect { stroke: var(--dim); }
+.topo-node.operator rect { stroke: var(--cyan); }
+.topo-node.channel rect { stroke: var(--violet); stroke-dasharray: 2 2; }
+.topo-node.sel rect { stroke: var(--hi); stroke-width: 2; }
+.topo-node.ended { opacity: .55; }
+.topo-node.ended rect { stroke-dasharray: 4 3; }
+.topo-node.busy rect { animation: topo-pulse 1.6s ease-in-out infinite; }
+@keyframes topo-pulse { 50% { stroke: var(--amber); } }
+.topo-node:focus-visible rect, .topo-edge:focus-visible .line { outline: none; stroke: var(--hi); }
+.topo-name { fill: var(--fg); } .topo-last { fill: var(--dim); }
+.topo-prov.claude { fill: var(--amber); } .topo-prov.gemini { fill: var(--cyan); }
+.topo-prov.operator { fill: var(--cyan); } .topo-prov.channel { fill: var(--violet); } .topo-wt { fill: var(--violet); }
+.topo-edge { cursor: pointer; }
+.topo-edge .line { fill: none; stroke: var(--line); }
+.topo-edge .hit { fill: none; stroke: transparent; stroke-width: 12; }
+.topo-edge.quiet .line { stroke: var(--dim); } .topo-edge.recent .line { stroke: var(--hi); }
+.topo-edge.reply .line { stroke: var(--amber); } .topo-edge.blocking .line { stroke: var(--red); }
+.topo-arrow.quiet { fill: var(--dim); } .topo-arrow.recent { fill: var(--hi); }
+.topo-arrow.reply { fill: var(--amber); } .topo-arrow.blocking { fill: var(--red); }
+.topo-count { fill: var(--fg); font-size: 10px; paint-order: stroke; stroke: var(--panel); stroke-width: 3px; }
+/* swimlane over the heatmap */
+.lane-err { stroke: var(--red); stroke-width: 1.5; }
+.lane-edit { stroke: var(--fg); stroke-width: 1; }
+.lane-msg { cursor: pointer; }
+.lane-msg line { stroke: var(--cyan); stroke-width: 1; opacity: .7; }
+.lane-msg .dot { fill: var(--cyan); stroke: var(--cyan); stroke-width: 1.2; }
+.lane-msg .hit { fill: transparent; }
+.lane-msg.reply line, .lane-msg.reply .dot { stroke: var(--amber); } .lane-msg.reply .dot { fill: var(--amber); }
+.lane-msg.blocking line, .lane-msg.blocking .dot { stroke: var(--red); } .lane-msg.blocking .dot { fill: var(--red); }
+.lane-msg.answered .dot { fill: var(--panel); }
+.lane-msg:focus-visible { outline: none; } .lane-msg:focus-visible .dot { stroke-width: 2.5; }
+/* contact stream: a message jumped to from the swimlane, and the pair chip */
+#mesh-feed li.flash { animation: msg-flash 1.6s ease-out 1; }
+@keyframes msg-flash { 0%, 40% { background: var(--sel); box-shadow: inset 2px 0 0 var(--hi); } 100% { background: transparent; } }
+.chip-x { font: inherit; background: none; border: 0; color: inherit; cursor: pointer; padding: 0 0 0 4px; }
+@media (prefers-reduced-motion: reduce) { .topo-node.busy rect, #mesh-feed li.flash { animation: none; } #mesh-feed li.flash { background: var(--sel); } }
+
+/* elastic squads: the strip's repainted info row and its static tools row */
+.squad-strip { display: block; }
+.strip-row { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; }
+.strip-row + .strip-row { margin-top: 4px; }
+.num-input { min-width: 0; width: 5ch; }
+.task-input { flex: 1 1 28ch; min-width: 20ch; }
+
+/* telemetry: BY MODEL */
+.models .good { color: var(--hi); } .models .bad { color: var(--red); }
+.models tr.side td { color: var(--dim); }
+.models tbody tr:first-child td, .models tr:not(.side) + tr.side td { border-top: 1px dotted var(--line); }
+.prov-sum { padding: 0 8px 4px; white-space: pre-wrap; }
+/* gallery: an ended tile stays readable (its last output is the point), dashed and dim in the head */
+.gallery .box.gone { opacity: .85; border-style: dashed; }
+.gallery .box.gone .thead { opacity: .7; }

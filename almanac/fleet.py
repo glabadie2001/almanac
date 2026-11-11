@@ -191,12 +191,14 @@ def _is_peer_send_tool(name: str | None) -> bool:
 def _peer_in_event(ts, parsed: dict) -> dict:
     sender = parsed.get("from_name") or "peer"
     ch = f"[{parsed['channel']}] " if parsed.get("channel") else ""
+    flag = f"[{parsed['needs']}] " if parsed.get("needs") else ""
     return dict(
         ts=ts,
         kind="peer_in",
         from_name=sender,
         channel=parsed.get("channel"),
-        text=prose(f"{sender}: {ch}{parsed.get('body') or ''}"),
+        needs=parsed.get("needs"),
+        text=prose(f"{sender}: {ch}{flag}{parsed.get('body') or ''}"),
     )
 
 
@@ -325,6 +327,8 @@ def read_tail(path: Path, window: int = 600_000, keep: int | None = None) -> tup
 
 
 TAIL_KEEP = 120
+VIEW_KEEP = 4000     # view() caches the whole parsed window (to this cap) so a kind filter can reach past the newest
+                     # few events; a 600 KB tail of tool calls is a few thousand short events at most
 
 
 class Fleet:
@@ -369,7 +373,7 @@ class Fleet:
         stamp = (st.st_size, st.st_mtime_ns)
         hit = self.tails.get(path)
         if hit is None or hit[0] != stamp:
-            events, meta = read_tail(path)
+            events, meta = read_tail(path, keep=VIEW_KEEP)
             hit = (stamp, events, meta)
             self.tails[path] = hit
         return path, hit[1], hit[2]

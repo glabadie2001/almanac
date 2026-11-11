@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from support import TOKEN, Fixture, assistant, tool_use, write_jsonl
+from support import TOKEN, Fixture, assistant, runner_probe, tool_use, write_jsonl
 from test_fleet import CLI, FT0, FakeMachine
 
 from almanac import gemini_host, mcp_mesh, spawner, uds
@@ -305,7 +305,7 @@ class MeshDoorAndMcpTests(Fixture):
         tool_names = [t["name"] for t in tools_resp["result"]["tools"]]
         self.assertEqual(
             tool_names,
-            ["mesh_roster", "mesh_context_stream", "mesh_contact_stream", "mesh_send", "mesh_wait"],
+            ["mesh_roster", "mesh_context_stream", "mesh_contact_stream", "mesh_send", "mesh_spawn", "mesh_wait"],
         )
 
         # Call mesh_send via JSON-RPC tools/call
@@ -582,7 +582,8 @@ class GeminiHostAndSpawnerTests(Fixture):
         home = self.root / "claude"
         (home / "sessions").mkdir(parents=True)
         fleet = Fleet(home, table=lambda: [], facts=lambda _: None, lines=lambda _: {})
-        service = Service(store, self.projects, 300, fleet=fleet, state=state, claude="claude.exe", gemini="agy.exe")
+        service = Service(store, self.projects, 300, fleet=fleet, state=state, claude="claude.exe", gemini="agy.exe",
+                          probe=runner_probe(self.root))
         handler = make_handler(service, TOKEN)
 
         repo = self.root / "workspace"

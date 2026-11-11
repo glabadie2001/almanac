@@ -17,7 +17,6 @@ import json
 import logging
 import secrets
 import time
-from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -63,6 +62,9 @@ def _sign(token: str, value: str) -> str:
 
 
 AGENT_PATHS = "/api/mesh"       # an agent token opens this route and everything under it, nothing else
+# handles no agent may hold: the human and the hub by every name the journal knows them by, and the mesh's own
+# addresses. An agent called `operator` would close flags and win reply passes as if it were you.
+RESERVED_AGENT_NAMES = frozenset({"operator", "almanac-hub", "hub", "peer", "all", "squad"})
 
 
 def agent_token(token: str, name: str) -> str:
@@ -85,17 +87,39 @@ def new_session(token: str) -> str:
     return f"{value}.{_sign(token, value)}"
 
 
-def valid_session(raw: str | None, token: str) -> bool:
-    if not raw:
-        return False
+def cookie_name(port: int) -> str:
+    """The session cookie for the door on `port`. Browsers scope cookies by host, not port, so two Almanacs on
+    127.0.0.1 sharing one name would sign each other's browser out."""
+    return f"{COOKIE}_{int(port)}"
+
+
+def _cookies(raw: str | None, name: str) -> list[str]:
+    """Every value of cookie `name` in a Cookie header, parsed by hand: `SimpleCookie.load` drops the whole header
+    when any cookie in it has an illegal name or an unterminated quote, and cookies on 127.0.0.1 are shared by
+    every local app, so someone else's odd cookie would sign the operator out. All of them, since a browser may
+    send a stale value of the same name before the fresh one."""
+    out = []
+    for part in (raw or "").split(";"):
+        key, sep, value = part.partition("=")
+        if sep and key.strip() == name:
+            value = value.strip()
+            out.append(value[1:-1] if len(value) >= 2 and value[0] == value[-1] == '"' else value)
+    return out
+
+
+def _valid_value(found: str, token: str) -> bool:
     try:
-        jar = SimpleCookie()
-        jar.load(raw)
-        value, signature = jar[COOKIE].value.rsplit(".", 1)
+        value, signature = found.rsplit(".", 1)
         age = time.time() - int(value.split(".", 1)[0])
         return 0 <= age <= SESSION_TTL and _equal(signature, _sign(token, value))
     except (KeyError, ValueError):
         return False
+
+
+def valid_session(raw: str | None, token: str, *, name: str) -> bool:
+    """A signed, unexpired session in cookie `name` (from `cookie_name`; the old shared name is never read).
+    Valid if any value of that name verifies."""
+    return any(_valid_value(v, token) for v in _cookies(raw, name) if v)
 
 
 class JsonHandler(BaseHTTPRequestHandler):
@@ -228,9 +252,11 @@ def protect(handler_class, *, token: str, hosts=(), timeout: float = 60):
             bearer = (self.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
             self.agent = agent_of(bearer, token)
             if self.agent:
+                if self.agent.lower() in RESERVED_AGENT_NAMES:
+                    raise Refused(403, f"{self.agent!r} is a reserved name; no agent may hold it")
                 if path != AGENT_PATHS and not path.startswith(AGENT_PATHS + "/"):
                     raise Refused(403, "an agent token only opens /api/mesh")
-            elif not (_equal(bearer, token) or valid_session(self.headers.get("Cookie"), token)):
+            elif not (_equal(bearer, token) or valid_session(self.headers.get("Cookie"), token, name=cookie_name(port))):
                 raise Refused(401, "sign in: open the /login?token=... link Almanac printed at startup")
             origin = self.headers.get("Origin")
             if self.command not in ("GET", "HEAD") and origin is not None:
@@ -250,7 +276,7 @@ def protect(handler_class, *, token: str, hosts=(), timeout: float = 60):
             url = urlsplit(self.path)
             if url.path == "/logout" and self.command == "POST":
                 self._bytes(b"{}", "application/json", 200,
-                            [("Set-Cookie", f"{COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict")])
+                            [("Set-Cookie", f"{cookie_name(self.server.server_port)}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict")])
                 return True
             if url.path != "/login" or self.command not in ("GET", "HEAD"):
                 return False
@@ -260,7 +286,8 @@ def protect(handler_class, *, token: str, hosts=(), timeout: float = 60):
                 return True
             self.send_response(303)
             self.send_header("Location", "/")
-            self.send_header("Set-Cookie", f"{COOKIE}={new_session(token)}; Path=/; Max-Age={SESSION_TTL}; HttpOnly; SameSite=Strict")
+            self.send_header("Set-Cookie", f"{cookie_name(self.server.server_port)}={new_session(token)}; Path=/; "
+                                           f"Max-Age={SESSION_TTL}; HttpOnly; SameSite=Strict")
             self.send_header("Content-Length", "0")
             self.end_headers()
             return True

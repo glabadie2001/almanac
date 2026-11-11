@@ -5,7 +5,7 @@ Each spawned agent receives:
   1. A deterministic peer identity (`agent_name`) registered in `~/.claude/sessions/`;
   2. Its Role Charter + live Squad/Mesh roster and protocol instructions;
   3. Almanac's `almanac-mesh` MCP server (`mesh_roster`, `mesh_context_stream`, `mesh_contact_stream`,
-     `mesh_send`, `mesh_wait`) plus CLI fallback (`python -m almanac.mcp_mesh --cli ...`);
+     `mesh_send`, `mesh_spawn`, `mesh_wait`) plus CLI fallback (`python -m almanac.mcp_mesh --cli ...`);
   4. Optional isolated Git worktree (`workspace_mode == "worktree"`) so parallel implementers never collide.
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ import time
 import uuid
 from pathlib import Path
 
-from almanac import gemini_host, resume, web
+from almanac import gemini_host, resume, uds, web
 
 AGENT_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$")
 NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
@@ -127,9 +127,14 @@ def build_mesh_charter(
     channels: list[str] | None = None,
     teammates: list[dict] | None = None,
     python_exe: str = sys.executable,
+    may_page_operator: bool = False,
+    grow: dict | None = None,
+    allowed_commands: list[str] | None = None,
 ) -> str:
     """System charter giving every Claude and Gemini agent shared stream awareness and uds-messaging etiquette."""
-    state_flag = f' --state "{Path(state_dir).resolve()}"' if state_dir else ""
+    # no --state in the CLI line: with it, a CLI that lacks a token falls back to the door's master token file.
+    # A spawned agent has ALMANAC_URL and its own ALMANAC_TOKEN in its environment, which the CLI reads first.
+    del state_dir
     lines = [
         f"# Almanac Cross-Model Mesh Identity: `{agent_name}` ({provider.upper()})",
         f"- **Assigned Role**: {role_title}",
@@ -148,10 +153,25 @@ def build_mesh_charter(
         "1. **Discover Peers**: Call `mesh_roster` to inspect live teammates, their roles, models, folders, and busy/idle status.",
         "2. **Read Peer Context Streams**: Call `mesh_context_stream(peer=\"<name>\")` to read a teammate's live transcript tail (prompts, reasoning, tool calls, errors) before duplicating work or reviewing.",
         "3. **Read Contact Streams**: Call `mesh_contact_stream()` (or filter by `peer` / `channel`) to catch up on inter-agent decisions.",
-        "4. **Communicate (`uds-messaging`)**: Call `mesh_send(to=\"<peer_name>|@squad|#channel\", message=\"...\")` (or Claude's native `SendMessage(to=\"<peer_name>\", ...)`). In Antigravity/Gemini, if `almanac-mesh` is lazy-loaded, call via `call_mcp_tool(ServerName=\"almanac-mesh_almanac-mesh\", ToolName=\"mesh_send\", Arguments={...})`. Inbound peer messages arrive wrapped in `<cross-session-message from-name=\"...\">`.",
+        "4. **Communicate (`uds-messaging`)**: Call `mesh_send(to=\"<peer_name>|@squad|#channel\", message=\"...\")` (or Claude's native `SendMessage(to=\"<peer_name>\", ...)`). In Antigravity/Gemini, if `almanac-mesh` is lazy-loaded, call via `call_mcp_tool(ServerName=\"almanac-mesh_almanac-mesh\", ToolName=\"mesh_send\", Arguments={...})`. Inbound peer messages arrive wrapped in `<cross-session-message from-name=\"...\">`. "
+        "When you need an answer, add `needs=\"reply\"` (wanted, not urgent) or `needs=\"blocking\"` (you cannot continue without it); the message arrives with a `[needs: ...]` line and stays open until its recipient replies to the sender directly. Answer any flagged message you receive with a direct `mesh_send` to its sender.",
         "5. **Wait When Blocked**: Call `mesh_wait(timeout_seconds=120)` when waiting on a teammate's reply or review.",
-        f"6. **Shell CLI Fallback**: You can also run `\"{python_exe}\" -P -m almanac.mcp_mesh --url {almanac_url}{state_flag} --self {agent_name} --cli <roster|context|contacts|send|wait> ...` (with `PYTHONPATH=\"{REPO_ROOT}\"`).",
+        f"6. **Shell CLI Fallback**: You can also run `\"{python_exe}\" -P -m almanac.mcp_mesh --self {agent_name} --cli <roster|context|contacts|send|wait|spawn> ...` (with `PYTHONPATH=\"{REPO_ROOT}\"`; your own token and Almanac's address come from the environment).",
+        "7. **Operator**: `mesh_send(to=\"operator\", ...)` reaches the human running this squad; use it for decisions only they can make and for the final report; `needs=\"blocking\"` raises an alert on their screen, so use it only when the squad cannot proceed."
+        if may_page_operator else
+        "7. **Operator**: your role does not page the operator; route through a teammate whose role does. You may always answer a message the operator sends you.",
     ]
+    if grow:
+        what = ("`mesh_spawn(task=..., role=\"<role id>\")` adds one member of any defined role (`mesh_roster` lists the "
+                "role ids)" if grow.get("any") else f"`mesh_spawn(task=...)` adds one {grow['role_title']}")
+        lines.append(
+            f"8. **Grow the squad**: {what} to this squad, up to {grow['limit']} in total "
+            "(the operator sets it; `mesh_roster` shows what is left). Use it for slices that can run in parallel on separate "
+            "files; give each a named slice and its files; you stay responsible for integrating their branches."
+        )
+    if allowed_commands and provider == "gemini":     # agy's allow rules; for Claude the role field is informational
+        lines.append("- **Shell**: your runner only permits these exact command lines, typed character for character: "
+                     + ", ".join(f"`{c}`" for c in allowed_commands) + "; anything else is denied, so do not try variants.")
     if teammates:
         lines += ["", "## Initial Squad Roster"]
         for tm in teammates:
@@ -168,9 +188,26 @@ def _git(repo: Path, *args: str, env: dict | None = None) -> str:
     proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, timeout=120,
                           creationflags=NO_WINDOW, env=env)
     if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout).decode("utf-8", "replace").strip()
-        raise RuntimeError(f"git {args[0]} failed: {err[:240]}")
+        raise RuntimeError(f"git {args[0]} failed: {_git_cause((proc.stderr or proc.stdout).decode('utf-8', 'replace'))}")
     return proc.stdout.decode("utf-8", "replace").strip()
+
+
+def _git_cause(text: str, limit: int = 240) -> str:
+    """git's error output with the cause first: `fatal:` / `error:` / `The following paths…` lines lead, hints and
+    line-ending warnings (which come first and bury it) drop out, and what is kept is cut from the end."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    cause = [ln for ln in lines if ln.startswith(("fatal:", "error:", "The following paths"))]
+    rest = [ln for ln in lines if ln not in cause and not ln.startswith(("warning:", "hint:"))]
+    out = " | ".join(cause + rest) or " | ".join(lines)
+    return out if len(out) <= limit else "…" + out[-limit:]
+
+
+def _ignored(top: Path, rel: str) -> bool:
+    """True when git already ignores `rel` (exit 0). A pathspec that names an ignored path, even as an exclude,
+    makes `git add` refuse with exit 1, so such a path must not be named."""
+    proc = subprocess.run(["git", "-C", str(top), "check-ignore", "-q", "--", rel], capture_output=True, timeout=30,
+                          creationflags=NO_WINDOW)
+    return proc.returncode == 0
 
 
 SNAPSHOT_SKIP = (":(exclude,glob)**/.env", ":(exclude,glob)**/.env.*")   # secrets stay out of an agent's branch
@@ -180,9 +217,11 @@ def snapshot_commit(top: Path, state_dir: Path | None = None) -> str:
     """HEAD plus the checkout's uncommitted changes and untracked, non-ignored files, as one commit (HEAD itself
     when there are none). Built in a throwaway index, so the checkout's index, working tree and stash are untouched.
     Never includes `.env` files or Almanac's own state folder (token, database, worktrees) when it sits inside."""
-    skip = list(SNAPSHOT_SKIP)
+    skip = list(SNAPSHOT_SKIP)          # glob excludes are safe even when they match only ignored files
     if state_dir is not None and Path(state_dir).resolve().is_relative_to(top.resolve()):
-        skip.append(":(exclude,literal)" + Path(state_dir).resolve().relative_to(top.resolve()).as_posix())
+        rel = Path(state_dir).resolve().relative_to(top.resolve()).as_posix()
+        if rel not in ("", ".") and not _ignored(top, rel):     # an ignored state folder is left out by git already
+            skip.append(":(exclude,literal)" + rel)
     head = _git(top, "rev-parse", "HEAD")
     with tempfile.TemporaryDirectory() as tmp:
         index = Path(tmp) / "index"
@@ -340,8 +379,10 @@ def spawn_agent(
     headless: bool = False,
     watch: float = 0.6,
     python_exe: str = sys.executable,
+    spawned_by: str | None = None,
 ) -> dict:
-    """Spawn one Claude or Gemini agent, register it in Almanac, and return its launch metadata."""
+    """Spawn one Claude or Gemini agent, register it in Almanac, and return its launch metadata. `spawned_by`: the
+    agent that added it to a running squad (None: the operator)."""
     if service.state is None:
         raise ValueError("Almanac state directory is required to spawn agents")
     role = service.store.role(role_id) if role_id else None
@@ -356,6 +397,24 @@ def spawn_agent(
     eff_name = slugify_name(base_name, fallback=eff_provider)
     if not AGENT_NAME_RE.match(eff_name):
         raise ValueError("agent_name must be 1..48 letters, digits, '-' or '_'")
+    if eff_name.lower() in web.RESERVED_AGENT_NAMES:
+        raise ValueError(f"{eff_name!r} is a reserved name (the operator's, the hub's or a mesh address); pick another")
+    if eff_provider == "claude":
+        from almanac import config
+        runner = service.runners()["claude"] if hasattr(service, "runners") else {}
+        if runner.get("reason") or config.is_shim(service.claude):
+            # a batch file gets its command line re-parsed by cmd.exe: the charter and an agent-written task would
+            # be cut at newlines and their `&` would run commands
+            return dict(ok=False, pid=None, agent_name=eff_name, session_id=None, provider=eff_provider, role_id=role_id,
+                        error=runner.get("reason") or f"{service.claude} is a .cmd / .bat shim: Almanac will not launch "
+                                                      "it; point \"claude\" at claude.exe")
+    if eff_provider == "gemini" and hasattr(service, "runners"):
+        runner = service.runners()["gemini"]
+        if not runner["ok"]:
+            # refused like a launch that died: a squad still starts its other members, and nothing is recorded
+            return dict(ok=False, pid=None, agent_name=eff_name, session_id=None, provider=eff_provider, role_id=role_id,
+                        error=f"Gemini runner not found; looked in: {'; '.join(runner['searched'])}; "
+                              "set \"gemini\" in config.json")
     token = web.agent_token(token, eff_name)    # the agent's own bearer: names it, opens /api/mesh only
 
     repo_dir = Path(cwd).expanduser().resolve()
@@ -395,6 +454,9 @@ def spawn_agent(
         channels=eff_channels,
         teammates=teammates,
         python_exe=python_exe,
+        may_page_operator=bool(role is None or role.get("may_page_operator")),   # role-less agents may page (door.may_page_operator)
+        grow=_grow_line(service, role, squad_id),
+        allowed_commands=(role or {}).get("allowed_commands") or [],
     )
     charter_file = spawn_dir / "charter.md"
     charter_file.write_text(charter, encoding="utf-8")
@@ -537,6 +599,8 @@ def spawn_agent(
             argv += ["--squad", squad_id]
         for ch in eff_channels:
             argv += ["--channel", ch]
+        for cmd in (role or {}).get("allowed_commands") or []:
+            argv += ["--allow-command", cmd]
         if initial_prompt and initial_prompt.strip():
             init_file = spawn_dir / "initial_prompt.md"
             init_file.write_text(initial_prompt.strip(), encoding="utf-8")
@@ -578,12 +642,18 @@ def spawn_agent(
         worktree_path=str(worktree_path) if worktree_path else None,
         pid=proc.pid,
         channels=eff_channels,
+        spawned_by=spawned_by,
     )
     with service.fleet_lock:
         if service.fleet:
             service.fleet.last["at"] = 0
     service.wake.set()                      # read transcripts on the short interval from now, not after a long sleep
-    return dict(ok=True, **rec, role_title=eff_role_title, channels=eff_channels)
+    mode_note = None
+    if eff_provider == "gemini":                      # if agy already said it ignores the asked mode, say so now
+        sessions = (service.fleet.home if service.fleet else (Path.home() / ".claude")) / "sessions"
+        mode_note = next((p.get("mode_note") for p in uds.discover_peers(sessions, alive_fn=lambda _: True)
+                          if p.get("pid") == proc.pid and p.get("mode_note")), None)
+    return dict(ok=True, **rec, role_title=eff_role_title, channels=eff_channels, mode_note=mode_note)
 
 
 def launch_squad(
@@ -596,8 +666,11 @@ def launch_squad(
     brief: str,
     members: list[dict],
     watch: float = 0.3,
+    spawn_role: str | None = None,
+    spawn_limit: int = 0,
 ) -> dict:
-    """Spawn a multi-agent cross-model squad with pre-wired peer rosters and a shared kickoff brief."""
+    """Spawn a multi-agent cross-model squad with pre-wired peer rosters and a shared kickoff brief.
+    `spawn_role` / `spawn_limit`: what an agent whose role may_spawn can add later (see `join_squad`)."""
     if not isinstance(members, list) or not members:
         raise ValueError("members must be a non-empty list of agent specs")
     if len(members) > 20:
@@ -608,7 +681,8 @@ def launch_squad(
 
     squad_slug = slugify_name(name or "squad", fallback="squad")[:24]
     squad_id = f"{squad_slug}-{secrets.token_hex(3)}"
-    squad_doc = service.store.create_squad(squad_id, name or squad_slug, str(repo_dir), brief or "")
+    squad_doc = service.store.create_squad(squad_id, name or squad_slug, str(repo_dir), brief or "",
+                                           spawn_role=spawn_role, spawn_limit=spawn_limit)
 
     # Pre-assign deterministic unique names so every agent gets the complete teammate roster at launch
     prepared: list[dict] = []
@@ -662,28 +736,33 @@ def launch_squad(
                 "as teammates make progress, and post major milestones to `#squad`."
             )
         initial_prompt = spec.get("initial_prompt") or ("\n\n".join(kickoff_parts) if kickoff_parts else None)
-        res = spawn_agent(
-            service,
-            almanac_url=almanac_url,
-            token=token,
-            cwd=str(repo_dir),
-            agent_name=p["agent_name"],
-            role_id=p["role_id"],
-            provider=p["provider"],
-            model=spec.get("model"),
-            effort=spec.get("effort"),
-            workspace_mode=spec.get("workspace_mode"),
-            permission_mode=spec.get("permission_mode"),
-            system_prompt=spec.get("system_prompt"),
-            initial_prompt=initial_prompt,
-            channels=spec.get("channels"),
-            squad_id=squad_id,
-            squad_name=name or squad_slug,
-            teammates=[r for r in roster_preview if r["agent_name"] != p["agent_name"]],
-            remote=bool(spec.get("remote", False)),
-            headless=bool(spec.get("headless", False)),
-            watch=watch,
-        )
+        try:
+            res = spawn_agent(
+                service,
+                almanac_url=almanac_url,
+                token=token,
+                cwd=str(repo_dir),
+                agent_name=p["agent_name"],
+                role_id=p["role_id"],
+                provider=p["provider"],
+                model=spec.get("model"),
+                effort=spec.get("effort"),
+                workspace_mode=spec.get("workspace_mode"),
+                permission_mode=spec.get("permission_mode"),
+                system_prompt=spec.get("system_prompt"),
+                initial_prompt=initial_prompt,
+                channels=spec.get("channels"),
+                squad_id=squad_id,
+                squad_name=name or squad_slug,
+                teammates=[r for r in roster_preview if r["agent_name"] != p["agent_name"]],
+                remote=bool(spec.get("remote", False)),
+                headless=bool(spec.get("headless", False)),
+                watch=watch,
+            )
+        except (RuntimeError, ValueError, OSError) as exc:
+            # one member that cannot start (a worktree git refuses, a bad role) must not orphan the ones already running
+            res = dict(ok=False, pid=None, agent_name=p["agent_name"], session_id=None, provider=p["provider"],
+                       role_id=p["role_id"], error=str(exc))
         launched_agents.append(res)
 
     if brief and brief.strip():
@@ -704,3 +783,133 @@ def launch_squad(
         failed=len(launched_agents) - ok_count,
     )
 
+
+# ---------------------------------------------------------------------- elastic squads: adding a member to a running squad
+
+ROLE_SHORT = {"architect": "arch", "implementer": "impl", "reviewer": "rev"}
+
+
+def _grow_line(service, role: dict | None, squad_id: str | None) -> dict | None:
+    """Charter item 8 for a role that may add members, in a squad that lets it (limit above 0, a spawn role set)."""
+    if not role or not role.get("may_spawn") or not squad_id or not hasattr(service.store, "squad"):
+        return None
+    squad = service.store.squad(squad_id)
+    if not squad or not squad.get("spawn_limit"):
+        return None
+    if squad.get("spawn_role") == "*":
+        return dict(role_title=None, any=True, limit=squad["spawn_limit"])
+    target = service.store.role(squad["spawn_role"]) if squad.get("spawn_role") else None
+    return dict(role_title=target["title"], limit=squad["spawn_limit"]) if target else None
+
+
+def free_handle(service, squad: dict, role: dict) -> str:
+    """The role's short form + provider (`impl-claude`), numbered from 2 when taken. Never a handle this squad has
+    used, nor one live anywhere on the machine (peers are addressed by name)."""
+    used = {a["agent_name"] for a in squad.get("agents", [])} | {p.get("name") for p in service.mesh_peers()}
+    first = role["id"].split("-")[0]
+    base = slugify_name(f"{ROLE_SHORT.get(first, first[:6] or 'agent')}-{role['provider']}")
+    if base not in used:
+        return base
+    n = 2
+    while f"{base}-{n}" in used:
+        n += 1
+    return f"{base}-{n}"
+
+
+def join_squad(
+    service,
+    *,
+    almanac_url: str,
+    token: str,
+    squad_id: str,
+    role_id: str,
+    task: str,
+    agent_name: str | None = None,
+    spawned_by: str | None = None,
+    watch: float = 0.6,
+    **operator_overrides,
+) -> dict:
+    """Add one member to a running squad: the one path for the operator's [+ ADD MEMBER] and an agent's mesh_spawn.
+    The newcomer's charter lists the squad as it is now, its kickoff carries the brief, its task and whom to report
+    to, and on success the squad hears who joined. `operator_overrides` (model, effort, workspace_mode,
+    permission_mode) come only from the operator; the door never passes them for an agent."""
+    squad = service.store.squad(squad_id)
+    if squad is None:
+        raise ValueError(f"no squad {squad_id!r}")
+    if squad.get("status") != "active":
+        raise ValueError(f"squad {squad_id} is {squad.get('status')}")
+    role = service.store.role(role_id) if role_id else None
+    if role is None:
+        raise ValueError(f"unknown role {role_id!r}")
+    task = str(task or "").strip()
+    live = {p.get("name") for p in service.mesh_peers()}
+    if agent_name:
+        name = slugify_name(agent_name, fallback=role["provider"])
+        if name in live:
+            raise ValueError(f"{name} is already live; give another name or leave it out")
+        if name in {a["agent_name"] for a in squad.get("agents", [])}:
+            raise ValueError(f"{name} was already a member of squad {squad_id}; its worktree, branch and token are "
+                             "that agent's. Give another name or leave it out")
+    else:
+        name = free_handle(service, squad, role)
+    newest: dict[str, dict] = {}
+    for a in squad.get("agents", []):
+        newest[a["agent_name"]] = a                      # agents come oldest first: the newest row per handle wins
+    teammates = []
+    for a in newest.values():
+        r = service.store.role(a["role_id"]) if a.get("role_id") else None
+        teammates.append(dict(agent_name=a["agent_name"], provider=a["provider"], role_id=a.get("role_id"),
+                              role_title=r["title"] if r else (a.get("role_id") or a["provider"]),
+                              charter=r["system_prompt"] if r else ""))
+    who = spawned_by or "operator"
+    # whom the newcomer reports to must be someone it may reach: the agent that added it, else the operator only if
+    # its role may page the operator, else the live squadmates whose role may (a join notice gives no reply pass)
+    if spawned_by:
+        report_to = f"`{spawned_by}`"
+    elif role.get("may_page_operator"):
+        report_to = "the operator (`mesh_send(to=\"operator\")`)"
+    else:
+        pagers = {r["id"] for r in service.store.roles() if r.get("may_page_operator")}
+        relays = sorted({p["name"] for p in service.mesh_peers(squad_id=squad_id) if p.get("agent_role") in pagers})
+        report_to = (" or ".join(f"`{r}`" for r in relays) if relays
+                     else "`#squad` (`mesh_send(to=\"#squad\")`), since nobody live in the squad may page the operator")
+    kickoff = []
+    if (squad.get("brief") or "").strip():
+        kickoff.append(f"## Squad Mission ({squad['name']})\n{squad['brief'].strip()}")
+    kickoff.append(f"## Your Initial Assignment (`{name}`)\n{task or '(none given: ask whoever added you)'}")
+    kickoff.append(f"You were added to the running squad by {who}. Report to {report_to} over `mesh_send` when your slice "
+                   "is done: files touched, the test command and its result, anything you could not do.")
+    wmode = (operator_overrides.get("workspace_mode") or role.get("workspace_mode") or "shared").strip().lower()
+    if wmode == "worktree":
+        kickoff.append(f"You work in your own git worktree on branch `almanac/{squad_id}/{name}`, cut from a snapshot of "
+                       "the checkout at spawn time. Commit your work on that branch, and name the branch in your report.")
+    kickoff.append("Coordinate with your squadmates via `mesh_send`, check `mesh_roster` and `mesh_context_stream` as "
+                   "teammates make progress, and post major milestones to `#squad`.")
+    res = spawn_agent(
+        service,
+        almanac_url=almanac_url,
+        token=token,
+        cwd=squad["cwd"],
+        agent_name=name,
+        role_id=role["id"],
+        provider=role["provider"],
+        model=operator_overrides.get("model"),
+        effort=operator_overrides.get("effort"),
+        workspace_mode=operator_overrides.get("workspace_mode"),
+        permission_mode=operator_overrides.get("permission_mode"),
+        initial_prompt="\n\n".join(kickoff),
+        squad_id=squad_id,
+        squad_name=squad["name"],
+        teammates=teammates,
+        watch=watch,
+        spawned_by=spawned_by,
+    )
+    if res.get("ok"):
+        try:
+            # not to the newcomer: it would arrive as a second prompt right after its kickoff and restart its turn
+            service.mesh_send(to="@squad", squad_id=squad_id, from_name=who,
+                              text=f"[{name} joined as {role['title']}, added by {who}] {task[:300]}",
+                              exclude={name, res.get("session_id")} - {None})
+        except (ValueError, OSError):
+            pass                                         # the spawn stands even if nobody could be told
+    return res

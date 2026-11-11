@@ -43,7 +43,7 @@ class DoorTests(Fixture):
         status, _, doc = self.request(self.handler, "/api/report?days=7&bucket=day")
         self.assertEqual(status, 200)
         self.assertEqual(sum(s["calls"] for s in doc["series"]), 1)
-        self.assertEqual([t["id"] for t in doc["tiles"]], ["kb_per_call", "ctx_per_out", "shell_min", "adoption"])
+        self.assertEqual([t["id"] for t in doc["tiles"]], ["kb_per_call", "ctx_per_out", "shell_min", "adoption", "error_rate"])
         status, _, doc = self.request(self.handler, "/api/report?bucket=month")
         self.assertEqual(status, 400)
         status, _, doc = self.request(self.handler, "/api/report?days=-1")
@@ -135,3 +135,51 @@ class DoorTests(Fixture):
             path.write_text(json.dumps(bad), encoding="utf-8")
             with self.assertRaises(ValueError):
                 load(path)
+
+
+class PortCookieTests(Fixture):
+    """Two Almanacs on one host: browsers keep cookies per host, not per port, so each door names its own."""
+
+    def setUp(self):
+        super().setUp()
+        from almanac import web
+        self.web = web
+        store = Store(self.root / "a.db")
+        self.addCleanup(store.close)
+        service = Service(store, self.projects, 300)
+        self.doors = {8812: (make_handler(service, TOKEN), TOKEN), 8897: (make_handler(service, "other-" + TOKEN), "other-" + TOKEN)}
+
+    def call(self, port, path, cookie=None, method="GET"):
+        from types import SimpleNamespace
+        from support import MemorySocket
+        handler = self.doors[port][0]
+        hdr = f"{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n"
+        hdr += "Content-Length: 0\r\n" if method == "POST" else ""
+        hdr += f"Cookie: {cookie}\r\n" if cookie else ""
+        conn = MemorySocket((hdr + "\r\n").encode())
+        handler(conn, ("127.0.0.1", 9), SimpleNamespace(server_port=port, server_name="localhost"))
+        head = conn.output.getvalue().partition(b"\r\n\r\n")[0].decode().split("\r\n")
+        return int(head[0].split()[1]), dict(line.split(": ", 1) for line in head[1:] if ": " in line)
+
+    def login(self, port):
+        status, headers = self.call(port, f"/login?token={self.doors[port][1]}")
+        self.assertEqual(status, 303)
+        return headers["Set-Cookie"].split(";", 1)[0]
+
+    def test_a_second_door_on_the_same_host_cannot_sign_the_first_out(self):
+        a, b = self.login(8812), self.login(8897)
+        self.assertTrue(a.startswith("almanac_session_8812=") and b.startswith("almanac_session_8897="))
+        jar = f"{a}; {b}"                                          # the browser sends both to either port
+        self.assertEqual(self.call(8812, "/api/fleet", jar)[0], 200)
+        self.assertEqual(self.call(8897, "/api/fleet", jar)[0], 200)
+        self.assertEqual(self.call(8812, "/api/fleet", b)[0], 401, "the other door's cookie is not ours")
+
+    def test_the_old_shared_name_is_not_read(self):
+        value = self.login(8812).split("=", 1)[1]
+        self.assertEqual(self.call(8812, "/api/fleet", f"almanac_session={value}")[0], 401)
+
+    def test_logout_clears_the_port_cookie(self):
+        status, headers = self.call(8812, "/logout", self.login(8812), method="POST")
+        self.assertEqual(status, 200)
+        self.assertTrue(headers["Set-Cookie"].startswith("almanac_session_8812=; "))
+        self.assertIn("Max-Age=0", headers["Set-Cookie"])

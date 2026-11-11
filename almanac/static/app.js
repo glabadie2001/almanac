@@ -50,7 +50,7 @@ const state = {
   feedKeys: new Set(), confirmKill: false, days: get("days", "30"), bucket: get("bucket", "day"), report: null, frame: 0,
   pins: new Set(JSON.parse(get("pins", "[]"))), wide: new Set(JSON.parse(get("wide", "[]"))),
   gMode: get("g-mode", "all"), gCols: get("g-cols", "auto"), gHeight: get("g-height", "m"), tiles: new Map(),
-  roles: [], squads: [],
+  roles: [], squads: [], fKinds: get("f-kinds", ""), gKinds: get("g-kinds", ""),
   models: {
     claude: [...DEFAULT_MODELS.claude],
     gemini: [...DEFAULT_MODELS.gemini],
@@ -60,8 +60,28 @@ const state = {
 };
 const meshState = {
   peers: [], messages: [], selPeer: null, ctxKinds: "", msgScope: "all", channelFilter: "",
-  seenMsgIds: new Set(), ctxSig: "", squadFilter: "",
+  seenMsgIds: new Set(), ctxSig: "", squadFilter: "", open: [], pair: null, squadChosen: false,
 };
+// feed filters shared by FLEET, GALLERY and the MESH context stream: [kinds= value, label]
+const KIND_SETS = [["", "all"], ["you,claude,gemini,peer_in,peer_out", "dialog"], ["peer_in,peer_out", "contacts"], ["tool,result,error", "tools"]];
+function fillKindSeg(id, current) {
+  $(id).replaceChildren(...KIND_SETS.map(([v, label]) => el("button", { type: "button", "data-v": v, "aria-pressed": String(v === current), text: label })));
+}
+function pressKindSeg(id, current) {
+  document.querySelectorAll(`#${id} button`).forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.v === current)));
+}
+const OPERATOR = new Set(["operator", "almanac-hub"]);
+const ANY_ROLE_NOTE = "any role the operator has defined, including ones that may page you or add members themselves "
+  + "(an architect); every member added still counts against this one limit";
+const hhmm = (ts) => new Date(ts * 1000).toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit" });
+// a message that asked for an answer: open (BLOCKING 4m / REPLY), or answered / resolved at hh:mm
+function needsBadge(m) {
+  if (!m.needs) return null;
+  if (m.answered_ts) return el("span", { cls: "flag done", text: `${m.answered_by === 0 ? "resolved" : "answered"} ✓ ${hhmm(m.answered_ts)}` });
+  return m.needs === "blocking"
+    ? el("span", { cls: "flag blocking", text: `BLOCKING ${age(m.ts)}`, title: `${m.from_name} cannot continue until ${m.to_name} answers` })
+    : el("span", { cls: "flag reply", text: "REPLY", title: `${m.from_name} wants an answer from ${m.to_name}` });
+}
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 const fmtEffortLabel = (e) => e === "medium" ? "med" : (e || "");
 
@@ -148,6 +168,73 @@ function showTip(e, text) {
 }
 function hideTip() { tip.hidden = true; }
 
+// ------------------------------------------------------------------ header alerts (every tab)
+// setAlert(id, {level: "warn"|"crit", text, title, onClick}) / clearAlert(id): one chip per open problem.
+const alerts = new Map();
+let alertsSig = "";
+function setAlert(id, a) { alerts.set(id, a); paintAlerts(); }
+function clearAlert(id) { if (alerts.delete(id)) paintAlerts(); }
+function paintAlerts() {
+  const sig = JSON.stringify([...alerts].map(([id, a]) => [id, a.level, a.text, a.title]));
+  if (sig === alertsSig) return;                 // polled: do not rebuild (and drop focus) when nothing changed
+  alertsSig = sig;
+  $("alerts").replaceChildren(...[...alerts].map(([id, a]) => {
+    const chip = el("button", { type: "button", cls: `alert-chip ${a.level === "crit" ? "crit" : "warn"}`,
+      text: a.text, title: a.title || a.text, "data-alert": id });
+    chip.addEventListener("click", () => (alerts.get(id)?.onClick || openAlertBox)(alerts.get(id) || a));
+    return chip;
+  }));
+}
+function openAlertBox(a) {
+  $("alert-box-text").textContent = a.title || a.text;
+  $("alert-box").hidden = false;
+  $("alert-box-close").focus();
+}
+function closeAlertBox() { $("alert-box").hidden = true; }
+$("alert-box-close").addEventListener("click", closeAlertBox);
+
+// runners Almanac launches agents with; re-probed by the server, polled here every 15 s
+const health = { doc: null, sig: "" };
+const runnerMissing = (kind) => health.doc?.runners?.[kind]?.ok === false;
+function runnerHelp(kind, r) {
+  const what = kind === "gemini" ? "gemini runner (agy)" : "claude runner";
+  if (r.reason) return `${what}: ${r.reason}.\nAlmanac looked in:\n  ${(r.searched || []).join("\n  ")}`;
+  return `${what} not found. Almanac looked in:\n  ${(r.searched || []).join("\n  ")}\nInstall it, or set "${kind}" in config.json; `
+    + "Almanac finds it on the next spawn without a restart.";
+}
+let healthOnce = null;
+const firstHealth = () => (healthOnce ??= loadHealth());   // boot and startup share the first look
+async function loadHealth() {
+  try { health.doc = await api("/api/health"); } catch { return null; }
+  for (const kind of ["claude", "gemini"]) {
+    const r = health.doc.runners?.[kind];
+    if (r && !r.ok) setAlert(`runner-${kind}`, { level: "warn", text: r.reason ? `▲ ${kind} runner refused (.cmd shim)` : `▲ ${kind} runner missing`,
+      title: runnerHelp(kind, r) });
+    else clearAlert(`runner-${kind}`);
+  }
+  const sig = `${runnerMissing("claude")}|${runnerMissing("gemini")}`;
+  if (sig !== health.sig) { health.sig = sig; syncRunnerLabels(); }
+  return health.doc;
+}
+// a Gemini option reads "(runner missing)" while agy cannot be found
+function roleOptionText(r, long = true) {
+  const base = `[${r.provider === "gemini" ? "G" : "C"}] ${r.title}${long ? ` (${r.id})` : ""}`;
+  return runnerMissing(r.provider) ? `${base} (runner missing)` : base;
+}
+function syncRunnerLabels() {
+  for (const sel of [$("spawn-provider"), $("role-provider")]) {
+    const opt = sel && [...sel.options].find((o) => o.value === "gemini");
+    if (!opt) continue;
+    opt.dataset.text ??= opt.textContent;
+    opt.textContent = runnerMissing("gemini") ? "gemini (runner missing)" : opt.dataset.text;
+  }
+  syncRoleControls();
+  document.querySelectorAll("#squad-members select[data-field='role_id'] option, #strip-role option, #strip-add-role option").forEach((o) => {
+    const r = state.roles.find((x) => x.id === o.value);
+    if (r) o.textContent = roleOptionText(r, false);
+  });
+}
+
 // ------------------------------------------------------------------ boot
 async function boot() {
   const screen = $("boot");
@@ -158,15 +245,26 @@ async function boot() {
   let skip = false;
   const stop = () => { skip = true; };
   addEventListener("keydown", stop, { once: true }); screen.addEventListener("click", stop, { once: true });
-  const lines = ["ALMANAC MISSION CONTROL v3 // CROSS-MODEL MESH", "(c) " + new Date().getFullYear(), "",
-    "> door " + location.port + " ............ ".slice(location.port.length), "> scanning claude+gemini ", "> uds-messaging bus .... ", "> telemetry ............ ", "", "READY."];
   const fleet = api("/api/fleet").catch(() => null);
-  for (const [i, line] of lines.entries()) {
+  const checked = firstHealth();
+  const runner = async (kind) => {
+    const h = await checked;
+    return !h ? "?" : h.runners?.[kind]?.ok ? "OK" : "MISSING";
+  };
+  // [text, what to print after it]; the last line waits for the runner check
+  const lines = [["ALMANAC MISSION CONTROL v3 // CROSS-MODEL MESH"], ["(c) " + new Date().getFullYear()], [""],
+    ["> door " + location.port + " ............ ".slice(location.port.length), async () => "OK"],
+    ["> claude runner ......... ", () => runner("claude")],
+    ["> gemini runner (agy) ... ", () => runner("gemini")],
+    ["> scanning claude+gemini ", async () => { const f = await fleet; return f ? `${f.processes.length} found` : "FAIL"; }],
+    ["> uds-messaging bus .... ", async () => "OK"], ["> telemetry ............ ", async () => "OK"], [""],
+    [async () => (runnerMissing("claude") || runnerMissing("gemini") ? "READY, WITH WARNINGS." : "READY.")]];
+  for (const [text, after] of lines) {
+    if (typeof text === "function") await checked;
+    const line = typeof text === "function" ? await text() : text;
     for (const ch of line) { if (skip) break; screen.textContent += ch; await new Promise((r) => setTimeout(r, 8)); }
     if (skip) break;
-    if (i === 3) screen.textContent += "OK";
-    if (i === 4) { const f = await fleet; screen.textContent += f ? `${f.processes.length} found` : "FAIL"; }
-    if (i === 5 || i === 6) screen.textContent += "OK";
+    if (after) screen.textContent += await after();
     screen.textContent += "\n";
     await new Promise((r) => setTimeout(r, 65));
   }
@@ -404,7 +502,7 @@ function syncRoleControls() {
   const cur = spawnRole.value;
   spawnRole.replaceChildren(
     el("option", { value: "", text: "(custom / no role)" }),
-    ...state.roles.map((r) => el("option", { value: r.id, text: `[${r.provider === "gemini" ? "G" : "C"}] ${r.title} (${r.id})` })),
+    ...state.roles.map((r) => el("option", { value: r.id, text: roleOptionText(r) })),
   );
   if (cur && state.roles.some((r) => r.id === cur)) spawnRole.value = cur;
   else if (state.roles.length && !cur) spawnRole.value = state.roles[0].id;
@@ -417,7 +515,7 @@ function syncRoleControls() {
     const effSel = row.querySelector("select[data-field='effort']");
     if (!sel) return;
     const v = sel.value;
-    sel.replaceChildren(...state.roles.map((r) => el("option", { value: r.id, text: `[${r.provider === "gemini" ? "G" : "C"}] ${r.title}` })));
+    sel.replaceChildren(...state.roles.map((r) => el("option", { value: r.id, text: roleOptionText(r, false) })));
     if (v && state.roles.some((r) => r.id === v)) sel.value = v;
     const picked = state.roles.find((r) => r.id === sel.value);
     if (modelInp && picked) {
@@ -428,12 +526,19 @@ function syncRoleControls() {
     }
   });
 
+  // the launch form's "architect may add" choice
+  const spawnSel = $("squad-spawn-role"), keep = spawnSel.value;
+  spawnSel.replaceChildren(el("option", { value: "", text: "(nobody)" }), el("option", { value: "*", text: "any role", title: ANY_ROLE_NOTE }),
+    ...state.roles.map((r) => el("option", { value: r.id, text: roleOptionText(r, false) })));
+  spawnSel.value = keep === "*" || state.roles.some((r) => r.id === keep) ? keep : "";
+
   // Render roles table inside Mesh drawer
   const tbody = $("roles-table")?.querySelector("tbody");
   if (tbody) {
     tbody.replaceChildren(...state.roles.map((r) => {
       const tr = el("tr", {},
-        el("td", { text: r.id }),
+        el("td", {}, r.id, r.may_page_operator ? el("span", { cls: "amber", text: " ✉", title: "may page the operator" }) : null,
+          r.may_spawn ? el("span", { cls: "cyan", text: " ⊕", title: "may add squad members" }) : null),
         el("td", {}, providerBadge(r.provider)),
         el("td", { text: r.title }),
         el("td", { cls: "model", text: fmtModel(r.model) }),
@@ -488,7 +593,7 @@ function addSquadMemberRow(presetRole = "", presetName = "", presetModel = "", p
     { id: "reviewer-gemini", provider: "gemini", title: "Peer Reviewer (Gemini)", model: "", effort: "high" },
   ];
   const roleSel = el("select", { "data-field": "role_id", "aria-label": "Member role" },
-    ...roles.map((r) => el("option", { value: r.id, text: `[${r.provider === "gemini" ? "G" : "C"}] ${r.title}` })));
+    ...roles.map((r) => el("option", { value: r.id, text: roleOptionText(r, false) })));
   if (presetRole && roles.some((r) => r.id === presetRole)) roleSel.value = presetRole;
   const getRole = () => (state.roles.length ? state.roles : roles).find((x) => x.id === roleSel.value) || roles[0];
   const activeRole = getRole();
@@ -605,12 +710,16 @@ $("squad-form").addEventListener("submit", async (e) => {
   }));
   btn.disabled = true; msg.textContent = `launching ${members.length} squad agents…`;
   try {
-    const r = await post("/api/squads", { name, cwd, brief, members });
+    const r = await post("/api/squads", { name, cwd, brief, members, spawn_role: $("squad-spawn-role").value || null,
+      spawn_limit: Number($("squad-spawn-limit").value || 0) });
+    // a member the server refused (no runner, a launch that died) says why
+    const refused = (r.squad?.agents || []).filter((a) => !a.ok).map((a) => `${a.agent_name}: ${a.error || "failed"}`);
     if (r.ok) {
-      msg.textContent = `squad ${r.squad.name} live: ${r.launched}/${members.length} agents on #squad`;
-      setTimeout(() => { loadFleet(); show("mesh"); }, 1000);
+      msg.textContent = `squad ${r.squad.name} live: ${r.launched}/${members.length} agents on #squad`
+        + (refused.length ? `; refused ${refused.join("; ")}` : "");
+      setTimeout(() => { loadFleet(); setMeshSquad(r.squad.id); show("mesh"); }, refused.length ? 4000 : 1000);
     } else {
-      msg.textContent = `partial/failed: launched ${r.launched || 0}/${members.length}`;
+      msg.textContent = `partial/failed: launched ${r.launched || 0}/${members.length}${refused.length ? `; ${refused.join("; ")}` : ""}`;
     }
   } catch (err) {
     msg.textContent = `failed: ${err.message}`;
@@ -761,6 +870,7 @@ async function loadFleet() {
   let doc;
   try { doc = await api("/api/fleet"); } catch (err) { $("fleet-summary").textContent = `fleet unavailable: ${err.message}`; return; }
   state.fleet = doc;
+  trackSessions();       // before any early return: every fleet refresh notices sessions leaving, whatever the tab
   const s = doc.summary || {};
   const byProv = s.providers || {};
   $("mesh-pill").textContent = `${byProv.claude || 0} claude · ${byProv.gemini || 0} gemini // uds`;
@@ -782,8 +892,6 @@ async function loadFleet() {
     state.cpu.set(key, hist);
   }
   for (const k of [...state.cpu.keys()]) if (!live.has(k)) state.cpu.delete(k);
-  const stale = [...state.pins].filter((k) => !live.has(k));
-  if (stale.length) { stale.forEach((k) => state.pins.delete(k)); put("pins", JSON.stringify([...state.pins])); }
   const body = $("fleet-table").querySelector("tbody");
   const first = state.seen.size === 0;
   body.replaceChildren(...shown.map((p) => {
@@ -848,7 +956,8 @@ function select(pid) {
 async function loadDetail() {
   if (!state.sel) return;
   let doc;
-  try { doc = await api(`/api/session?pid=${state.sel}`); } catch (err) { $("detail-head").replaceChildren(el("span", { cls: "red", text: err.message })); return; }
+  const kindsQ = state.fKinds ? `&kinds=${encodeURIComponent(state.fKinds)}` : "";
+  try { doc = await api(`/api/session?pid=${state.sel}${kindsQ}`); } catch (err) { $("detail-head").replaceChildren(el("span", { cls: "red", text: err.message })); return; }
   state.detail = doc;
   const p = doc.process, u = doc.usage;
   $("detail").setAttribute("data-title", `SESSION ${p.pid}`);
@@ -865,12 +974,13 @@ async function loadDetail() {
   add("state", p.status ? `${p.status} · ${age(p.updated)} ago` : null, active(p) ? "amber" : "");
   add("folder", p.cwd); add("session", p.session_id); add("version", p.version);
   add("parent", p.parent ? `${p.parent} (${p.ppid})` : null); add("command", p.role === "session" ? null : p.cmd);
+  if (u && u.turns) add("worked", `${fmtDur(u.work_s)} work · ${fmtDur(u.wait_s)} waiting · ${u.turns} turn${u.turns === 1 ? "" : "s"}`);
   if (u && u.messages) add("tokens", `${num(u.output, 0)} out · ${num(u.input + u.cache_create + u.cache_read, 0)} context · ${num(u.calls, 0)} tool calls · ${num(u.read_back_kb, 0)} KB back`);
   $("detail-head").replaceChildren(el("div", { cls: "title", text: rowName(p) }), kv);
 
   const feed = $("feed");
   const atBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 40;
-  if (!doc.events.length) feed.replaceChildren(el("li", { cls: "result", text: p.session_id ? "no transcript yet" : "no session transcript for this process" }));
+  if (!doc.events.length) feed.replaceChildren(el("li", { cls: "result", text: !p.session_id ? "no session transcript for this process" : state.fKinds ? "nothing of this kind yet" : "no transcript yet" }));
   else {
     const items = doc.events.map((e, i) => {
       const key = `${e.ts}|${e.kind}|${e.text.slice(0, 40)}|${i - doc.events.length}`;
@@ -907,9 +1017,7 @@ $("pin").addEventListener("click", () => { const p = state.detail?.process; if (
 $("open-mesh-peer").addEventListener("click", () => {
   const p = state.detail?.process;
   if (!p) return;
-  const handle = p.name || p.session_id || String(p.pid);
-  meshState.selPeer = handle;
-  $("mesh-to").value = p.name || String(p.pid);
+  peerFromProcess(p);
   show("mesh");
 });
 
@@ -955,9 +1063,120 @@ $("kill").addEventListener("click", kill);
 // ------------------------------------------------------------------ gallery
 const LIMITS = { s: 15, m: 30, l: 60 };
 
-function gallerySessions() {
-  const all = (state.fleet?.processes || []).filter((p) => p.role === "session");
-  return state.gMode === "pinned" ? all.filter((p) => state.pins.has(keyOf(p))) : all;
+const GONE_MAX = 12;                       // ended tiles kept at most, the oldest dropped first
+const gallerySquad = { id: get("g-squad", ""), tried: 0 };
+const galleryPrev = new Map();             // key -> the last fleet row seen, to notice a session leaving whatever the filter
+
+const liveSessions = () => (state.fleet?.processes || []).filter((p) => p.role === "session");
+const galleryKeeps = (p) => state.pins.has(keyOf(p)) || !!p.squad_id;
+function galleryShows(p) {
+  switch (state.gMode) {
+    case "pinned": return state.pins.has(keyOf(p));
+    case "busy": return active(p);
+    case "squad": return gallerySquad.id ? p.squad_id === gallerySquad.id : !!p.squad_id;
+    default: return true;
+  }
+}
+function gallerySessions() { return liveSessions().filter(galleryShows); }
+
+// Run on every fleet refresh, whatever the tab: a pinned or squad session that left the fleet keeps its tile,
+// ended; the rest just go. This is also the one place pins are pruned: a pin lives while its session is live or
+// while an ended tile holds it ([DISMISS ✕] and trimGone drop the tile, and the pin goes on the next refresh).
+function trackSessions() {
+  if (!state.fleet || state.fleet.error) return;
+  const live = liveSessions();
+  const liveKeys = new Set(live.map(keyOf));
+  let changed = false;
+  for (const [k, p] of galleryPrev) {
+    if (liveKeys.has(k) || !galleryKeeps(p)) continue;
+    let t = state.tiles.get(k);
+    if (!t) { t = makeTile(p); state.tiles.set(k, t); }
+    if (!t.gone) { endTile(t, p); changed = true; }
+  }
+  for (const [k, t] of state.tiles) if (t.gone && liveKeys.has(k)) { t.gone = 0; t.goneQ = ""; t.feedSig = "x"; changed = true; }
+  galleryPrev.clear();
+  for (const p of live) galleryPrev.set(keyOf(p), p);
+  if (changed) { trimGone(); saveGone(); }
+  const stale = [...state.pins].filter((k) => !liveKeys.has(k) && !state.tiles.get(k)?.gone);
+  if (stale.length) { stale.forEach((k) => state.pins.delete(k)); put("pins", JSON.stringify([...state.pins])); }
+}
+
+// the last two segments of the folder; the title has the full path and, for a worktree, the repo it belongs to
+function folderLabel(p) {
+  const full = p.cwd || p.worktree_path || "";
+  const sep = full.includes("\\") ? "\\" : "/";
+  const tail = full.split(/[\\/]+/).filter(Boolean).slice(-2).join(sep);
+  const norm = (s) => String(s || "").replace(/[\\/]+/g, "/").replace(/\/$/, "").toLowerCase();
+  const lines = [full];
+  if (p.worktree_path) {
+    if (norm(p.worktree_path) !== norm(full)) lines.push(`worktree ${p.worktree_path}`);
+    lines.push(`worktree of ${p.worktree_of || "an unknown repo"}`);
+  }
+  return el("span", { cls: "dim where", text: `${p.worktree_path ? "⑂ " : ""}${tail}`, title: lines.filter(Boolean).join("\n") || null });
+}
+
+function saveGone() {
+  const recs = [...state.tiles.values()].filter((t) => t.gone).sort((a, b) => a.gone - b.gone).map((t) => ({
+    p: t.p, gone: t.gone,
+    events: (t.events || []).slice(-60).map((e) => ({ ts: e.ts, kind: e.kind, text: String(e.text ?? "").slice(0, 2000) })),
+  }));
+  put("g-gone", JSON.stringify(recs));
+}
+function trimGone() {
+  const gone = [...state.tiles.values()].filter((t) => t.gone).sort((a, b) => a.gone - b.gone);
+  for (const t of gone.slice(0, Math.max(0, gone.length - GONE_MAX))) { t.box.remove(); state.tiles.delete(keyOf(t.p)); }
+}
+function endTile(t, p) {
+  t.gone = Date.now(); t.goneQ = ""; t.armed = 0;
+  t.p = { ...p, status: "ended" };
+}
+// one fetch of the final output once a session has ended: /api/mesh/context falls back to the stored transcript
+async function endedFeed(t, q) {
+  t.goneQ = q;
+  const sid = t.p.session_id;
+  if (!sid) return;
+  let doc;
+  try {
+    const res = await fetch(`/api/mesh/context?peer=${encodeURIComponent(sid)}&${q}`, { credentials: "same-origin" });
+    if (!res.ok) return;                   // a 404 keeps the feed the tile already had
+    doc = await res.json();
+  } catch { return; }
+  if (!t.gone || state.tiles.get(keyOf(t.p)) !== t) return;
+  paintTile(t, { process: t.p, events: doc.events || [], meta: doc.meta, usage: doc.usage });
+  saveGone();
+}
+function restoreGone() {
+  let recs;
+  try { recs = JSON.parse(get("g-gone", "[]")); } catch { recs = []; }
+  if (!Array.isArray(recs)) return;
+  for (const r of recs.slice(-GONE_MAX)) {
+    if (!r || typeof r.p !== "object" || r.p === null || r.p.pid === undefined || state.tiles.has(keyOf(r.p))) continue;
+    const t = makeTile(r.p);
+    t.box.classList.remove("tile-enter");
+    t.gone = Number(r.gone) || Date.now(); t.goneQ = "";
+    state.tiles.set(keyOf(r.p), t);
+    const events = (Array.isArray(r.events) ? r.events : []).filter((e) => e && typeof e === "object")
+      .map((e) => ({ ts: e.ts, kind: String(e.kind || "result"), text: String(e.text ?? "") }));
+    paintTile(t, { process: t.p, events });
+  }
+}
+async function fillGallerySquads() {
+  if (!state.squads.length && Date.now() - gallerySquad.tried > 30000) {
+    gallerySquad.tried = Date.now();
+    try { state.squads = (await api("/api/squads?limit=50")).squads || []; } catch { /* the filter can wait */ }
+  }
+  const sel = $("g-squad");
+  const ids = state.squads.map((s) => s.id);
+  if (gallerySquad.id && !ids.includes(gallerySquad.id)) ids.push(gallerySquad.id);
+  const sig = ids.join(",");
+  if (sel.dataset.sig !== sig) {
+    sel.replaceChildren(el("option", { value: "", text: "any squad" }), ...ids.map((id) => {
+      const s = state.squads.find((x) => x.id === id);
+      return el("option", { value: id, text: s ? `${s.name} (${s.id})` : id });
+    }));
+    sel.dataset.sig = sig;
+  }
+  sel.value = gallerySquad.id;
 }
 
 function makeTile(p) {
@@ -974,8 +1193,21 @@ function makeTile(p) {
   const meshBtn = el("button", { type: "button", cls: "btn cyan", text: "[MESH ▸]", title: "inspect in Mesh view" });
   const open = el("button", { type: "button", cls: "btn", text: "[FLEET ▸]", title: "open in the fleet view" });
   const killBtn = el("button", { type: "button", cls: "btn danger", text: "[KILL ✕]" });
-  box.append(head, feed, form, el("div", { cls: "actions pad" }, remote, pin, wide, meshBtn, open, killBtn, msg));
-  const t = { box, head, feed, input, msg, remote, pin, wide, kill: killBtn, p, feedSig: "", armed: 0 };
+  const chatBtn = el("button", { type: "button", cls: "btn", text: "[CHAT ▸]", title: "open its transcript in the chats view", hidden: true });
+  const dismiss = el("button", { type: "button", cls: "btn", text: "[DISMISS ✕]", title: "forget this ended tile", hidden: true });
+  box.append(head, feed, form, el("div", { cls: "actions pad" }, remote, pin, wide, meshBtn, open, killBtn, chatBtn, dismiss, msg));
+  const t = { box, head, feed, input, form, msg, remote, pin, wide, meshBtn, open, kill: killBtn, chat: chatBtn, dismiss, p,
+    feedSig: "", armed: 0, gone: 0, goneQ: "", events: [] };
+
+  chatBtn.addEventListener("click", () => {
+    if (!t.p.session_id) return;
+    show("chats"); openChat(t.p.session_id);
+  });
+  dismiss.addEventListener("click", () => {
+    t.box.remove(); state.tiles.delete(key);
+    if (state.pins.delete(key)) put("pins", JSON.stringify([...state.pins]));
+    saveGone(); loadGallery();
+  });
 
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -996,8 +1228,7 @@ function makeTile(p) {
     put("wide", JSON.stringify([...state.wide])); paintTile(t, null);
   });
   meshBtn.addEventListener("click", () => {
-    meshState.selPeer = t.p.name || t.p.session_id || String(t.p.pid);
-    $("mesh-to").value = t.p.name || String(t.p.pid);
+    peerFromProcess(t.p);
     show("mesh");
   });
   open.addEventListener("click", () => { show("fleet"); select(t.p.pid); });
@@ -1025,26 +1256,34 @@ function paintTile(t, doc) {
   t.meta = meta;
   const provTag = (p.provider || "claude") === "gemini" ? "[G]" : "[C]";
   t.box.setAttribute("data-title", `${provTag} ${p.pid} ${rowName(p)}`.slice(0, 62));
-  t.box.classList.toggle("busy", active(p));
+  const ended = !!t.gone;
+  t.box.classList.toggle("gone", ended);
+  t.box.classList.toggle("busy", !ended && active(p));
   t.box.classList.toggle("wide", state.wide.has(key));
   const u = doc?.usage || t.usage;
   t.usage = u;
   const m = meta.model || p.model;
   t.head.replaceChildren(...[
-    providerBadge(p.provider), rowState(p),
+    providerBadge(p.provider),
+    ended ? el("span", { cls: "amber", text: `ended ${hhmm(t.gone / 1000)}`, title: new Date(t.gone).toLocaleString() }) : rowState(p),
     p.agent_role ? el("span", { cls: "role-tag", text: p.agent_role }) : null,
     el("span", { cls: "model", text: fmtModel(m), title: m || "no assistant reply yet" }), effortBadge(meta.effort || p.effort),
-    udsBadge(p.has_uds, p.pipe),
-    el("span", { cls: "dim", text: `cpu ${p.cpu === null ? "–" : num(p.cpu) + "%"} · ${p.mem_mb}M · up ${age(p.started)}` }),
+    ended ? null : udsBadge(p.has_uds, p.pipe),
+    ended ? null : el("span", { cls: "dim", text: `cpu ${p.cpu === null ? "–" : num(p.cpu) + "%"} · ${p.mem_mb}M · up ${age(p.started)}` }),
     u && u.messages ? el("span", { cls: "dim", text: `· ${num(u.output, 0)} out tok` }) : null,
-    el("span", { cls: "dim where", text: p.cwd || "", title: p.cwd || "" })].filter(Boolean));
+    workShort(u) ? el("span", { cls: "dim", text: `· ${workShort(u)}` }) : null,
+    folderLabel(p)].filter(Boolean));
   t.pin.textContent = state.pins.has(key) ? "[UNPIN ◆]" : "[PIN ◇]";
   t.wide.textContent = state.wide.has(key) ? "[NARROW ⇥]" : "[WIDE ⇔]";
-  t.remote.hidden = !p.remote_url;
-  if (p.remote_url) t.remote.href = p.remote_url;
+  for (const n of [t.form, t.kill, t.pin, t.wide, t.meshBtn, t.open]) n.hidden = ended;
+  t.chat.hidden = t.dismiss.hidden = !ended;
+  t.chat.disabled = !p.session_id;
+  t.remote.hidden = ended || !p.remote_url;
+  if (p.remote_url && !ended) t.remote.href = p.remote_url;
   t.input.placeholder = active(p) ? "busy: queues until free" : `send via ${p.has_uds ? "uds-messaging" : "console"}`;
-  if (!doc) return;
-  const events = doc.events || [];
+  if (!doc || !Array.isArray(doc.events)) return;      // a process-only paint leaves the feed as it is
+  const events = doc.events;
+  t.events = events;
   const sig = `${events.length}|${events.length ? events[events.length - 1].ts + events[events.length - 1].text.slice(0, 30) : ""}`;
   if (sig === t.feedSig) return;
   const fresh = t.feedSig !== "";
@@ -1065,24 +1304,39 @@ async function loadGallery() {
   grid.dataset.cols = state.gCols; grid.dataset.height = state.gHeight;
   for (const [id, v] of [["g-mode", state.gMode], ["g-cols", state.gCols], ["g-height", state.gHeight]])
     document.querySelectorAll(`#${id} button`).forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.v === v)));
-  const list = gallerySessions();
-  const all = (state.fleet?.processes || []).filter((p) => p.role === "session").length;
-  $("g-count").textContent = `${list.length} tile${list.length === 1 ? "" : "s"} · ${state.pins.size} pinned · ${all} sessions running`;
-  $("g-empty").hidden = list.length > 0;
-  $("g-empty").textContent = state.gMode === "pinned" ? "nothing pinned: click ◇ on a fleet row, press p, or use [PIN ◇] on a tile" : "no Claude or Gemini sessions running";
+  $("g-squad").hidden = state.gMode !== "squad";
+  if (state.gMode === "squad") await fillGallerySquads();
+  const live = liveSessions();     // ended tiles were made by trackSessions() in the loadFleet() before this
+  const list = live.filter(galleryShows);
+  const ended = [...state.tiles.values()].filter((t) => t.gone).sort((a, b) => b.gone - a.gone);
+  const endedShown = ended.filter((t) => galleryShows(t.p));
+  const sq = state.squads.find((s) => s.id === gallerySquad.id);
+  const adj = state.gMode === "pinned" ? "pinned " : state.gMode === "busy" ? "busy " : "";
+  const inSquad = state.gMode !== "squad" ? "" : gallerySquad.id ? ` in ${sq ? sq.name : gallerySquad.id}` : " in a squad";
+  $("g-count").textContent = `${list.length} ${adj}tile${list.length === 1 ? "" : "s"}${inSquad}`
+    + `${endedShown.length ? ` + ${endedShown.length} ended` : ""} · ${state.pins.size} pinned · ${live.length} sessions running`;
+  $("g-empty").hidden = list.length + endedShown.length > 0;
+  $("g-empty").textContent = state.gMode === "pinned" ? "nothing pinned: click ◇ on a fleet row, press p, or use [PIN ◇] on a tile"
+    : state.gMode === "busy" ? "no session is busy right now"
+    : state.gMode === "squad" ? (gallerySquad.id ? "no session of this squad is running or recently ended" : "no squad session is running or recently ended")
+    : "no Claude or Gemini sessions running";
   const keys = new Set(list.map(keyOf));
-  for (const [k, t] of state.tiles) if (!keys.has(k)) { t.box.remove(); state.tiles.delete(k); }
+  for (const [k, t] of state.tiles) if (!t.gone && !keys.has(k)) { t.box.remove(); state.tiles.delete(k); }
+  for (const t of ended) if (!endedShown.includes(t)) t.box.remove();     // filtered out, still remembered
   for (const p of list) if (!state.tiles.has(keyOf(p))) state.tiles.set(keyOf(p), makeTile(p));
-  const order = list.map((p) => state.tiles.get(keyOf(p)).box);
-  if (order.some((box, i) => grid.children[i] !== box)) grid.append(...order);
+  const order = [...list.map((p) => state.tiles.get(keyOf(p)).box), ...endedShown.map((t) => t.box)];
+  if (order.length !== grid.children.length || order.some((box, i) => grid.children[i] !== box)) grid.append(...order);
   for (const p of list) paintTile(state.tiles.get(keyOf(p)), { process: p });
+  const kindsQ = state.gKinds ? `&kinds=${encodeURIComponent(state.gKinds)}` : "";
+  const endedQ = `limit=${LIMITS[state.gHeight] || 30}${kindsQ}`;
+  for (const t of endedShown) { paintTile(t, null); if (t.goneQ !== endedQ) endedFeed(t, endedQ); }
   if (!list.length) return;
   let doc;
-  try { doc = await api(`/api/sessions?pids=${list.map((p) => p.pid).join(",")}&limit=${LIMITS[state.gHeight] || 30}`); } catch { return; }
+  try { doc = await api(`/api/sessions?pids=${list.map((p) => p.pid).join(",")}&limit=${LIMITS[state.gHeight] || 30}${kindsQ}`); } catch { return; }
   for (const d of doc.sessions) {
     if (d.gone) continue;
     const t = state.tiles.get(keyOf(d.process));
-    if (t) paintTile(t, d);
+    if (t && !t.gone) paintTile(t, d);
   }
 }
 for (const [id, field] of [["g-mode", "gMode"], ["g-cols", "gCols"], ["g-height", "gHeight"]]) {
@@ -1093,6 +1347,28 @@ for (const [id, field] of [["g-mode", "gMode"], ["g-cols", "gCols"], ["g-height"
     loadGallery();
   });
 }
+fillKindSeg("g-kinds", state.gKinds);
+$("g-kinds").addEventListener("click", (e) => {
+  if (e.target.dataset.v === undefined) return;
+  state.gKinds = e.target.dataset.v; put("g-kinds", state.gKinds);
+  pressKindSeg("g-kinds", state.gKinds);
+  for (const t of state.tiles.values()) t.feedSig = "x";     // one choice for every tile; repaint them all
+  loadGallery();
+});
+$("g-squad").addEventListener("change", (e) => {
+  gallerySquad.id = e.target.value; put("g-squad", gallerySquad.id);
+  loadGallery();
+});
+queueMicrotask(restoreGone);    // after the whole script has run: paintTile uses helpers declared further down
+fillKindSeg("fleet-kinds", state.fKinds);
+$("fleet-kinds").addEventListener("click", (e) => {
+  if (e.target.dataset.v === undefined) return;
+  state.fKinds = e.target.dataset.v; put("f-kinds", state.fKinds);
+  pressKindSeg("fleet-kinds", state.fKinds);
+  state.feedKeys = new Set();
+  $("feed").dataset.pid = "";                                // scroll to the newest of the new selection
+  loadDetail();
+});
 
 // ------------------------------------------------------------------ mesh: peer roster + context stream + contact stream
 function populateRoleForm(r) {
@@ -1107,6 +1383,8 @@ function populateRoleForm(r) {
   if ([...$("role-effort").options].some((o) => o.value === eff)) $("role-effort").value = eff;
   $("role-workspace").value = r ? (r.workspace_mode || "shared") : "shared";
   $("role-prompt").value = r ? (r.system_prompt || "") : "";
+  $("role-page").checked = !!r?.may_page_operator;
+  $("role-grow").checked = !!r?.may_spawn;
   $("role-msg").textContent = r ? `editing ${r.id}` : "";
 }
 
@@ -1131,6 +1409,8 @@ $("role-save").closest("form").addEventListener("submit", async (e) => {
       effort: $("role-effort").value || null,
       workspace_mode: $("role-workspace").value,
       system_prompt: $("role-prompt").value.trim(),
+      may_page_operator: $("role-page").checked,
+      may_spawn: $("role-grow").checked,
     });
     msg.textContent = r.ok ? `saved role ${r.role.id} ✓` : "save failed";
     await loadRoles();
@@ -1157,15 +1437,54 @@ $("mesh-spawn-jump").addEventListener("click", () => {
   setDrawer("spawn-drawer", "toggle-spawn", true);
 });
 $("mesh-refresh").addEventListener("click", () => { loadMesh(); if (meshState.selPeer) loadPeerContext(); });
+
+// The selected peer is held by session id when there is one (a handle can be reused across squads, and
+// /api/mesh/context?peer=<handle> opens the newest live session of that name); the handle is kept beside it
+// for display, the "selected peer" scope and #mesh-to.
+const isSelPeer = (p) => !!meshState.selPeer
+  && (p.session_id === meshState.selPeer || p.name === meshState.selPeer || String(p.pid) === meshState.selPeer);
+function selPeerName() {
+  const p = meshState.peers.find(isSelPeer);
+  return p ? p.name : meshState.selName || meshState.selPeer;
+}
+// #mesh-to: what the page writes there is replaced on a squad change; what the operator typed is left alone
+function setMeshTo(v) { $("mesh-to").value = v; delete $("mesh-to").dataset.typed; }
+$("mesh-to").addEventListener("input", (e) => { e.target.dataset.typed = "1"; });
+function selectPeer(name, sid, setTo = true) {
+  meshState.selPeer = sid || name || null;
+  meshState.selName = name || sid || null;
+  meshState.ctxSig = "";
+  if (setTo && name && document.activeElement !== $("mesh-to")) setMeshTo(name);
+}
+function pickPeer(name, sid) { selectPeer(name, sid); loadMesh(); loadPeerContext(); }
+// a jump from FLEET or GALLERY lands on the peer's own squad, so the roster, topology and heatmap include it
+function peerFromProcess(p) {
+  setMeshSquad(p.squad_id || "");
+  selectPeer(p.name || String(p.pid), p.session_id);
+}
+// every squad change goes through here: the selection and #mesh-to are re-checked against the new roster
+// in loadMesh(), and an edge pair filter from the old squad is dropped
+function setMeshSquad(id) {
+  meshState.squadFilter = id || "";
+  meshState.squadChosen = true;
+  meshState.revalidate = true;
+  setPairFilter(null, null);
+}
+function clearPeerContext() {
+  $("mesh-ctx-box").setAttribute("data-title", "PEER CONTEXT STREAM");
+  $("mesh-ctx-head").replaceChildren(el("span", { cls: "dim", text: "no peer selected" }));
+  $("mesh-ctx-feed").replaceChildren();
+}
 $("mesh-squad-filter").addEventListener("change", (e) => {
-  meshState.squadFilter = e.target.value;
+  setMeshSquad(e.target.value);
   loadMesh();
 });
+fillKindSeg("mesh-ctx-kinds", meshState.ctxKinds);
 $("mesh-ctx-kinds").addEventListener("click", (e) => {
   if (e.target.dataset.v === undefined) return;
   meshState.ctxKinds = e.target.dataset.v;
   meshState.ctxSig = "";
-  document.querySelectorAll("#mesh-ctx-kinds button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.v === meshState.ctxKinds)));
+  pressKindSeg("mesh-ctx-kinds", meshState.ctxKinds);
   if (meshState.selPeer) loadPeerContext();
 });
 $("mesh-msg-scope").addEventListener("click", (e) => {
@@ -1188,10 +1507,33 @@ async function loadMesh() {
     $("mesh-summary").textContent = `mesh unavailable: ${err.message}`;
     return;
   }
+  if (sq !== meshState.squadFilter) return;       // the squad changed while this was in flight: the newer call paints
   meshState.peers = doc.peers || [];
   meshState.messages = doc.messages || [];
+  meshState.open = doc.open || [];
   if (doc.roles?.length) { state.roles = doc.roles; syncRoleControls(); }
   state.squads = doc.squads || [];
+  if (!meshState.squadFilter && !meshState.squadChosen) {
+    meshState.squadChosen = true;                 // once: "all peers" chosen later stays chosen
+    const live = new Set(meshState.peers.map((p) => p.squad_id).filter(Boolean));
+    const pick = state.squads.find((s) => live.has(s.id));   // squads come newest first
+    if (pick) { meshState.squadFilter = pick.id; meshState.revalidate = true; return loadMesh(); }
+  }
+  if (meshState.revalidate) {
+    // a squad change: a selection from the old squad goes (the first peer is picked below, as on first load),
+    // and #mesh-to stops addressing the old peer unless the operator typed it
+    meshState.revalidate = false;
+    let dropped = false;
+    if (meshState.selPeer && !meshState.peers.some(isSelPeer)) {
+      meshState.selPeer = meshState.selName = null;
+      meshState.ctxSig = "";
+      dropped = true;
+      if (!meshState.peers.length) clearPeerContext();
+    }
+    // a page-set handle goes with a dropped selection (the same handle may name someone else in the new squad)
+    const to = $("mesh-to"), v = to.value.trim();
+    if (!to.dataset.typed && v && !/^[@#]/.test(v) && (dropped || !meshState.peers.some((p) => p.name === v || String(p.pid) === v))) setMeshTo("@all");
+  }
 
   const cCount = meshState.peers.filter((p) => p.provider === "claude").length;
   const gCount = meshState.peers.filter((p) => p.provider === "gemini").length;
@@ -1201,16 +1543,22 @@ async function loadMesh() {
     " · ",
     el("span", { cls: doc.hub_pipe ? "hi" : "dim", text: doc.hub_pipe ? "uds hub ▲" : "uds hub ▽" }),
     ` · ${state.squads.length} squad${state.squads.length === 1 ? "" : "s"}`,
+    ...(health.doc ? [" · ", el("span", {
+      cls: runnerMissing("gemini") ? "run-missing" : "hi",
+      text: runnerMissing("gemini") ? "agy ▽ missing" : "agy ▲",   // ▲ up, as "uds hub ▲"
+      title: runnerMissing("gemini") ? runnerHelp("gemini", health.doc.runners.gemini) : `gemini runner: ${health.doc.runners?.gemini?.path}`,
+    })] : []),
   );
 
   // Sync squad selector
   const sqSel = $("mesh-squad-filter");
-  const prevSq = sqSel.value;
+  const prevSq = meshState.squadFilter;
   sqSel.replaceChildren(
     el("option", { value: "", text: "all peers" }),
     ...state.squads.map((s) => el("option", { value: s.id, text: `${s.name} (${s.id})` })),
   );
   if (prevSq && state.squads.some((s) => s.id === prevSq)) sqSel.value = prevSq;
+  paintSquadStrip();
 
   // Sync datalist targets
   const dl = $("mesh-targets");
@@ -1226,40 +1574,133 @@ async function loadMesh() {
   const tbody = $("mesh-peers-table").querySelector("tbody");
   $("mesh-peers-empty").hidden = meshState.peers.length > 0;
   tbody.replaceChildren(...meshState.peers.map((p) => {
-    const isSel = meshState.selPeer && (p.name === meshState.selPeer || p.session_id === meshState.selPeer || String(p.pid) === meshState.selPeer);
+    const isSel = isSelPeer(p);
     const lastTxt = p.last_event ? `[${p.last_event.kind}] ${p.last_event.text}`.replace(/\s+/g, " ").slice(0, 44) : "–";
+    // passive badge: an idle peer that owes someone an answer (replaces a stall watchdog)
+    const owed = active(p) ? [] : meshState.open.filter((m) => m.to_name === p.name);
+    const owedBlocking = owed.some((m) => m.needs === "blocking");
     const tr = el("tr", { cls: isSel ? "sel" : "" },
       el("td", {}, providerBadge(p.provider)),
-      el("td", { text: p.name.slice(0, 24), title: `pid ${p.pid} · ${p.cwd || ""}` }),
+      el("td", { title: `pid ${p.pid} · ${p.cwd || ""}${p.spawned_by ? ` · added by ${p.spawned_by}` : ""}` }, p.name.slice(0, 24), owed.length ? el("span", {
+        cls: `flag ${owedBlocking ? "blocking" : "reply"}`, text: `✉${owed.length}`,
+        title: `idle with ${owed.length} unanswered: ${owed.map((m) => `${m.from_name} (${m.needs}, ${age(m.ts)})`).join(", ")}`,
+      }) : null),
       el("td", { cls: "role-tag", text: (p.agent_role || "–").slice(0, 18) }),
       el("td", { cls: "cyan", text: (p.squad_id || "–").slice(0, 16) }),
       el("td", {}, udsBadge(p.has_uds, p.pipe)),
       el("td", {}, rowState({ ...p, role: "session" })),
       el("td", { cls: "dim", text: lastTxt, title: p.last_event?.text || "" }),
     );
-    tr.addEventListener("click", () => {
-      meshState.selPeer = p.name || p.session_id || String(p.pid);
-      meshState.ctxSig = "";
-      if (document.activeElement !== $("mesh-to")) $("mesh-to").value = p.name;
-      loadMesh();
-      loadPeerContext();
-    });
+    tr.addEventListener("click", () => pickPeer(p.name || String(p.pid), p.session_id));
     return tr;
   }));
 
   if (!meshState.selPeer && meshState.peers.length) {
-    meshState.selPeer = meshState.peers[0].name;
+    const p0 = meshState.peers[0];
+    selectPeer(p0.name || String(p0.pid), p0.session_id, false);
     loadPeerContext();
   }
   paintMeshMessages();
+  loadHeat();      // only when the scope changed; the 30 s loop refreshes it
+  loadTopo(false, doc.latest_id);
+}
+
+// elastic squads: what the architect may add (and how much is used), the operator's limit editor and [+ ADD MEMBER].
+// The tools row is rebuilt only when the squad changes, so a half-typed task survives the 2 s poll.
+function paintStripTools(squad) {
+  const target = state.roles.find((r) => r.id === squad.spawn_role);
+  $("strip-grow").textContent = squad.spawn_role
+    ? `added ${squad.spawn_used || 0}/${squad.spawn_limit || 0} · ${squad.spawn_role === "*" ? "any role" : squad.spawn_role}`
+    : "agents add nobody (no spawn role)";
+  $("strip-grow").title = squad.spawn_role === "*" ? `an agent whose role may add members can add up to ${squad.spawn_limit} members of any role`
+    : target ? `an agent whose role may add members can add up to ${squad.spawn_limit} ${target.title}` : "";
+  const strip = $("mesh-strip");
+  const rolesSig = state.roles.map((r) => `${r.id}:${r.title}`).join(",");      // a renamed or swapped role rebuilds too
+  if (strip.dataset.squad === squad.id && strip.dataset.roles === rolesSig) return;
+  strip.dataset.squad = squad.id; strip.dataset.roles = rolesSig;
+  const opts = (blank) => [...(blank ? [el("option", { value: "", text: "(nobody)" }), el("option", { value: "*", text: "any role", title: ANY_ROLE_NOTE })] : []),
+    ...state.roles.map((r) => el("option", { value: r.id, text: roleOptionText(r, false) }))];
+  $("strip-role").replaceChildren(...opts(true));
+  $("strip-role").value = squad.spawn_role || "";
+  $("strip-limit").value = String(squad.spawn_limit || 0);
+  $("strip-add-role").replaceChildren(...opts(false));
+  // the squad's spawn role, else an implementer, else the first role: never "" while there is a role to pick
+  const want = [squad.spawn_role !== "*" && squad.spawn_role, state.roles.find((r) => r.id.startsWith("implementer"))?.id, state.roles[0]?.id]
+    .find((id) => id && state.roles.some((r) => r.id === id));
+  $("strip-add-role").value = want || "";
+  for (const [form, btn] of [["strip-edit-form", "strip-edit"], ["strip-add-form", "strip-add"]]) {
+    $(form).hidden = true; $(btn).setAttribute("aria-expanded", "false");
+  }
+  $("strip-msg").textContent = "";
+}
+for (const [btn, form, focus] of [["strip-edit", "strip-edit-form", "strip-role"], ["strip-add", "strip-add-form", "strip-add-task"]]) {
+  $(btn).addEventListener("click", () => {
+    const open = $(form).hidden;
+    $(form).hidden = !open; $(btn).setAttribute("aria-expanded", String(open));
+    if (open) $(focus).focus();
+  });
+}
+$("strip-edit-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const btn = e.target.querySelector("button[type=submit]");
+  if (btn.disabled) return;
+  btn.disabled = true;
+  try {
+    const r = await post("/api/squad", { id: meshState.squadFilter, spawn_role: $("strip-role").value || null,
+      spawn_limit: Number($("strip-limit").value || 0) });
+    $("strip-msg").textContent = r.ok ? `saved: agents may add ${r.squad.spawn_role === "*" ? "any role" : r.squad.spawn_role || "nobody"} up to ${r.squad.spawn_limit} ✓` : `refused: ${r.error}`;
+    if (r.ok) { $("strip-edit-form").hidden = true; $("strip-edit").setAttribute("aria-expanded", "false"); loadMesh(); }
+  } catch (err) { $("strip-msg").textContent = `failed: ${err.message}`; }
+  btn.disabled = false;
+});
+$("strip-add-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const btn = e.target.querySelector("button[type=submit]");
+  if (btn.disabled) return;                         // Enter pressed again while the first add is still launching
+  const task = $("strip-add-task").value.trim(), role = $("strip-add-role").value;
+  if (!task) return;
+  if (!role) { $("strip-msg").textContent = "pick a role for the new member first (no roles loaded?)"; $("strip-add-role").focus(); return; }
+  btn.disabled = true;
+  $("strip-msg").textContent = "launching…";
+  try {
+    const r = await post("/api/squad/member", { squad_id: meshState.squadFilter, role_id: role,
+      agent_name: $("strip-add-name").value.trim() || null, task });
+    $("strip-msg").textContent = r.ok ? `${r.agent_name} joined (${r.provider}, pid ${r.pid}) ✓` : `refused: ${r.error}`;
+    if (r.ok) { $("strip-add-task").value = ""; $("strip-add-name").value = ""; setTimeout(() => { loadFleet(); loadMesh(); }, 900); }
+  } catch (err) { $("strip-msg").textContent = `failed: ${err.message}`; }
+  btn.disabled = false;
+});
+
+// one line above the roster for the selected squad: its brief, and who is waiting on whom
+function paintSquadStrip() {
+  const strip = $("mesh-strip");
+  const squad = state.squads.find((s) => s.id === meshState.squadFilter);
+  strip.hidden = !squad;
+  if (!squad) return;
+  const brief = (squad.brief || "").replace(/\s+/g, " ").trim();
+  const waits = meshState.open.map((m) => {
+    const toOp = OPERATOR.has(m.to_name);
+    const text = toOp && m.needs === "blocking" ? `${m.from_name} blocked on operator for ${age(m.ts)}`
+      : `${m.from_name} waits on ${toOp ? "operator" : m.to_name} ${age(m.ts)} (${m.needs})`;
+    return el("span", { cls: m.needs === "blocking" ? "flag blocking" : "flag reply", text, title: m.body.slice(0, 400) });
+  });
+  paintStripTools(squad);
+  $("mesh-strip-info").replaceChildren(
+    el("span", { cls: "cyan", text: squad.name }), " ",
+    el("span", { cls: "dim", text: brief.length > 160 ? `${brief.slice(0, 160)}…` : brief || "(no brief)", title: squad.brief || "" }),
+    ...(waits.length ? [el("span", { cls: "grow" }), ...waits] : [el("span", { cls: "grow" }), el("span", { cls: "dim", text: "nobody waiting" })]),
+  );
 }
 
 function paintMeshMessages() {
   const feed = $("mesh-feed");
   const atBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 40;
   let list = meshState.messages;
-  if (meshState.msgScope === "peer" && meshState.selPeer) {
-    const target = meshState.selPeer;
+  if (meshState.pair) {          // an edge's pair filter replaces the scope until its chip is dismissed
+    const [a, b] = meshState.pair, norm = (n) => (OPERATOR.has(n) ? "operator" : n);
+    list = list.filter((m) => (norm(m.from_name) === a && norm(m.to_name) === b) || (norm(m.from_name) === b && norm(m.to_name) === a));
+  } else if (meshState.msgScope === "peer" && meshState.selPeer) {
+    const target = selPeerName();
     list = list.filter((m) => m.from_name === target || m.to_name === target || m.to_name.startsWith("@") || m.to_name.startsWith("#"));
   }
   if (meshState.channelFilter) {
@@ -1282,9 +1723,10 @@ function paintMeshMessages() {
         el("span", { cls: m.to_name.startsWith("@") || m.to_name.startsWith("#") ? "amber" : "cyan", text: m.to_name }),
         m.channel ? el("span", { cls: "violet", text: m.channel }) : null,
         el("span", { cls: "dim", text: `[${m.transport || "uds"}]` }),
+        needsBadge(m),
       );
       const body = el("div", { cls: "msg-body", text: m.body });
-      return el("li", { cls: fresh ? "new" : "" }, head, body);
+      return el("li", { cls: fresh ? "new" : "", "data-id": m.id }, head, body);
     }));
   }
   meshState.messages.forEach((m) => meshState.seenMsgIds.add(m.id));
@@ -1292,27 +1734,30 @@ function paintMeshMessages() {
 }
 
 async function loadPeerContext() {
-  if (!meshState.selPeer) return;
+  const want = meshState.selPeer;
+  if (!want) return;
   let doc;
   try {
     const kindsQ = meshState.ctxKinds ? `&kinds=${encodeURIComponent(meshState.ctxKinds)}` : "";
-    doc = await api(`/api/mesh/context?peer=${encodeURIComponent(meshState.selPeer)}&limit=60${kindsQ}`);
+    doc = await api(`/api/mesh/context?peer=${encodeURIComponent(want)}&limit=60${kindsQ}`);
   } catch (err) {
-    $("mesh-ctx-head").replaceChildren(el("span", { cls: "red", text: err.message }));
+    if (meshState.selPeer === want) $("mesh-ctx-head").replaceChildren(el("span", { cls: "red", text: err.message }));
     return;
   }
+  if (meshState.selPeer !== want) return;          // another peer was picked meanwhile
   const p = doc.peer, u = doc.usage;
   $("mesh-ctx-box").setAttribute("data-title", `CONTEXT STREAM // ${p.name}`.slice(0, 56));
-  $("mesh-ctx-head").replaceChildren(
+  $("mesh-ctx-head").replaceChildren(...[    // replaceChildren would print a null as "null"
     providerBadge(p.provider), " ",
     el("span", { cls: "title", text: p.name }),
     p.agent_role ? el("span", { cls: "role-tag", text: ` · ${p.agent_role}` }) : null,
     p.model ? el("span", { cls: "model", text: ` · ${fmtModel(p.model)}` }) : null,
     el("span", { cls: "dim", text: ` · ${doc.live ? `live pid ${p.pid}` : "ended"}` }),
     u && u.messages ? el("span", { cls: "dim", text: ` · ${num(u.output, 0)} out tok · ${num(u.calls, 0)} tools` }) : null,
-  );
+    workShort(u) ? el("span", { cls: "dim", text: ` · ${workShort(u)}` }) : null,
+  ].filter((n) => n !== null));
   const events = doc.events || [];
-  const sig = `${p.name}|${events.length}|${events.length ? events[events.length - 1].ts + events[events.length - 1].text.slice(0, 30) : ""}`;
+  const sig = `${p.session_id || p.name}|${events.length}|${events.length ? events[events.length - 1].ts + events[events.length - 1].text.slice(0, 30) : ""}`;
   if (sig === meshState.ctxSig) return;
   meshState.ctxSig = sig;
   const feed = $("mesh-ctx-feed");
@@ -1322,6 +1767,403 @@ async function loadPeerContext() {
     : [el("li", { cls: "result", text: "no matching context events yet" })]));
   if (atBottom) feed.scrollTop = feed.scrollHeight;
 }
+
+// ------------------------------------------------------------------ mesh: topology (who talks to whom)
+// Deterministic SVG, no physics: columns operator | architect | implementer | reviewer | other, rows in spawn order,
+// channels on a rail underneath. One curved edge per direction, width by count, coloured by open flags.
+const topoState = { doc: null, key: "", at: 0, latest: -1 };
+const TOPO_COLS = ["operator", "architect", "implementer", "reviewer", "other"];
+const TOPO_MIN_COL = 136, TOPO_MIN_CH_SLOT = 96;     // px: a node box is then >= 114 wide, a channel box >= 86
+const TOPO_CH = 6.7;                                 // px per character of the 11px monospace the svg is set in
+// shorten to fit `px`, ending in an ellipsis; estimated by character count, as the face is monospace
+function fitText(s, px) {
+  const n = Math.max(1, Math.floor(px / TOPO_CH));
+  return s.length <= n ? s : `${s.slice(0, Math.max(1, n - 1))}…`;
+}
+
+async function loadTopo(force = false, latestId = -1) {
+  const sq = meshState.squadFilter;
+  const key = sq || "";
+  // the graph moves with messages: refetch when the scope or the newest message id changes, else every 10 s
+  if (!force && key === topoState.key && latestId === topoState.latest && Date.now() - topoState.at < 10000) return;
+  if (topoState.unsupported) return;
+  topoState.key = key; topoState.latest = latestId; topoState.at = Date.now();
+  // fetch, not api(): a server older than the topology answers 404 for the route, which must neither flag the LINK
+  // as down nor be asked again every few seconds
+  let res, doc;
+  try {
+    res = await fetch(`/api/mesh/graph${sq ? `?squad=${encodeURIComponent(sq)}` : ""}`, { credentials: "same-origin" });
+    doc = await res.json().catch(() => ({}));
+  } catch { return; }
+  if (res.status === 404 && doc.error === "Not found") {
+    topoState.unsupported = true;                       // until the next page load
+    $("topo-scope").textContent = "";
+    $("topo").replaceChildren(el("p", { cls: "dim pad", text: "topology needs an Almanac restart: this server predates it" }));
+    return;
+  }
+  if (!res.ok) { $("topo-scope").textContent = `topology unavailable: ${doc.error || res.status}`; return; }
+  topoState.doc = doc;
+  paintTopo();
+}
+
+function topoEdgeClass(e) {
+  if (e.open?.blocking) return "blocking";
+  if (e.open?.reply) return "reply";
+  return Date.now() / 1000 - (e.last_ts || 0) < 60 ? "recent" : "quiet";
+}
+
+function paintTopo() {
+  const doc = topoState.doc, box = $("topo");
+  if (!doc) return;
+  const agents = doc.nodes.filter((n) => n.kind === "agent");
+  const sq = state.squads.find((s) => s.id === doc.squad_id);
+  if (!doc.squad_id && agents.length > 20) {
+    $("topo-scope").textContent = `${agents.length} live peers`;
+    box.replaceChildren(el("p", { cls: "dim pad", text: "pick a squad above to draw its topology: more than 20 unrelated peers make no readable graph" }));
+    return;
+  }
+  const openFlags = doc.edges.reduce((n, e) => n + (e.open?.reply || 0) + (e.open?.blocking || 0), 0);
+  $("topo-scope").textContent = `${sq ? `squad ${sq.name}` : "live peers (no squad)"} · ${agents.length} agent${agents.length === 1 ? "" : "s"}`
+    + ` · ${doc.edges.length} path${doc.edges.length === 1 ? "" : "s"}${openFlags ? ` · ${openFlags} open` : ""}`;
+  // layout: only the columns in use (the operator always), each node a fixed box
+  // A column is never narrower than TOPO_MIN_COL: past that the svg keeps its width and .topo scrolls sideways
+  const used = TOPO_COLS.filter((c) => c === "operator" || agents.some((n) => n.role_class === c));
+  const avail = box.clientWidth ? box.clientWidth - 20 : 640;          // .topo has 10px of padding either side
+  const pad = 14, W = Math.max(420, Math.round(avail), 2 * pad + used.length * TOPO_MIN_COL), colW = (W - 2 * pad) / used.length;
+  const nodeW = Math.min(176, colW - 22), nodeH = 40, rowH = 58, top = 22;
+  const pos = new Map();
+  const perCol = Object.fromEntries(used.map((c) => [c, 0]));
+  for (const n of doc.nodes) {
+    if (n.kind === "channel") continue;
+    const c = n.kind === "operator" ? "operator" : n.role_class;
+    const i = used.indexOf(c), r = perCol[c]++;
+    pos.set(n.id, { x: pad + i * colW + (colW - nodeW) / 2, y: top + r * rowH, w: nodeW, h: nodeH });
+  }
+  const rows = Math.max(1, ...Object.values(perCol));
+  const channels = doc.nodes.filter((n) => n.kind === "channel");
+  // channels: as many per rail row as fit at TOPO_MIN_CH_SLOT each, further rows underneath
+  const railY = top + rows * rowH + 8, span = W - 2 * pad, railRowH = 32;
+  const perRail = Math.max(1, Math.min(channels.length, Math.floor(span / TOPO_MIN_CH_SLOT)));
+  const slot = span / perRail, chW = Math.min(120, slot - 10);
+  channels.forEach((n, i) => {
+    const r = Math.floor(i / perRail), c = i % perRail;
+    pos.set(n.id, { x: pad + c * slot + (slot - chW) / 2, y: railY + r * railRowH, w: chW, h: 24 });
+  });
+  const railRows = Math.ceil(channels.length / perRail);
+  const H = (channels.length ? railY + (railRows - 1) * railRowH + 24 : top + rows * rowH) + 12;
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, role: "group",
+    "aria-label": `Topology: ${agents.length} agents, ${doc.edges.length} message paths, ${openFlags} open flags. Tab to a node or an edge, Enter to open it.` });
+  if (W > avail) { svg.style.width = `${W}px`; svg.style.maxWidth = "none"; }    // CSSOM: the CSP allows no style attribute
+  const defs = svgEl("defs");
+  for (const k of ["quiet", "recent", "reply", "blocking"]) {
+    const m = svgEl("marker", { id: `topo-arrow-${k}`, viewBox: "0 0 8 8", refX: "7", refY: "4", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" });
+    m.append(svgEl("path", { d: "M0,0 L8,4 L0,8 z", class: `topo-arrow ${k}` }));
+    defs.append(m);
+  }
+  svg.append(defs);
+  // column heads
+  used.forEach((c, i) => svg.append(svgEl("text", { x: pad + i * colW + colW / 2, y: 12, "text-anchor": "middle", class: "topo-col" }, c.toUpperCase())));
+  // edges first, so nodes sit on top
+  const center = (p) => ({ x: p.x + p.w / 2, y: p.y + p.h / 2 });
+  const clip = (c, toward, p) => {          // where the line from the centre toward `toward` leaves the box
+    const dx = toward.x - c.x, dy = toward.y - c.y;
+    const t = Math.min(dx ? (p.w / 2) / Math.abs(dx) : Infinity, dy ? (p.h / 2) / Math.abs(dy) : Infinity, 1);
+    return { x: c.x + dx * t, y: c.y + dy * t };
+  };
+  for (const e of doc.edges) {
+    const a = pos.get(e.from), b = pos.get(e.to);
+    if (!a || !b || e.from === e.to) continue;
+    const ca = center(a), cb = center(b);
+    const dx = cb.x - ca.x, dy = cb.y - ca.y, len = Math.hypot(dx, dy) || 1;
+    const bend = Math.min(40, 14 + len * 0.08);            // to the left of the direction: a->b and b->a part
+    const ctl = { x: (ca.x + cb.x) / 2 - (dy / len) * bend, y: (ca.y + cb.y) / 2 + (dx / len) * bend };
+    const p0 = clip(ca, ctl, a), p1 = clip(cb, ctl, b);
+    const k = topoEdgeClass(e), width = Math.min(6, 1 + Math.log2(Math.max(1, e.count)));
+    const open = (e.open?.reply || 0) + (e.open?.blocking || 0);
+    const label = `${e.from} → ${e.to}: ${e.count} message${e.count === 1 ? "" : "s"}, last ${age(e.last_ts)} ago`
+      + (open ? `, ${e.open.blocking ? `${e.open.blocking} blocking` : ""}${e.open.blocking && e.open.reply ? ", " : ""}${e.open.reply ? `${e.open.reply} waiting for a reply` : ""}` : "");
+    const g = svgEl("g", { class: `topo-edge ${k}`, tabindex: "0", role: "button", "aria-label": `${label}; show these messages` });
+    g.append(svgEl("title", {}, label));
+    const d = `M${p0.x.toFixed(1)},${p0.y.toFixed(1)} Q${ctl.x.toFixed(1)},${ctl.y.toFixed(1)} ${p1.x.toFixed(1)},${p1.y.toFixed(1)}`;
+    g.append(svgEl("path", { d, class: "hit" }), svgEl("path", { d, class: "line", "stroke-width": width.toFixed(1), "marker-end": `url(#topo-arrow-${k})` }));
+    const mid = { x: 0.25 * p0.x + 0.5 * ctl.x + 0.25 * p1.x, y: 0.25 * p0.y + 0.5 * ctl.y + 0.25 * p1.y };
+    g.append(svgEl("text", { x: mid.x, y: mid.y - 3, "text-anchor": "middle", class: "topo-count" },
+      open ? `${e.count} · ${open}${e.open.blocking ? " ▲" : " ?"}` : String(e.count)));
+    const act = () => setPairFilter(e.from, e.to);
+    g.addEventListener("click", act);
+    g.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); act(); } });
+    svg.append(g);
+  }
+  // nodes
+  for (const n of doc.nodes) {
+    const p = pos.get(n.id);
+    if (!p) continue;
+    const busy = n.live && n.status && n.status !== "idle" && n.status !== "ended";
+    const cls = `topo-node ${n.kind}${n.kind === "agent" && !n.live ? " ended" : ""}${busy && !reduced ? " busy" : ""}`
+      + `${(n.session_id ? isSelPeer({ name: n.id, session_id: n.session_id }) : n.id === selPeerName()) ? " sel" : ""}`;
+    const last = n.last_event ? `[${n.last_event.kind}] ${n.last_event.text}`.replace(/\s+/g, " ") : n.kind === "agent" && !n.live ? "ended" : "";
+    const title = [n.id, n.role_id, n.provider, n.kind === "agent" ? (n.live ? n.status || "idle" : "ended") : null,
+      n.worktree ? `worktree ${n.worktree}` : null, n.spawned_by ? `added by ${n.spawned_by}` : null, last].filter(Boolean).join(" · ");
+    const g = svgEl("g", { class: cls, tabindex: n.kind === "agent" ? "0" : null, role: n.kind === "agent" ? "button" : null,
+      "aria-label": n.kind === "agent" ? `${title}; open its context stream` : title });
+    g.append(svgEl("title", {}, title));
+    g.append(svgEl("rect", { x: p.x, y: p.y, width: p.w, height: p.h, rx: 3 }));
+    const letter = n.kind === "operator" ? "◉" : n.kind === "channel" ? "#" : (n.provider === "gemini" ? "G" : "C");
+    const head = svgEl("text", { x: p.x + 6, y: p.y + (n.kind === "channel" ? 16 : 15), class: "topo-name" });
+    // labels fit the box (full name and last event stay in <title>): 6px inset either side, 2 chars of provider
+    // letter, 2 more for the worktree mark
+    const nameRoom = p.w - 12 - 2 * TOPO_CH - (n.worktree ? 2 * TOPO_CH : 0);
+    head.append(svgEl("tspan", { class: `topo-prov ${n.provider || n.kind}` }, `${letter} `), document.createTextNode(fitText(n.id, nameRoom)));
+    if (n.worktree) head.append(svgEl("tspan", { class: "topo-wt" }, " ⑂"));
+    g.append(head);
+    if (n.kind === "agent") g.append(svgEl("text", { x: p.x + 6, y: p.y + 31, class: "topo-last" }, fitText(last, p.w - 12)));
+    if (n.kind === "agent") {
+      const pick = () => pickPeer(n.id, n.session_id);
+      g.addEventListener("click", pick);
+      g.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); pick(); } });
+    }
+    svg.append(g);
+  }
+  box.replaceChildren(svg);
+}
+
+// an edge click filters the contact stream to that pair; a chip beside the scope seg undoes it
+function setPairFilter(a, b) {
+  meshState.pair = a && b ? [a, b] : null;
+  const chip = $("mesh-pair-chip");
+  chip.hidden = !meshState.pair;
+  const seg = $("mesh-msg-scope");
+  seg.classList.toggle("overridden", !!meshState.pair);
+  if (meshState.pair) seg.title = "an edge filter is on: dismiss its chip to use this scope again"; else seg.removeAttribute("title");
+  if (meshState.pair) $("mesh-pair-text").textContent = `${a} ⇄ ${b}`;
+  paintMeshMessages();
+  if (meshState.pair) $("mesh-feed").scrollTop = $("mesh-feed").scrollHeight;
+}
+$("mesh-pair-clear").addEventListener("click", () => setPairFilter(null, null));
+
+// jump from the swimlane to a message in the contact stream
+function flashMessage(id) {
+  const li = $("mesh-feed").querySelector(`li[data-id="${Number(id)}"]`);
+  if (!li) return false;
+  li.scrollIntoView({ block: "center", behavior: reduced ? "auto" : "smooth" });
+  li.classList.remove("flash"); void li.offsetWidth; li.classList.add("flash");
+  return true;
+}
+
+// ------------------------------------------------------------------ mesh: squad timeline // work heatmap
+// One row per agent, one column per time bucket: work in a 5-step single-hue ramp by intensity, waiting (mesh_wait)
+// in a quieter hue, idle left as background. A PARALLEL row above steps by how many agents worked at once.
+const heatState = { doc: null, mode: get("heat-mode", "events"), layers: get("heat-layers", "heat"), key: "", geo: null };
+const SVG_NS = "http://www.w3.org/2000/svg";
+function svgEl(tag, attrs = {}, text) {
+  const n = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs)) if (v !== null && v !== undefined) n.setAttribute(k, v);
+  if (text !== undefined) n.textContent = text;
+  return n;
+}
+function fmtDur(sec) {
+  const s = Math.round(sec || 0);
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.round(s / 60)}m`;
+  return `${Math.floor(s / 3600)}h${String(Math.round((s % 3600) / 60)).padStart(2, "0")}m`;
+}
+const workShort = (u) => (u && u.turns ? `${fmtDur(u.work_s)} work` : null);
+
+function heatQuery() {
+  if (meshState.squadFilter) return `squad=${encodeURIComponent(meshState.squadFilter)}`;
+  const sids = meshState.peers.map((p) => p.session_id).filter(Boolean).slice(0, 20);
+  return sids.length ? `sessions=${sids.map(encodeURIComponent).join(",")}` : "";
+}
+// fetched when the scope changes and every 30 s while MESH shows (the data moves at ingest pace), never per 2 s poll
+async function loadHeat(force = false) {
+  const q = heatQuery();
+  if (!force && q === heatState.key) return;
+  heatState.key = q;
+  if (!q) { heatState.doc = null; paintHeat(); return; }
+  try { heatState.doc = await api(`/api/worktime?${q}`); }
+  catch (err) { $("heat-scope").textContent = `worktime unavailable: ${err.message}`; return; }
+  paintHeat();
+}
+
+// fold k adjacent buckets into one column so a column is never narrower than ~4px
+function heatColumns(doc, maxCols) {
+  const k = Math.max(1, Math.ceil(doc.range.n / maxCols)), cols = Math.ceil(doc.range.n / k);
+  const fold = (arr, f) => Array.from({ length: cols }, (_, c) => f(arr.slice(c * k, c * k + k)));
+  const sum = (xs) => xs.reduce((a, b) => a + b, 0);
+  return {
+    k, cols, bucket: doc.range.bucket_s * k,
+    agents: doc.agents.map((a) => ({ ...a, work: fold(a.work, sum), wait: fold(a.wait, sum), events: fold(a.events, sum), output: fold(a.output, sum) })),
+    maxWorking: fold(doc.overlap.max_working, (xs) => Math.max(0, ...xs)),
+  };
+}
+
+function heatSummary(doc, names) {
+  const ov = doc.overlap, wall = doc.range.end - doc.range.start, by = ov.by_count || {};
+  const parallelPct = wall > 0 ? Math.round((ov.parallel_s / wall) * 100) : 0;
+  const line = `wall ${fmtDur(wall)} · someone working ${fmtDur(ov.any_s)} · parallel (2+) ${fmtDur(ov.parallel_s)} ${parallelPct}%`
+    + ` · solo ${fmtDur(by[1] || by["1"] || 0)} · all idle ${fmtDur(by[0] || by["0"] || 0)} · peak ${ov.peak}`;
+  const pairs = (ov.pairs || []).slice(0, 4).map((p) => `${names[p.a] || p.a.slice(0, 8)} × ${names[p.b] || p.b.slice(0, 8)} ${fmtDur(p.overlap_s)}`);
+  return { line, pairs };
+}
+
+function paintHeat() {
+  const doc = heatState.doc, box = $("heat");
+  const sq = state.squads.find((s) => s.id === meshState.squadFilter);
+  if (!doc || !doc.agents?.length || !doc.range?.n) {
+    $("heat-scope").textContent = sq ? `squad ${sq.name}` : "peers shown";
+    box.replaceChildren(el("p", { cls: "dim", text: doc?.agents?.length ? "no turns recorded yet for these sessions (transcripts are read every 30 s while agents run)" : "no sessions to chart" }));
+    $("heat-legend").replaceChildren(); $("heat-summary").textContent = "";
+    $("heat-table").querySelector("tbody").replaceChildren();
+    return;
+  }
+  const names = Object.fromEntries(doc.agents.map((a) => [a.session_id, a.agent_name]));
+  const W = Math.max(360, Math.round(box.clientWidth || 640)), labelW = 150, statW = 178, gridX = labelW, gridW = W - labelW - statW;
+  const geo = heatColumns(doc, Math.max(10, Math.floor(gridW / 4)));
+  const cw = gridW / geo.cols, rowH = 16, gap = 3, parY = 2, rowsY = parY + rowH + 8;
+  const axisY = rowsY + geo.agents.length * (rowH + gap) + 2, H = axisY + 18;
+  heatState.geo = { ...geo, gridX, cw, W };
+  // intensity: per-minute rate in each worked column, scaled to the squad's 95th percentile so one burst
+  // does not flatten the rest
+  const per = (a, i) => (heatState.mode === "output" ? a.output[i] : a.events[i]) / (geo.bucket / 60);
+  const rates = geo.agents.flatMap((a) => a.work.map((w, i) => (w > 0 ? per(a, i) : null))).filter((v) => v !== null && v > 0).sort((x, y) => x - y);
+  const p95 = rates.length ? rates[Math.min(rates.length - 1, Math.floor(rates.length * 0.95))] : 0;
+  const step = (a, i) => (p95 > 0 ? Math.min(5, Math.max(1, Math.ceil((per(a, i) / p95) * 5))) : 1);
+  const summary = heatSummary(doc, names);
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": `Work heatmap. ${summary.line}. ${summary.pairs.join(", ")}` });
+  const cell = (x, y, fill) => svgEl("rect", { x: x.toFixed(2), y, width: Math.max(1, cw - (cw > 4 ? 1 : 0)).toFixed(2), height: rowH, fill, rx: cw > 6 ? 1 : 0 });
+  // PARALLEL row
+  svg.append(svgEl("text", { x: 0, y: parY + 12, class: "lbl" }, "PARALLEL"));
+  geo.maxWorking.forEach((m, i) => { if (m > 0) svg.append(cell(gridX + i * cw, parY, `var(--par-${Math.min(4, m)})`)); });
+  svg.append(svgEl("text", { x: gridX + gridW + 8, y: parY + 12 }, `peak ${doc.overlap.peak}`));
+  // agent rows
+  geo.agents.forEach((a, r) => {
+    const y = rowsY + r * (rowH + gap);
+    const role = (a.role_id || "").split("-")[0];
+    const label = svgEl("text", { x: 0, y: y + 12, class: "lbl" }, a.agent_name.slice(0, 15));
+    if (role) label.append(svgEl("tspan", { class: "lbl-role" }, ` ${role.slice(0, 5)}`));
+    if (!a.live) label.setAttribute("opacity", ".6");
+    svg.append(label);
+    a.work.forEach((w, i) => {
+      if (w > 0) svg.append(cell(gridX + i * cw, y, `var(--heat-${step(a, i)})`));
+      else if (a.wait[i] > 0) svg.append(cell(gridX + i * cw, y, "var(--heat-wait)"));
+    });
+    const idlePct = a.wall_s > 0 ? Math.round((a.idle_s / a.wall_s) * 100) : 0;
+    svg.append(svgEl("text", { x: gridX + gridW + 8, y: y + 12 }, `work ${fmtDur(a.work_s)} · wait ${fmtDur(a.wait_s)} · idle ${idlePct}%`));
+  });
+  // time axis
+  svg.append(svgEl("line", { x1: gridX, x2: gridX + gridW, y1: axisY, y2: axisY, class: "axis" }));
+  const span = geo.cols * geo.bucket;
+  const tickStep = [60, 120, 300, 600, 900, 1800, 3600, 7200, 14400, 43200, 86400].find((s) => span / s <= 7) || 86400;
+  const t0 = doc.range.start;
+  for (let t = Math.ceil(t0 / tickStep) * tickStep; t <= t0 + span; t += tickStep) {
+    const x = gridX + ((t - t0) / geo.bucket) * cw;
+    svg.append(svgEl("line", { x1: x, x2: x, y1: axisY, y2: axisY + 4, class: "axis" }));
+    svg.append(svgEl("text", { x, y: axisY + 15, "text-anchor": "middle" }, hhmm(t)));
+  }
+  // hit rows: hover for a tooltip, click / Enter to select the peer
+  const rowAt = (r) => (r < 0 ? null : geo.agents[r]);
+  [-1, ...geo.agents.keys()].forEach((r) => {
+    const a = rowAt(r), y = r < 0 ? parY : rowsY + r * (rowH + gap);
+    const hit = svgEl("rect", { x: gridX, y: y - 1, width: gridW, height: rowH + 2, class: "row-hit",
+      tabindex: a ? "0" : null, role: a ? "button" : null,
+      "aria-label": a ? `${a.agent_name}: work ${fmtDur(a.work_s)}, waiting ${fmtDur(a.wait_s)}, ${a.turns} turns; select this peer` : null });
+    hit.addEventListener("mousemove", (e) => showTip(e, heatTip(a, e, svg)));
+    hit.addEventListener("mouseleave", hideTip);
+    if (a) {
+      const pick = () => pickPeer(a.agent_name, a.session_id);
+      hit.addEventListener("click", pick);
+      hit.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); pick(); } });
+    }
+    svg.append(hit);
+  });
+  if (heatState.layers === "events") drawSwimlane(svg, doc, geo, { gridX, cw, rowsY, rowH, gap });
+  box.replaceChildren(svg);
+  $("heat-scope").textContent = `${sq ? `squad ${sq.name}` : `${doc.agents.length} peers shown`} · since ${hhmm(doc.range.start)} · ${fmtDur(geo.bucket)} columns`;
+  // CSSOM, not a style attribute: the page's CSP (style-src 'self') blocks inline style attributes
+  const sw = (v) => { const n = el("span", { cls: "sw" }); n.style.background = `var(${v})`; return n; };
+  $("heat-legend").replaceChildren(
+    el("span", {}, `work (${heatState.mode === "output" ? "output tokens" : "events"} / min) low `, sw("--heat-1"), sw("--heat-2"), sw("--heat-3"), sw("--heat-4"), sw("--heat-5"), " high"),
+    el("span", {}, sw("--heat-wait"), " waiting (mesh_wait)"),
+    el("span", {}, "parallel ", sw("--par-1"), " solo ", sw("--par-2"), " 2 ", sw("--par-3"), " 3 ", sw("--par-4"), " 4+"),
+    el("span", {}, "blank = idle"),
+    heatState.layers === "events" && !("marks" in doc) ? el("span", { text: "events need an Almanac restart: this server predates them" })
+    : heatState.layers === "events" ? el("span", {}, "events: ", el("span", { cls: "red", text: "│" }), " tool error · ",
+      el("span", { text: "ˌ" }), " file edit · ", el("span", { cls: "cyan", text: "●" }), " message (",
+      el("span", { cls: "amber", text: "reply" }), " / ", el("span", { cls: "red", text: "blocking" }), ", ○ once answered)") : "");
+  $("heat-summary").replaceChildren(el("span", { text: summary.line }),
+    summary.pairs.length ? el("span", { cls: "dim", text: ` · ${summary.pairs.join(" · ")}` }) : "");
+  $("heat-table").querySelector("tbody").replaceChildren(...doc.agents.map((a) => el("tr", {},
+    el("th", { scope: "row", text: a.agent_name }), el("td", { text: fmtDur(a.work_s) }), el("td", { text: fmtDur(a.wait_s) }),
+    el("td", { text: fmtDur(a.idle_s) }), el("td", { text: String(a.turns) }), el("td", { text: String(a.calls) }))));
+}
+
+// swimlane on the heatmap, same x axis: per agent, a tick for each tool error and a notch for each file edit; each
+// message a thin line from the sender's row to the recipient's with a dot at the recipient (a broadcast, or one to
+// the operator, is a dot on the sender's row), coloured by its flag and hollow once answered
+function drawSwimlane(svg, doc, geo, { gridX, cw, rowsY, rowH, gap }) {
+  const rowOf = new Map(geo.agents.map((a, r) => [a.session_id, r]));
+  const rowByName = new Map(geo.agents.map((a, r) => [a.agent_name, r]));
+  const xAt = (ts) => gridX + ((ts - doc.range.start) / geo.bucket) * cw;
+  const top = (r) => rowsY + r * (rowH + gap), mid = (r) => top(r) + rowH / 2;
+  const lane = svgEl("g", { class: "lane" });
+  for (const m of doc.marks || []) {
+    const r = rowOf.get(m.session);
+    if (r === undefined) continue;
+    const x = xAt(m.ts).toFixed(1);
+    lane.append(m.kind === "error"
+      ? svgEl("line", { x1: x, x2: x, y1: top(r), y2: top(r) + rowH, class: "lane-err" })
+      : svgEl("line", { x1: x, x2: x, y1: top(r) + rowH - 5, y2: top(r) + rowH, class: "lane-edit" }));
+  }
+  for (const m of doc.messages || []) {
+    const from = rowByName.get(m.from), to = rowByName.get(m.to);
+    const at = to !== undefined && !String(m.to).match(/^[@#]/) ? to : from;
+    if (at === undefined) continue;
+    const x = xAt(m.ts);
+    const cls = `lane-msg ${m.needs || "plain"}${m.needs && m.answered_ts ? " answered" : ""}`;
+    const label = `${clock(m.ts)} ${m.from} → ${m.to}${m.needs ? ` [${m.needs}${m.answered_ts ? ", answered" : ", open"}]` : ""}: ${m.preview}`;
+    const g = svgEl("g", { class: cls, tabindex: "0", role: "button", "aria-label": `${label}; show it in the contact stream` });
+    if (from !== undefined && to !== undefined && from !== to) g.append(svgEl("line", { x1: x, x2: x, y1: mid(from), y2: mid(to) }));
+    g.append(svgEl("circle", { cx: x, cy: mid(at), r: 2.8, class: "dot" }), svgEl("circle", { cx: x, cy: mid(at), r: 7, class: "hit" }));
+    g.addEventListener("mouseenter", (e) => showTip(e, label));
+    g.addEventListener("mouseleave", hideTip);
+    const go = () => {
+      if (flashMessage(m.id)) return;
+      const r = g.getBoundingClientRect();
+      showTip({ clientX: r.left, clientY: r.top }, "older than the contact stream shows (its newest 150)");
+    };
+    g.addEventListener("click", go);
+    g.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); go(); } });
+    lane.append(g);
+  }
+  svg.append(lane);
+}
+
+$("heat-layers").addEventListener("click", (e) => {
+  if (!e.target.dataset.v) return;
+  heatState.layers = e.target.dataset.v; put("heat-layers", heatState.layers);
+  document.querySelectorAll("#heat-layers button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.v === heatState.layers)));
+  paintHeat();
+});
+document.querySelectorAll("#heat-layers button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.v === heatState.layers)));
+
+function heatTip(a, e, svg) {
+  const g = heatState.geo, box = svg.getBoundingClientRect();
+  const x = ((e.clientX - box.left) / box.width) * g.W;
+  const i = Math.min(g.cols - 1, Math.max(0, Math.floor((x - g.gridX) / g.cw)));
+  const t0 = heatState.doc.range.start + i * g.bucket, span = `${clock(t0)}–${clock(t0 + g.bucket)}`;
+  if (!a) return `PARALLEL · ${span}\nat most ${g.maxWorking[i]} agent${g.maxWorking[i] === 1 ? "" : "s"} working at once`;
+  return `${a.agent_name} · ${span}\nwork ${fmtDur(a.work[i])} · waiting ${fmtDur(a.wait[i])}\n${a.events[i]} events · ${num(a.output[i], 0)} output tokens`;
+}
+
+$("heat-mode").addEventListener("click", (e) => {
+  if (!e.target.dataset.v) return;
+  heatState.mode = e.target.dataset.v; put("heat-mode", heatState.mode);
+  document.querySelectorAll("#heat-mode button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.v === heatState.mode)));
+  paintHeat();
+});
+document.querySelectorAll("#heat-mode button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.v === heatState.mode)));
+let heatResize = 0;
+addEventListener("resize", () => { clearTimeout(heatResize); heatResize = setTimeout(() => { if (state.tab === "mesh") { paintHeat(); paintTopo(); } }, 200); });
 
 // IME-safe Enter-to-submit for Contact Stream textarea (Shift+Enter inserts newline)
 $("mesh-text").addEventListener("keydown", (e) => {
@@ -1344,9 +2186,11 @@ $("mesh-send-form").addEventListener("submit", async (e) => {
       text,
       channel: channel || null,
       squad_id: meshState.squadFilter || null,
+      needs: $("mesh-needs").value || null,
     });
     if (r.ok) {
       $("mesh-text").value = "";
+      $("mesh-needs").value = "";
       const got = r.delivered || [], lost = (r.failed || []).map((f) => f.name);
       msg.textContent = got.length
         ? `delivered to ${got.join(", ")} ✓` + (lost.length ? ` · not delivered to ${lost.join(", ")}` : "")
@@ -1364,7 +2208,7 @@ $("mesh-send-form").addEventListener("submit", async (e) => {
 });
 
 // ------------------------------------------------------------------ chats: every chat ever kept, resumable
-const chatState = { list: [], sel: null, armed: 0, timer: 0 };
+const chatState = { list: [], sel: null, armed: 0, timer: 0, nameTimer: 0 };
 const NAMED_BY = { renamed: "you (/rename)", haiku: "Haiku", auto: "auto title", prompt: "its first prompt" };
 const usd = (v) => v === null || v === undefined ? "–" : v < 0.01 ? "<$0.01" : `$${v.toFixed(2)}`;
 const ktok = (n) => !n ? "–" : n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1000)}k`;
@@ -1455,21 +2299,36 @@ $("resume").addEventListener("click", async () => {
   setTimeout(loadChats, 4000);
 });
 $("chat-q").addEventListener("input", () => { clearTimeout(chatState.timer); chatState.timer = setTimeout(loadChats, 250); });
+// one follow-up timer at most, and only while CHATS is the tab and the page is visible; show("chats") and the
+// page becoming visible again restart it
+const chatsShown = () => state.tab === "chats" && !document.hidden;
+function scheduleNameStatus(ms, withChats) {
+  clearTimeout(chatState.nameTimer);
+  chatState.nameTimer = setTimeout(() => {
+    chatState.nameTimer = 0;
+    if (!chatsShown()) return;
+    nameStatus(); if (withChats) loadChats();
+  }, ms);
+}
 async function nameStatus() {
   try {
     const n = await api("/api/names");
     $("name-status").textContent = n.running ? `naming… ${n.done} named, ${n.failed} failed, $${(n.usd || 0).toFixed(3)} so far`
       : n.done || n.failed ? `last run: ${n.done} named, ${n.failed} failed, $${(n.usd || 0).toFixed(3)}` : "";
-    if (n.running) setTimeout(() => { nameStatus(); loadChats(); }, 3000);
+    if (n.running && chatsShown()) scheduleNameStatus(3000, true);
   } catch { /* the link light already shows trouble */ }
 }
+document.addEventListener("visibilitychange", () => { if (chatsShown()) nameStatus(); });
 $("name-all").addEventListener("click", async () => {
   try { const r = await post("/api/name", { all: true }); $("name-status").textContent = `${r.queued} chats to name…`; }
   catch (err) { $("name-status").textContent = `failed: ${err.message}`; return; }
-  setTimeout(nameStatus, 1500);
+  scheduleNameStatus(1500, false);
 });
 
 // ------------------------------------------------------------------ telemetry
+state.provider = ["all", "claude", "gemini"].includes(get("provider", "all")) ? get("provider", "all") : "all";
+const pct1 = (v) => v === null || v === undefined ? "–" : `${num(v * 100, 1)}%`;
+const tokens = (v) => v === null || v === undefined ? "–" : v >= 1e6 ? `${num(v / 1e6, 1)}M` : v >= 1e4 ? `${num(v / 1e3, 0)}k` : num(v, 0);
 function cells(values, fmt, labels, max) {
   const top = max ?? Math.max(0, ...values.filter((v) => v !== null && v !== undefined));
   const box = el("span", { cls: "cells" });
@@ -1497,11 +2356,15 @@ function countUp(node, target, fmt) {
 function drawReport(r) {
   const labels = r.series.map((s) => s.bucket);
   $("tiles").replaceChildren(...r.tiles.map((t) => {
-    const fmt = (v) => v === null || v === undefined ? "–" : t.unit === "%" ? pct(v) : t.unit === "×" ? `${num(v, 0)}×` : `${num(v, 2)} ${t.unit}`;
+    const fmt = (v) => v === null || v === undefined ? "–" : t.id === "error_rate" ? pct1(v) : t.unit === "%" ? pct(v) : t.unit === "×" ? `${num(v, 0)}×` : `${num(v, 2)} ${t.unit}`;
     const big = el("div", { cls: "big" });
     countUp(big, t.value, fmt);
-    let delta = el("div", { cls: "dim", text: "no earlier period yet" });
-    if (t.value !== null && t.previous) {
+    let delta = el("div", { cls: "dim", text: t.value === null && t.id === "error_rate" ? "no tool results yet" : "no earlier period yet" });
+    if (t.value !== null && t.previous === 0) {
+      const worse = t.value > 0 && t.better === "down";
+      delta = el("div", {}, el("span", { cls: t.value === 0 ? "dim" : worse ? "bad" : "good", text: t.value === 0 ? "= flat" : `▲ up from zero` }),
+        el("span", { cls: "dim", text: ` vs ${fmt(0)}` }));
+    } else if (t.value !== null && t.previous) {
       const ch = (t.value - t.previous) / Math.abs(t.previous), better = t.better === "down" ? ch < 0 : ch > 0, flat = Math.abs(ch) < 0.02;
       delta = el("div", {}, el("span", { cls: flat ? "dim" : better ? "good" : "bad", text: flat ? "= flat" : `${ch > 0 ? "▲" : "▼"} ${Math.abs(Math.round(ch * 100))}% ${better ? "better" : "worse"}` }),
         el("span", { cls: "dim", text: ` vs ${fmt(t.previous)}` }));
@@ -1512,6 +2375,7 @@ function drawReport(r) {
   const trend = [["KB back / call", r.series.map((s) => s.kb_per_call), (v) => `${num(v, 2)} KB`],
     ["context / output", r.series.map((s) => s.ctx_per_out), (v) => `${num(v, 0)}×`],
     ["shell wait (min)", r.series.map((s) => s.shell_min), (v) => `${num(v, 1)} min`],
+    ["tool error rate", r.series.map((s) => s.error_rate), pct1],
     ["tool calls", r.series.map((s) => s.calls), (v) => num(v, 0)],
     ["output tokens", r.series.map((s) => s.output_tokens), (v) => num(v, 0)]];
   const rows = el("div", { cls: "rows" });
@@ -1520,6 +2384,8 @@ function drawReport(r) {
     rows.append(el("span", { cls: "lbl", text: name }), el("span", { cls: "val", text: fmt(last ?? null) }), cells(vals, fmt, labels), el("span", { cls: "dim", text: "latest" }));
   }
   $("trends").replaceChildren(rows, tableView(["bucket", ...trend.map((t) => t[0])], labels.map((b, i) => [b, ...trend.map(([, v, f]) => v[i] === null ? "–" : f(v[i]))])));
+
+  drawModels(r);
 
   const fams = r.families.slice(0, 12), maxCalls = Math.max(1, ...fams.map((f) => f.calls));
   const frows = el("div", { cls: "rows" });
@@ -1551,10 +2417,57 @@ function drawReport(r) {
   $("ingest-status").textContent = last ? `read ${clock(last.at)} · ${last.files} files · ${last.read} changed` : "waiting for first read";
 }
 
+// BY MODEL: one row per (provider, model); the error-rate mark compares with the period before
+function changeMark(now, before, better = "down") {
+  if (now === null || now === undefined || before === null || before === undefined) return null;
+  const diff = now - before;
+  if (Math.abs(diff) < 0.005) return el("span", { cls: "dim", text: " =", title: `previous period: ${pct1(before)}` });
+  const good = better === "down" ? diff < 0 : diff > 0;
+  return el("span", { cls: good ? "good" : "bad", text: diff > 0 ? " ▲" : " ▼", title: `previous period: ${pct1(before)}` });
+}
+function drawModels(r) {
+  const head = ["", "model", "sessions", "output", "ctx/out", "KB/call", "calls", "error rate"];
+  const right = (text, title) => el("td", { cls: "r", text, title });
+  const body = el("tbody");
+  const models = r.models || [];
+  for (const m of models) {
+    if (m.kind === "legacy") {
+      body.append(el("tr", { cls: "dim side" }, el("td"), el("td", { text: "legacy", title: "calls seeded from an inventory of pruned transcripts" }),
+        right("–"), right("–"), right("–"), right("–"), right(num(m.calls, 0)), right("–")));
+      continue;
+    }
+    const side = m.kind === "unattributed";
+    const err = m.error_rate === null ? "–" : `${pct1(m.error_rate)} (${num(m.tool_errors, 0)})`;
+    body.append(el("tr", { cls: side ? "dim side" : null },
+      el("td", {}, side ? null : providerBadge(m.provider)),
+      el("td", { cls: "model", text: side ? "unattributed" : fmtModel(m.model), title: side ? "no model recorded on these calls or messages" : m.model }),
+      right(num(m.sessions, 0)), right(tokens(m.output_tokens), `${num(m.output_tokens, 0)} output tokens`),
+      right(m.ctx_per_out === null ? "–" : `${num(m.ctx_per_out, 0)}×`, m.previous.ctx_per_out === null ? null : `previous period: ${num(m.previous.ctx_per_out, 0)}×`),
+      right(m.kb_per_call === null ? "–" : num(m.kb_per_call, 2), m.previous.kb_per_call === null ? null : `previous period: ${num(m.previous.kb_per_call, 2)} KB`),
+      right(num(m.calls, 0)),
+      el("td", { cls: "r" }, err, changeMark(m.error_rate, m.previous.error_rate))));
+  }
+  const kids = [];
+  if (!models.length) kids.push(el("p", { cls: "dim", text: "no model activity in this period" + (state.provider === "all" ? "" : ` for ${state.provider}`) }));
+  else {
+    if (state.provider === "all" && (r.providers || []).length > 1) {
+      kids.push(el("div", { cls: "dim prov-sum" }, ...r.providers.flatMap((p) => [providerBadge(p.provider),
+        ` ${tokens(p.output_tokens)} out · ${num(p.calls, 0)} calls · ${pct1(p.error_rate)} errors   `])));
+    }
+    kids.push(el("div", { cls: "scroll" }, el("table", { cls: "models" }, el("thead", {}, el("tr", {}, ...head.map((h, i) => el("th", { cls: i > 1 ? "r" : null, text: h })))), body)));
+    if (models.some((m) => m.kind !== "model")) {
+      kids.push(el("p", { cls: "dim", text: "dimmed: unattributed = calls or replies with no model recorded; legacy = calls seeded from pruned transcripts (count only, no sizes, results or tokens). error rate = errors / calls whose result arrived; ▲▼ vs the period before" }));
+    }
+  }
+  $("models").replaceChildren(...kids);
+}
+
 async function loadReport() {
   document.querySelectorAll("#days button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.v === state.days)));
   document.querySelectorAll("#bucket button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.v === state.bucket)));
-  try { state.report = await api(`/api/report?days=${state.days}&bucket=${state.bucket}`); drawReport(state.report); }
+  document.querySelectorAll("#provider button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.v === state.provider)));
+  const prov = state.provider === "all" ? "" : `&provider=${state.provider}`;
+  try { state.report = await api(`/api/report?days=${state.days}&bucket=${state.bucket}${prov}`); drawReport(state.report); }
   catch (err) { $("ingest-status").textContent = `report unavailable: ${err.message}`; }
 }
 $("days").addEventListener("click", (e) => {
@@ -1564,6 +2477,7 @@ $("days").addEventListener("click", (e) => {
   loadReport();
 });
 $("bucket").addEventListener("click", (e) => { if (e.target.dataset.v) { state.bucket = e.target.dataset.v; put("bucket", state.bucket); loadReport(); } });
+$("provider").addEventListener("click", (e) => { if (e.target.dataset.v) { state.provider = e.target.dataset.v; put("provider", state.provider); loadReport(); } });
 $("rescan").addEventListener("click", async () => {
   $("rescan").textContent = "[READING…]";
   try { await post("/api/ingest", {}); } catch { /* shown by the report */ }
@@ -1582,6 +2496,252 @@ async function loadLog() {
     : [el("li", { cls: "dim", text: "nothing spawned, killed or said yet" })]));
 }
 
+// ------------------------------------------------------------------ operator inbox: what agents send the human
+const inboxState = {
+  counts: null, messages: [], threads: [], sel: null, squad: "", sig: "", feedSig: "", notifySig: "",
+  notify: get("notify", "0") === "1", notified: new Set(JSON.parse(get("notified", "[]"))),
+};
+const canNotify = () => "Notification" in window;
+
+// header badge, the blocking alert and notifications: polled every 5 s on every tab
+async function loadInboxCounts() {
+  let c;
+  try { c = await api("/api/operator/inbox?limit=0"); } catch { return; }
+  inboxState.counts = c;
+  const btn = $("inbox-btn");
+  btn.textContent = `[✉ ${c.unread}]`;
+  btn.className = `inbox-btn${c.open.blocking ? " crit" : c.open.reply ? " amber" : c.unread ? " hi" : ""}`;
+  btn.setAttribute("aria-label", `operator inbox, ${c.unread} unread, ${c.open.reply} waiting for a reply, ${c.open.blocking} blocking`);
+  if (c.open.blocking) {
+    setAlert("operator-blocking", {
+      level: "crit", text: `▲ blocked on operator ${age(c.oldest_blocking_ts)}`,
+      title: `${c.open.blocking} agent message${c.open.blocking === 1 ? "" : "s"} cannot go on until you answer: open the inbox (7)`,
+      onClick: () => show("inbox"),
+    });
+    document.title = "(!) ALMANAC";
+    const notifySig = `${c.latest_id}|${c.open.blocking}`;
+    if (notifySig !== inboxState.notifySig) { inboxState.notifySig = notifySig; notifyBlocking(); }
+  } else {
+    clearAlert("operator-blocking");
+    document.title = "Almanac";
+  }
+}
+
+// one browser notification per blocking message id, only once the operator turned them on from a click
+async function notifyBlocking() {
+  if (!inboxState.notify || !canNotify() || Notification.permission !== "granted") return;
+  let doc;
+  try { doc = await api("/api/operator/inbox?limit=300"); } catch { return; }
+  for (const m of doc.messages) {
+    if (m.needs !== "blocking" || m.answered_ts || !OPERATOR.has(m.to_name) || inboxState.notified.has(m.id)) continue;
+    inboxState.notified.add(m.id);
+    const n = new Notification(`${m.from_name} is blocked on you`, { body: m.body.slice(0, 200), tag: `almanac-${m.id}` });
+    n.onclick = () => { window.focus(); show("inbox"); selectThread(threadKey(m)); n.close(); };
+  }
+  put("notified", JSON.stringify([...inboxState.notified].slice(-500)));
+}
+
+function paintNotifyToggle() {
+  const b = $("inbox-notify");
+  b.disabled = !canNotify();
+  b.title = !canNotify() ? "this browser has no notifications"
+    : canNotify() && Notification.permission === "denied" ? "notifications are blocked for this page in the browser's site settings"
+    : "a browser notification when an agent is blocked on you";
+  const on = inboxState.notify && canNotify() && Notification.permission === "granted";
+  b.textContent = on ? "[NOTIFY ◆]" : "[NOTIFY ◇]";
+  b.setAttribute("aria-pressed", String(on));
+}
+$("inbox-notify").addEventListener("click", async () => {
+  if (!canNotify()) return;
+  if (inboxState.notify) inboxState.notify = false;
+  else inboxState.notify = (await Notification.requestPermission()) === "granted";   // asked only from this click
+  put("notify", inboxState.notify ? "1" : "0");
+  paintNotifyToggle();
+  inboxState.notifySig = "";
+  if (inboxState.notify) loadInboxCounts();
+});
+
+// a thread is everything between the operator and one other party in one squad
+const threadKey = (m) => `${OPERATOR.has(m.from_name) ? m.to_name : m.from_name}\u0000${m.squad_id || ""}`;
+function buildThreads(messages) {
+  const by = new Map();
+  for (const m of messages) {
+    const k = threadKey(m);
+    const [other, squad] = k.split("\u0000");
+    const t = by.get(k) || { key: k, other, squad, session: null, msgs: [], unread: 0, open: [], last: 0 };
+    t.msgs.push(m);
+    // handles repeat across squads: address the other party by its newest session id, never by name alone
+    const sid = OPERATOR.has(m.from_name) ? m.to_session : m.from_session;
+    if (sid && m.ts >= (t.sessionTs || 0)) { t.session = sid; t.sessionTs = m.ts; }
+    t.last = Math.max(t.last, m.ts);
+    if (OPERATOR.has(m.to_name) && !m.read_ts) t.unread += 1;
+    if (m.needs && !m.answered_ts) t.open.push(m);
+    by.set(k, t);
+  }
+  return [...by.values()].sort((a, b) => b.last - a.last);
+}
+
+async function loadInbox() {
+  const sq = inboxState.squad;
+  let doc;
+  try { doc = await api(`/api/operator/inbox?limit=300${sq ? `&squad=${encodeURIComponent(sq)}` : ""}`); }
+  catch (err) { $("inbox-summary").textContent = `inbox unavailable: ${err.message}`; return; }
+  // squads are re-read on entering INBOX (show() sets the flag), so a squad launched since shows up in the filter
+  if (inboxState.squadsStale || !state.squads.length) {
+    try { state.squads = (await api("/api/squads?limit=50")).squads || []; inboxState.squadsStale = false; } catch { /* the filter can wait */ }
+  }
+  if (!state.roles.length) await loadRoles();
+  const sqSel = $("inbox-squad");
+  const ids = state.squads.map((s) => s.id);
+  if (sq && !ids.includes(sq)) ids.push(sq);             // the chosen squad stays choosable while it is filtered on
+  const sqSig = ids.join(",") + "|" + state.squads.map((s) => s.name).join(",");
+  if (sqSel.dataset.sig !== sqSig) {
+    sqSel.replaceChildren(el("option", { value: "", text: "all squads" }), ...ids.map((id) => {
+      const s = state.squads.find((x) => x.id === id);
+      return el("option", { value: id, text: s ? `${s.name} (${s.id})` : id });
+    }));
+    sqSel.dataset.sig = sqSig;
+  }
+  if (document.activeElement !== sqSel) sqSel.value = sq;
+  inboxState.messages = doc.messages;
+  inboxState.threads = buildThreads(doc.messages);
+  $("inbox-summary").textContent = `${inboxState.threads.length} thread${inboxState.threads.length === 1 ? "" : "s"} · `
+    + `${doc.unread} unread · ${doc.open.blocking} blocking · ${doc.open.reply} waiting for a reply`;
+  const sig = JSON.stringify(inboxState.threads.map((t) => [t.key, t.msgs.length, t.unread, t.open.length, t.msgs.at(-1)?.answered_ts]))
+    + inboxState.sel + Math.floor(Date.now() / 30000);    // ages on badges move: repaint at least every 30 s
+  if (sig === inboxState.sig) return;
+  inboxState.sig = sig;
+  paintThreads();
+  paintThread();
+}
+
+function paintThreads() {
+  const list = $("inbox-threads");
+  const empty = !inboxState.threads.length;
+  $("inbox-empty").hidden = !empty;
+  if (empty) {
+    const pagers = state.roles.filter((r) => r.may_page_operator).map((r) => r.id);
+    $("inbox-empty").textContent = `nothing to or from the operator yet. Roles that may page you: ${pagers.join(", ") || "none"}; `
+      + "any agent may answer a message you send it.";
+  }
+  list.replaceChildren(...inboxState.threads.map((t) => {
+    const blocking = t.open.filter((m) => m.needs === "blocking" && OPERATOR.has(m.to_name));
+    const replying = t.open.filter((m) => m.needs === "reply" && OPERATOR.has(m.to_name));
+    const oldest = blocking.length ? Math.min(...blocking.map((m) => m.ts)) : 0;
+    const last = t.msgs.at(-1);
+    const btn = el("button", { type: "button", cls: `thread${t.key === inboxState.sel ? " sel" : ""}`, "aria-current": t.key === inboxState.sel ? "true" : null },
+      el("span", { cls: "thread-head" },
+        el("span", { cls: OPERATOR.has(last.from_name) ? "cyan" : "hi", text: t.other }),
+        t.squad ? el("span", { cls: "dim", text: ` · ${t.squad}` }) : null,
+        el("span", { cls: "grow" }),
+        t.unread ? el("span", { cls: "unread", text: `${t.unread} new` }) : null,
+        blocking.length ? el("span", { cls: "flag blocking", text: `BLOCKING ${age(oldest)}` })
+          : replying.length ? el("span", { cls: "flag reply", text: "REPLY" }) : null,
+        el("span", { cls: "dim", text: ` ${when(last.ts)}` })),
+      el("span", { cls: "thread-last dim", text: `${OPERATOR.has(last.from_name) ? "you: " : ""}${last.body}`.replace(/\s+/g, " ").slice(0, 90) }));
+    btn.addEventListener("click", () => selectThread(t.key));
+    return el("li", {}, btn);
+  }));
+}
+
+function selectThread(key) {
+  inboxState.sel = key;
+  inboxState.sig = ""; inboxState.feedSig = "";
+  paintThreads(); paintThread();
+  $("inbox-text").focus();
+}
+
+async function markThreadRead(t) {
+  const ids = t.msgs.filter((m) => OPERATOR.has(m.to_name) && !m.read_ts).map((m) => m.id);
+  if (!ids.length) return;
+  try { await post("/api/operator/read", { ids }); } catch { return; }
+  const now = Date.now() / 1000;
+  t.msgs.forEach((m) => { if (ids.includes(m.id)) m.read_ts = now; });
+  t.unread = 0;
+  loadInboxCounts();
+}
+
+function paintThread() {
+  const t = inboxState.threads.find((x) => x.key === inboxState.sel);
+  const form = $("inbox-form"), feed = $("inbox-feed");
+  form.hidden = !t;
+  if (!t) {
+    $("inbox-head").replaceChildren(el("span", { cls: "dim", text: inboxState.threads.length ? "select a thread on the left" : "" }));
+    feed.replaceChildren();
+    return;
+  }
+  $("inbox-thread-box").setAttribute("data-title", `THREAD // ${t.other}`.slice(0, 56));
+  const peer = (meshState.peers || []).find((p) => t.session && p.session_id === t.session)
+    || (t.session ? null : (meshState.peers || []).find((p) => p.name === t.other));
+  $("inbox-head").replaceChildren(...[      // replaceChildren would print a null as "null"
+    el("span", { cls: "title", text: t.other }),
+    t.squad ? el("span", { cls: "dim", text: ` · squad ${t.squad}` }) : null,
+    t.session ? el("span", { cls: "dim", text: ` · session ${t.session.slice(0, 8)}`, title: t.session }) : null,
+    el("span", { cls: "dim", text: ` · ${t.msgs.length} message${t.msgs.length === 1 ? "" : "s"}` }),
+    peer ? el("span", { cls: "dim", text: ` · ${peer.status || "idle"}` }) : null].filter(Boolean));
+  $("inbox-to").textContent = t.session ? `${t.other} (${t.session.slice(0, 8)})` : t.other;
+  const sig = JSON.stringify(t.msgs.map((m) => [m.id, m.answered_ts])) + Math.floor(Date.now() / 30000);
+  if (sig !== inboxState.feedSig) {
+    inboxState.feedSig = sig;
+    const atBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 40;
+    feed.replaceChildren(...t.msgs.map((m) => {
+      const mine = OPERATOR.has(m.from_name);
+      const resolve = m.needs && !m.answered_ts
+        ? el("button", { type: "button", cls: "btn", text: "[RESOLVE ✓]", title: "close this flag by hand (no reply needed)" }) : null;
+      resolve?.addEventListener("click", async () => {
+        resolve.disabled = true;
+        try {
+          const r = await post("/api/operator/resolve", { id: m.id });
+          if (r.ok === false) $("inbox-msg").textContent = `refused: ${r.error}`;
+        } catch (err) { $("inbox-msg").textContent = `failed: ${err.message}`; }
+        inboxState.sig = ""; await loadInbox(); loadInboxCounts();
+      });
+      return el("li", { cls: mine ? "from-op" : "" },
+        el("div", { cls: "msg-head" },
+          el("span", { cls: "dim", text: clock(m.ts) }),
+          el("span", { cls: mine ? "cyan" : "hi", text: mine ? "you" : m.from_name }),
+          el("span", { cls: "dim", text: "──▸" }),
+          el("span", { cls: "dim", text: OPERATOR.has(m.to_name) ? "you" : m.to_name }),
+          m.channel ? el("span", { cls: "violet", text: m.channel }) : null,
+          needsBadge(m), resolve),
+        el("div", { cls: "msg-body", text: m.body }));
+    }));
+    if (atBottom || feed.dataset.key !== t.key) feed.scrollTop = feed.scrollHeight;
+    feed.dataset.key = t.key;
+  }
+  if (t.unread && state.tab === "inbox" && !document.hidden) markThreadRead(t);
+}
+
+$("inbox-squad").addEventListener("change", (e) => { inboxState.squad = e.target.value; inboxState.sig = ""; loadInbox(); });
+$("inbox-refresh").addEventListener("click", () => { inboxState.sig = ""; loadInbox(); loadInboxCounts(); });
+$("inbox-btn").addEventListener("click", () => show("inbox"));
+$("inbox-text").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    if (e.isComposing || e.keyCode === 229) return;
+    $("inbox-form").requestSubmit();
+  }
+});
+$("inbox-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const t = inboxState.threads.find((x) => x.key === inboxState.sel);
+  const text = $("inbox-text").value.trim(), msg = $("inbox-msg"), btn = $("inbox-send");
+  if (!t || !text) return;
+  btn.disabled = true; msg.textContent = `sending to ${t.other}…`;
+  try {
+    const r = await post("/api/mesh/send", { to: t.session || t.other, text, squad_id: t.squad || null, needs: $("inbox-needs").value || null });
+    if (r.ok) {
+      $("inbox-text").value = ""; $("inbox-needs").value = "";
+      msg.textContent = (r.delivered || []).length ? `delivered to ${r.delivered.join(", ")} ✓` : `nobody received it: ${t.other} is not live`;
+      inboxState.sig = ""; await loadInbox(); loadInboxCounts();
+    } else {
+      msg.textContent = `not delivered: ${r.error || "refused"}${/no live|not found|no session|LookupError/i.test(r.error || "") ? " (the agent is no longer live)" : ""}`;
+    }
+  } catch (err) { msg.textContent = `failed: ${err.message}`; }
+  btn.disabled = false;
+  $("inbox-text").focus();
+});
+
 // ------------------------------------------------------------------ tabs, keys, loops
 function show(tab) {
   state.tab = tab;
@@ -1590,13 +2750,14 @@ function show(tab) {
     b.setAttribute("aria-selected", String(sel));
     if (sel) b.scrollIntoView({ block: "nearest", inline: "nearest" });
   });
-  for (const id of ["fleet", "gallery", "mesh", "chats", "telemetry", "log"]) $(id).hidden = id !== tab;
+  for (const id of ["fleet", "gallery", "mesh", "chats", "telemetry", "log", "inbox"]) $(id).hidden = id !== tab;
   if (tab === "chats") { loadChats(); nameStatus(); }
   if (tab === "telemetry") loadReport();
   if (tab === "log") loadLog();
+  if (tab === "inbox") { inboxState.sig = ""; inboxState.squadsStale = true; loadInbox(); paintNotifyToggle(); }
   if (tab === "fleet") loadFleet();
   if (tab === "gallery") loadFleet().then(loadGallery);
-  if (tab === "mesh") { loadMesh(); if (meshState.selPeer) loadPeerContext(); }
+  if (tab === "mesh") { loadMesh().then(() => { loadHeat(true); loadTopo(true); }); if (meshState.selPeer) loadPeerContext(); }
 }
 document.querySelectorAll(".tabs [role=tab]").forEach((b) => b.addEventListener("click", () => show(b.dataset.tab)));
 $("help-btn").addEventListener("click", () => { $("help").hidden = !$("help").hidden; });
@@ -1616,6 +2777,7 @@ addEventListener("keydown", (e) => {
     case "4": show("chats"); break;
     case "5": show("telemetry"); break;
     case "6": show("log"); break;
+    case "7": show("inbox"); break;
     case "m": if (state.tab === "fleet" && state.detail?.process?.role === "session") { e.preventDefault(); editSelectedSessionModel(); } break;
     case "s": if (state.tab === "fleet") { e.preventDefault(); setDrawer("spawn-drawer", "toggle-spawn", $("spawn-drawer").hidden); } break;
     case "p": if (state.tab === "fleet" && state.detail?.process?.role === "session") { togglePin(state.detail.process); loadDetail(); loadFleet(); } break;
@@ -1625,11 +2787,13 @@ addEventListener("keydown", (e) => {
       setDrawer("spawn-drawer", "toggle-spawn", false);
       setDrawer("squad-drawer", "toggle-squad", false);
       $("roles-drawer").hidden = true;
+      closeAlertBox();
       break;
     case "r":
       state.tab === "chats" ? loadChats()
         : state.tab === "telemetry" ? loadReport()
         : state.tab === "log" ? loadLog()
+        : state.tab === "inbox" ? ((inboxState.sig = ""), (inboxState.squadsStale = true), loadInbox(), loadInboxCounts())
         : state.tab === "gallery" ? loadFleet().then(loadGallery)
         : state.tab === "mesh" ? (loadMesh(), meshState.selPeer && loadPeerContext())
         : loadFleet();
@@ -1640,6 +2804,7 @@ addEventListener("keydown", (e) => {
     case "/":
       if (state.tab === "chats") { e.preventDefault(); $("chat-q").focus(); }
       else if (state.tab === "mesh") { e.preventDefault(); $("mesh-text").focus(); }
+      else if (state.tab === "inbox" && !$("inbox-form").hidden) { e.preventDefault(); $("inbox-text").focus(); }
       else if (!$("say").hidden) { e.preventDefault(); $("say-text").focus(); }
       break;
     case "x": if (state.tab === "fleet") kill(); break;
@@ -1654,16 +2819,34 @@ if (!reduced) setInterval(() => {
   state.frame += 1;
   document.querySelectorAll("[data-spin]").forEach((n) => { n.textContent = SPIN[state.frame % SPIN.length]; });
 }, 90);
-setInterval(() => {
-  if (document.hidden) return;
-  if (state.tab === "fleet") { loadFleet(); loadDetail(); }
-  if (state.tab === "gallery") loadFleet().then(loadGallery);
-  if (state.tab === "mesh") { loadMesh(); if (meshState.selPeer) loadPeerContext(); }
+// the 2 s poll skips a tick while the previous tick's requests are still out (a slow server would otherwise stack
+// them); a tick stuck past POLL_STUCK_MS no longer blocks the next. On the other tabs the fleet is still read every
+// 10 s, so a pinned or squad session that starts and exits there gets its ended gallery tile (trackSessions).
+const POLL_STUCK_MS = 20000;
+const poll = { busy: 0, tick: 0 };
+setInterval(async () => {
+  if (document.hidden || (poll.busy && Date.now() - poll.busy < POLL_STUCK_MS)) return;
+  const tab = state.tab, jobs = [];
+  poll.tick += 1;
+  if (tab === "fleet") jobs.push(loadFleet(), loadDetail());
+  else if (tab === "gallery") jobs.push(loadFleet().then(loadGallery));
+  else if (poll.tick % 5 === 0) jobs.push(loadFleet());
+  if (tab === "mesh") { jobs.push(loadMesh()); if (meshState.selPeer) jobs.push(loadPeerContext()); }
+  if (tab === "inbox") jobs.push(loadInbox());
+  if (!jobs.length) return;
+  const mine = poll.busy = Date.now();
+  try { await Promise.allSettled(jobs); } finally { if (poll.busy === mine) poll.busy = 0; }
 }, 2000);
+setInterval(() => { if (!document.hidden) loadInboxCounts(); }, 5000);
+setInterval(() => { if (!document.hidden && state.tab === "mesh") loadHeat(true); }, 30000);
 setInterval(() => { if (!document.hidden && state.tab === "log") loadLog(); }, 5000);
+setInterval(() => { if (!document.hidden) loadHealth(); }, 15000);
 setInterval(() => { if (!document.hidden && state.tab === "telemetry") loadReport(); }, 5 * 60 * 1000);
 
 boot();
+firstHealth();
+loadInboxCounts();
+paintNotifyToggle();
 loadModels();
 loadRoles();
 loadFleet().then(() => {
