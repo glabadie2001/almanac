@@ -208,8 +208,11 @@ function mdTableAt(lines, i) {                        // a header row with a pip
   const rule = mdCells(lines[i + 1]);
   return rule.every((c) => /^:?-+:?$/.test(c)) && rule.length === mdCells(lines[i]).length;
 }
-function mdHref(raw) {                                // only http(s), and only what new URL() accepts
-  const u = raw.trim().split(/\s+/)[0].replace(/^<(.*)>$/, "$1");
+// only http(s), only what new URL() accepts, and no whitespace: a target with a space is not a link, so an unclosed
+// "[x](https://..." in prose cannot swallow the words up to some later ")"; the text then stays as written
+function mdHref(raw) {
+  const u = raw.trim().replace(/^<(.*)>$/, "$1");
+  if (!u || /\s/.test(u)) return null;
   try {
     const url = new URL(u);
     return url.protocol === "http:" || url.protocol === "https:" ? url.href : null;
@@ -309,13 +312,15 @@ function mdList(lines, i) {
 // inline: `code`, **bold** / __bold__, *italic* / _italic_ (an underscore inside a word stays literal, for
 // snake_case paths), [text](http-url), ![alt](http-url) as a link, \-escapes, and a newline as a break
 function mdInline(s, depth = 0) {
-  const out = [], none = new Set();
-  let buf = "", i = 0;
+  const out = [], seen = new Map();
+  let buf = "", i = 0, badClose = -1;
   const push = (node) => { if (buf) { out.push({ t: "text", v: buf }); buf = ""; } out.push(node); };
-  const find = (tok, from) => {                       // `from` only grows for a given tok, so a miss stays a miss
-    if (none.has(tok)) return -1;
-    const k = s.indexOf(tok, from);
-    if (k < 0) none.add(tok);
+  // `from` only grows for a given tok, so a miss stays a miss and a hit at or after `from` is still the first one:
+  // each tok's string is scanned once overall, however many openers ask (a run of "[" before one "]" stays linear)
+  const find = (tok, from) => {
+    let k = seen.get(tok);
+    if (k === -1) return -1;
+    if (k === undefined || k < from) { k = s.indexOf(tok, from); seen.set(tok, k); }
     return k;
   };
   const word = (c) => !!c && /[A-Za-z0-9]/.test(c);
@@ -358,7 +363,7 @@ function mdInline(s, depth = 0) {
     }
     if (ch === "[" || (ch === "!" && s[i + 1] === "[")) {
       const o = ch === "!" ? i + 1 : i, close = find("]", o + 1);
-      if (close >= 0 && s[close + 1] === "(") {
+      if (close >= 0 && close !== badClose && s[close + 1] === "(") {   // a "](" already refused is not tried again
         const end = find(")", close + 2);
         const href = end >= 0 ? mdHref(s.slice(close + 2, end)) : null;
         if (href && depth < MD_MAX_DEPTH) {           // an image is only ever a link: nothing is fetched
@@ -367,6 +372,7 @@ function mdInline(s, depth = 0) {
           i = end + 1;
           continue;
         }
+        badClose = close;
       }
       buf += s.slice(i, o + 1); i = o + 1;
       continue;

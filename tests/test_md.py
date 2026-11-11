@@ -24,6 +24,20 @@ def parse(*texts):
     return out if len(texts) > 1 else out[0]
 
 
+def timed(*texts):
+    """Milliseconds node spends parsing each text, measured inside node (its start-up is not counted)."""
+    src = APP.read_text(encoding="utf-8")
+    part = src[src.index("// md:begin"):src.index("// md:end")]
+    script = part + ("\nconst input = JSON.parse(require('fs').readFileSync(0, 'utf8'));"
+                     "\nprocess.stdout.write(JSON.stringify(input.map((t) => { const t0 = performance.now(); mdParse(t);"
+                     " return performance.now() - t0; })));")
+    run = subprocess.run([NODE, "-e", script], input=json.dumps(texts), capture_output=True, encoding="utf-8",
+                         timeout=60)
+    if run.returncode:
+        raise AssertionError(run.stderr)
+    return json.loads(run.stdout)
+
+
 def walk(node):
     """Every dict in a parsed tree."""
     if isinstance(node, list):
@@ -113,6 +127,10 @@ class MarkdownTests(unittest.TestCase):
             "| a | b |\n|---|---|\n| 1 |\n| 1 | 2 | 3 |",
             "**bold never closes and `code never closes and [link never",
         )
+        prose = "See [spec](https://example.com/doc and remember (important) to run tests"
+        swallowed = parse(prose)
+        self.assertNotIn("a", kinds(swallowed), "a target with a space is not a link")
+        self.assertEqual(text_of(swallowed), prose, "nothing up to the later ')' is dropped")
         self.assertEqual(fence, [{"t": "code", "lang": "", "text": "no closing fence\n# not a heading"}])
         self.assertEqual([len(r) for r in ragged[0]["rows"]], [2, 3], "short rows padded, long rows keep their cells")
         self.assertEqual(text_of(ragged[0]["rows"][1][2]), "3")
@@ -130,6 +148,14 @@ class MarkdownTests(unittest.TestCase):
         self.assertEqual(text_of(brackets), "[" * 5000)
         self.assertEqual(text_of(ticks), "a " + "`" * 3000 + "x")
         self.assertEqual(text_of(unders), "_a" * 3000)
+
+    def test_bracket_runs_are_linear(self):
+        texts = ("[" * 20000 + "]", "[" * 5000 + "](not-a-url)", "[" * 100000 + "]")
+        ms = timed(*texts)
+        self.assertLess(max(ms), 1000, f"parse times {ms} ms")   # a hang guard: about 5 ms at 100,000 brackets
+        for text, tree in zip(texts, parse(*texts)):
+            self.assertNotIn("a", kinds(tree))
+            self.assertEqual(text_of(tree), text, "every bracket stays as written")
 
 
 if __name__ == "__main__":

@@ -431,3 +431,8 @@ details table td:first-child, details table th:first-child { text-align: left; }
 /* a stalled agent (stopped on an API error) in FLEET and the MESH roster; a notice from Almanac in the inbox */
 .flag.stalled { color: var(--amber); margin-left: 0; font-weight: bold; }
 #inbox-feed li.from-sys { box-shadow: inset 2px 0 0 var(--amber); padding-left: 6px; }
+/* a flag chip after a rendered message in a feed line stays on the message's first line, at its right */
+.feed li:has(> .md ~ .flag) { display: flex; align-items: baseline; padding-left: 0; text-indent: 0; }
+.feed li:has(> .md ~ .flag)::before { flex: none; }
+.feed li:has(> .md ~ .flag) > .md { flex: 1; width: auto; min-width: 0; }
+.feed li:has(> .md ~ .flag) > .flag { flex: none; margin-left: 6px; }
