@@ -50,7 +50,7 @@ class AddDirsTests(ElasticRig):
 
     def test_the_charter_names_the_folders_for_gemini_only(self):
         kw = dict(agent_name="r", role_title="R", role_prompt="p", almanac_url="u", add_dirs=["C:\\docs"])
-        self.assertIn("you may read these folders: `C:\\docs`.", spawner.build_mesh_charter(provider="gemini", **kw))
+        self.assertIn("these folders are also part of your workspace: `C:\\docs`.", spawner.build_mesh_charter(provider="gemini", **kw))
         self.assertNotIn("C:\\docs", spawner.build_mesh_charter(provider="claude", **kw))
 
     def test_an_agent_cannot_name_folders(self):

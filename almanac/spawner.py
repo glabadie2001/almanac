@@ -174,7 +174,7 @@ def build_mesh_charter(
         lines.append("- **Shell**: your runner only permits these exact command lines, typed character for character: "
                      + ", ".join(f"`{c}`" for c in allowed_commands) + "; anything else is denied, so do not try variants.")
     if add_dirs and provider == "gemini":             # agy `--add-dir`; Claude agents already read outside their cwd
-        lines.append("- **Folders**: besides your workspace you may read these folders: "
+        lines.append("- **Folders**: these folders are also part of your workspace: "
                      + ", ".join(f"`{d}`" for d in add_dirs) + ".")
     if teammates:
         lines += ["", "## Initial Squad Roster"]
