@@ -118,6 +118,16 @@ function effortBadge(e) {
   return el("span", { cls: `effort ${norm}`, title: `effort: ${norm}` },
     el("span", { cls: "lvl", text: "▮".repeat(Math.max(0, n)) }), el("span", { cls: "off", text: "▯".repeat(Math.max(0, 5 - n)) }), ` ${fmtEffortLabel(norm)}`);
 }
+// elastic roles: `models` / `efforts` list what mesh_spawn may choose besides the defaults (absent or [] = fixed)
+const elasticAlt = (list, own) => (Array.isArray(list) ? list.filter((x) => x !== own) : []);
+const elasticMore = (list, own) => {
+  const n = elasticAlt(list, own).length;
+  return n ? el("span", { cls: "dim", text: ` +${n}` }) : null;
+};
+function elasticTip(r) {
+  const m = Array.isArray(r.models) && r.models.length ? r.models : null, e = Array.isArray(r.efforts) && r.efforts.length ? r.efforts : null;
+  return m || e ? [`models: ${(m || [r.model || "default"]).join(", ")}`, `efforts: ${(e || [r.effort || "default"]).join(", ")}`].join("\n") : null;
+}
 const keyOf = (p) => `${p.pid}:${p.created}`;
 const active = (p) => !!p.status && p.status !== "idle" && p.status !== "ended";
 function togglePin(p) {
@@ -830,8 +840,8 @@ function syncRoleControls() {
           r.may_restart ? el("span", { cls: "red", text: " ⟳", title: "may restart Almanac" }) : null),
         el("td", {}, providerBadge(r.provider)),
         el("td", { text: r.title }),
-        el("td", { cls: "model", text: fmtModel(r.model) }),
-        el("td", {}, effortBadge(r.effort)),
+        el("td", { cls: "model", title: elasticTip(r) }, fmtModel(r.model), elasticMore(r.models, r.model)),
+        el("td", { title: elasticTip(r) }, effortBadge(r.effort), elasticMore(r.efforts, r.effort)),
         el("td", { cls: "dim", text: r.workspace_mode || "shared" }),
       );
       tr.addEventListener("click", () => populateRoleForm(r));
@@ -1682,6 +1692,8 @@ function populateRoleForm(r) {
   $("role-grow").checked = !!r?.may_spawn;
   $("role-restart").checked = !!r?.may_restart;
   $("role-channels").value = (r?.channels || []).join(", ");
+  $("role-models").value = (r?.models || []).join(", ");
+  $("role-efforts").value = (r?.efforts || []).join(", ");
   $("role-commands").value = (r?.allowed_commands || []).join("\n");
   $("role-dirs").value = (r?.add_dirs || []).join("\n");
   $("role-msg").textContent = r ? `editing ${r.id}` : "";
@@ -1712,6 +1724,10 @@ $("role-save").closest("form").addEventListener("submit", async (e) => {
       may_spawn: $("role-grow").checked,
       may_restart: $("role-restart").checked,          // a server without the flag ignores the key
       channels: $("role-channels").value.split(",").map((s) => s.trim()).filter(Boolean),
+      // what mesh_spawn may choose besides the defaults, which are always allowed; [] fixes the role at them. Any
+      // refusal from the door shows in #role-msg. A server without the fields ignores them.
+      models: $("role-models").value.split(",").map((s) => s.trim()).filter(Boolean),
+      efforts: $("role-efforts").value.split(",").map((s) => s.trim()).filter(Boolean),
       allowed_commands: $("role-commands").value,
       add_dirs: $("role-dirs").value,
     });
