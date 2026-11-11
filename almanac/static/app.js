@@ -124,9 +124,10 @@ const elasticMore = (list, own) => {
   const n = elasticAlt(list, own).length;
   return n ? el("span", { cls: "dim", text: ` +${n}` }) : null;
 };
-function elasticTip(r) {
-  const m = Array.isArray(r.models) && r.models.length ? r.models : null, e = Array.isArray(r.efforts) && r.efforts.length ? r.efforts : null;
-  return m || e ? [`models: ${(m || [r.model || "default"]).join(", ")}`, `efforts: ${(e || [r.effort || "default"]).join(", ")}`].join("\n") : null;
+function elasticTip(r) {                              // the whole allowed set: the default, always allowed, then the rest
+  const ma = elasticAlt(r.models, r.model), ea = elasticAlt(r.efforts, r.effort);
+  return ma.length || ea.length
+    ? [`models: ${[r.model || "default", ...ma].join(", ")}`, `efforts: ${[r.effort || "default", ...ea].join(", ")}`].join("\n") : null;
 }
 const keyOf = (p) => `${p.pid}:${p.created}`;
 const active = (p) => !!p.status && p.status !== "idle" && p.status !== "ended";
@@ -834,14 +835,16 @@ function syncRoleControls() {
   const tbody = $("roles-table")?.querySelector("tbody");
   if (tbody) {
     tbody.replaceChildren(...state.roles.map((r) => {
+      const tip = elasticTip(r), badge = effortBadge(r.effort);
+      if (tip) badge.removeAttribute("title");          // the badge's own "effort: high" would hide the cell's list
       const tr = el("tr", {},
         el("td", {}, r.id, r.may_page_operator ? el("span", { cls: "amber", text: " ✉", title: "may page the operator" }) : null,
           r.may_spawn ? el("span", { cls: "cyan", text: " ⊕", title: "may add squad members" }) : null,
           r.may_restart ? el("span", { cls: "red", text: " ⟳", title: "may restart Almanac" }) : null),
         el("td", {}, providerBadge(r.provider)),
         el("td", { text: r.title }),
-        el("td", { cls: "model", title: elasticTip(r) }, fmtModel(r.model), elasticMore(r.models, r.model)),
-        el("td", { title: elasticTip(r) }, effortBadge(r.effort), elasticMore(r.efforts, r.effort)),
+        el("td", { cls: "model", title: tip }, fmtModel(r.model), elasticMore(r.models, r.model)),
+        el("td", { title: tip }, badge, elasticMore(r.efforts, r.effort)),
         el("td", { cls: "dim", text: r.workspace_mode || "shared" }),
       );
       tr.addEventListener("click", () => populateRoleForm(r));
