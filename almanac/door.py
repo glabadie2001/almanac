@@ -1468,6 +1468,9 @@ def _owner(service, squad: str, handle) -> dict:
     found = service.store.spawned(squad_id=squad, agent_name=handle, limit=1) if handle else []
     if not found:
         raise ValueError(f"owner {handle!r}: no member of squad {squad} by that name")
+    if found[0].get("retired_ts"):
+        raise _refused(409, f"owner {handle!r} was retired when its task was accepted (its role is fresh-per-task): "
+                            "put a fresh member on the task with mesh_spawn(ref=..., task=...)")
     return found[0]
 
 
@@ -1604,9 +1607,11 @@ def file_object(service, agent, caller, body: dict) -> dict:
     return dict(object=object_docs(service, [row], body=True)[0], delivered=delivered)
 
 
-def log_to_object(service, agent, caller, body: dict) -> dict:
+def log_to_object(service, agent, caller, body: dict, *, after: list | None = None) -> dict:
     """POST /api/mesh/object/log: append to a task's log, optionally changing its status or owner. A changed owner
-    gets the assignment message; a changed status sends its creator one notice."""
+    gets the assignment message; a changed status sends its creator one notice; a task becoming accepted is a context
+    boundary (context_boundary). `after`: the route's list of steps to run once the response is written; without
+    one they run before this returns."""
     row = load_object(service, agent, caller, body.get("ref") or "")
     kind = str(body.get("kind") or "note").strip()
     if kind not in LOG_KINDS:
@@ -1637,8 +1642,166 @@ def log_to_object(service, agent, caller, body: dict) -> dict:
             to_name, to_session = "operator", None     # filed in the backlog by another squad, dispatched since
         _hub_tell(service, to_name=to_name, to_session=to_session,
                   text=notice + (f"\n\n{text}" if text else ""), agent=agent, caller=caller, squad=row["squad_id"])
-    return dict(object=object_docs(service, [service.store.object_row(row["id"])], body=True)[0],
-                entry=log_doc(entry), delivered=delivered)
+    later = [] if after is None else after
+    if status == "accepted":
+        context_boundary(service, service.store.object_row(row["id"]), caller if agent else None, after=later)
+    doc = dict(object=object_docs(service, [service.store.object_row(row["id"])], body=True)[0],
+               entry=log_doc(entry), delivered=delivered)
+    if after is None:
+        for step in later:
+            step()
+    return doc
+
+
+HUB = dict(agent_name="almanac-hub")      # who the context_boundary log entries are by
+
+
+def context_boundary(service, row: dict, caller: dict | None, *, after: list) -> None:
+    """`row` just became accepted: apply its members' context_policy, here in the hub, on this one event only.
+    fresh-per-task: the owner is retired (_retire). compact-at-N: the owner, and the creator when it is a member of
+    the squad (the lead's boundary), get `/compact` when their context is at or above N (_compact). `caller`: the
+    agent that made the change (None: the operator); ending it waits in `after` until the response is written."""
+    from almanac.store import parse_context_policy
+    squad = row["squad_id"]
+    if not squad:
+        return
+    members = []
+    owner = service.store.spawn_by_session(row["owner_session"]) if row["owner_session"] else None
+    if owner and owner["squad_id"] == squad:
+        members.append(owner)
+    # the creator by its session, so another squad's member of the same name is never touched; then that handle's
+    # newest session here: a respawned lead is still the lead
+    first = service.store.spawn_by_session(row["created_by"]) if row["created_by"] else None
+    creator = (service.store.spawned(squad_id=squad, agent_name=first["agent_name"], limit=1)
+               if first and first["squad_id"] == squad else [])
+    if creator and creator[0]["session_id"] not in {m["session_id"] for m in members}:
+        members.append(creator[0])
+    for sp in members:
+        if sp.get("retired_ts"):
+            continue
+        role = service.store.role(sp["role_id"]) if sp.get("role_id") else None
+        try:
+            kind, n = parse_context_policy((role or {}).get("context_policy"))
+        except ValueError:
+            continue
+        if kind == "fresh" and owner is not None and sp["session_id"] == owner["session_id"]:
+            _retire(service, row, sp, caller, after)
+        elif kind == "compact":
+            _compact(service, row, sp, n)
+
+
+def _live_proc(service, sid: str) -> dict | None:
+    """The fleet row of session `sid`'s running process (just its pid when the scan has no row yet), or None."""
+    pid = _live_sessions(service).get(sid)
+    if pid is None:
+        return None
+    return next((p for p in service.fleet_now().get("processes", []) if p["pid"] == pid), None) or dict(pid=pid)
+
+
+def _retire(service, row: dict, sp: dict, caller: dict | None, after: list) -> None:
+    """fresh-per-task: end the owner's session, mark its spawn row retired (its slot comes back) and say so on the
+    task. Not while it owns another open task of the squad. Its worktree and branch are left for the lead to merge.
+    A caller retiring itself is ended only once its response is written."""
+    from almanac.store import TASK_STATUSES
+    name, sid, ref = sp["agent_name"], sp["session_id"], ref_of(row)
+    still = [ref_of(o) for o in service.store.objects(squad_id=row["squad_id"], owner=name,
+                                                       statuses=[s for s in TASK_STATUSES if s != "accepted"])
+             if o["id"] != row["id"]]
+    if still:
+        service.store.log_object(row["id"], who=HUB, kind="retired", body=(
+            f"{name} is not retired (fresh-per-task): it still owns {', '.join(still)}"))
+        return
+    if service.fleet is not None:
+        with service.fleet_lock:
+            service.fleet.last["at"] = 0                  # a fresh scan: an owner that just exited is not "live"
+    proc = _live_proc(service, sid)
+    context = (proc or {}).get("context") or (service.store.chat(sid) or {}).get("context")
+    size = f"; its last context was {context:,} tokens" if context else ""
+    keep = ". Its worktree and branch are left as they are for the lead to merge"
+
+    def end() -> tuple[bool, str]:
+        if proc is None:
+            return True, "was not running"
+        if service.fleet is None or not proc.get("created"):
+            return False, "could not be ended: Almanac has no process scan to end it by"
+        ok, message, found = service.fleet.kill(proc["pid"], proc["created"])
+        if not ok and found is not None:
+            return False, f"could not be ended (pid {proc['pid']}): {message}"
+        service.launched.pop(sid, None)
+        with service.fleet_lock:
+            service.fleet.last["at"] = 0
+        return True, "was ended" if ok else "was not running"
+
+    # the deferred end only when it can work; otherwise the ordinary path below says it was not retired
+    if (proc is not None and caller and caller.get("session_id") == sid and service.fleet is not None
+            and proc.get("created")):
+        service.store.retire_spawn(sid)
+        service.store.log_object(row["id"], who=HUB, kind="retired", body=(
+            f"{name} retired on {ref} (fresh-per-task): its session {sid} ends once this reply is written{size}{keep}"))
+
+        def end_self():
+            ok, what = end()
+            if not ok:                  # still running after all: it gets its row and its slot back
+                logging.getLogger("almanac").warning("retiring %s (session %s): %s", name, sid, what)
+                service.store.retire_spawn(sid, retired=False)
+                service.store.log_object(row["id"], who=HUB, kind="retired", body=(
+                    f"{name} was not retired (fresh-per-task): its session {sid} {what}{size}"))
+        after.append(end_self)
+        return
+    ok, what = end()
+    if not ok:                  # still running: it keeps its row and its slot, and the lead is told on the task
+        service.store.log_object(row["id"], who=HUB, kind="retired", body=(
+            f"{name} was not retired (fresh-per-task): its session {sid} {what}{size}"))
+        return
+    service.store.retire_spawn(sid)
+    service.store.log_object(row["id"], who=HUB, kind="retired", body=(
+        f"{name} retired on {ref} (fresh-per-task): its session {sid} {what}{size}{keep}"))
+
+
+# No second /compact to a session within this many seconds of the last. Time, not a watched reading: an agent typed
+# at mid-turn keeps taking steps, so its reading moves before the queued /compact runs, and two accepts in one turn
+# would otherwise queue it twice.
+COMPACT_COOLDOWN = 600
+
+
+def _compact(service, row: dict, sp: dict, n: int) -> None:
+    """compact-at-N: type `/compact` into a Claude agent's console (console.send, never fleet.send: that delivers a
+    peer message, not keys; typed mid-turn it queues), or have a Gemini agent's host send agy a raw `/compact` turn.
+    Only on a context reading at or above N that is not a running total, and not twice on the same reading."""
+    from almanac import console, uds
+    name, sid = sp["agent_name"], sp["session_id"]
+    proc = _live_proc(service, sid)
+    context = (proc or {}).get("context")
+    if not proc or not context or proc.get("context_total") or context < n:
+        return
+    sent = service.__dict__.setdefault("compacted", {})   # {session: (its context, time) when /compact was last sent}
+    last, at = sent.get(sid, (None, float("-inf")))
+    if last == context or time.monotonic() - at < COMPACT_COOLDOWN:
+        return
+    before = f"{name} at {context:,} tokens (compact-at-{n})"
+    provider = proc.get("provider") or sp.get("provider") or "claude"
+    if provider == "gemini":
+        if not proc.get("has_uds") or service.fleet is None:
+            ok, what = False, "its host has no uds pipe to tell"
+        else:
+            try:
+                uds.send_peer(service.fleet.home / "sessions", str(proc["pid"]), json.dumps({"op": "compact"}),
+                              from_name="almanac-hub", channel="__almanac_control__", alive_fn=lambda _: True,
+                              from_pipe=service.hub_peer.pipe_path if service.hub_peer else "almanac-hub")
+                ok, what = True, "its host sends agy a /compact turn"
+            except Exception as exc:
+                ok, what = False, f"its host could not be told: {exc}"
+    elif proc.get("role") == "headless" or sid in (service.__dict__.get("headless_procs") or {}):
+        sent[sid] = (context, time.monotonic())        # nothing will change that: say it once per reading
+        service.store.log_object(row["id"], who=HUB, kind="compact", body=(
+            f"{before} not compacted: a headless Claude has no console to type /compact into"))
+        return
+    else:
+        ok, what = console.send(proc["pid"], "/compact")
+    if ok:
+        sent[sid] = (context, time.monotonic())
+    service.store.log_object(row["id"], who=HUB, kind="compact", body=(
+        f"{before}: /compact sent ({what})" if ok else f"{before}: /compact not sent: {what}"))
 
 
 _DISPATCH_LOCK, _DISPATCHING = threading.Lock(), set()
@@ -2118,8 +2281,15 @@ def make_handler(service, token, *, hosts=()):
                 return self._send(200, file_object(service, self.agent, service.caller(self.agent, self.agent_session),
                                                    self._body()))
             if method == "POST" and path == "/api/mesh/object/log":
-                return self._send(200, log_to_object(service, self.agent, service.caller(self.agent, self.agent_session),
-                                                     self._body()))
+                after = []          # what must wait for the response: ending the caller itself (context_boundary)
+                self._send(200, log_to_object(service, self.agent, service.caller(self.agent, self.agent_session),
+                                              self._body(), after=after))
+                if after:
+                    self.close_connection = True
+                    self.wfile.flush()
+                for step in after:
+                    step()
+                return None
             if method == "POST" and path == "/api/mesh/object/respawn":
                 body = self._body()
                 port = getattr(self.server, "server_port", 8812)

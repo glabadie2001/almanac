@@ -2386,7 +2386,7 @@ async function loadTask(ref) {
   const logHead = (l) => `${clock(l.ts)} ${l.agent_name} [${l.kind}]`
     + `${!l.status_to ? "" : l.kind === "create" ? ` as ${l.status_to}` : ` ${l.status_from || "–"} → ${l.status_to}`}`
     + `${l.owner_to ? ` owner → ${l.owner_to}` : ""}`;
-  const logCls = (k) => (k === "dead" ? "error" : k === "message" ? "peer_out" : k === "status" || k === "assign" || k === "dispatch" || k === "respawn" ? "tool" : "claude");
+  const logCls = (k) => (k === "dead" ? "error" : k === "message" ? "peer_out" : k === "status" || k === "assign" || k === "dispatch" || k === "respawn" || k === "retired" || k === "compact" ? "tool" : "claude");
   // a refresh (every objects_rev change re-runs this for the open task) keeps the reader's place, measured from the
   // bottom because new log entries arrive at the top; only a newly opened task, or a reader at the top, starts at the top
   const feed = $("mesh-ctx-feed"), fromBottom = feed.scrollTop ? feed.scrollHeight - feed.scrollTop : 0;

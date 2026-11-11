@@ -115,6 +115,24 @@ def slugify_name(raw: str, fallback: str = "agent") -> str:
     return cleaned or fallback
 
 
+def _policy_line(value) -> str | None:
+    """The charter's line for a role's context_policy (door.context_boundary enforces it); none for `none`."""
+    from almanac.store import parse_context_policy
+    try:
+        kind, n = parse_context_policy(value)
+    except ValueError:
+        return None
+    if kind == "fresh":
+        return ("- **Context policy (fresh-per-task)**: your session ends when your task is accepted, and the next task "
+                "starts on a fresh agent from its task and log. Put everything the next agent needs in the task log "
+                "(`mesh_log`) and in commits.")
+    if kind == "compact":
+        return (f"- **Context policy (compact-at-{n})**: at a task boundary (a task you own or filed is accepted) you are "
+                f"compacted when your context is above {n:,} tokens. Record decisions in task logs, not only in this "
+                "conversation.")
+    return None
+
+
 def build_mesh_charter(
     *,
     agent_name: str,
@@ -134,6 +152,7 @@ def build_mesh_charter(
     add_dirs: list[str] | None = None,
     may_restart: bool = False,
     may_respawn: bool = False,
+    context_policy: str | None = None,
 ) -> str:
     """System charter giving every Claude and Gemini agent shared stream awareness and uds-messaging etiquette."""
     # no --state in the CLI line: with it, a CLI that lacks a token falls back to the door's master token file.
@@ -194,6 +213,9 @@ def build_mesh_charter(
                      "starts a fresh one with the same handle, role and worktree, whose kickoff is the task and its log. "
                      "Use it when an owner's context has grown too large, or when a stalled owner did not recover after "
                      "`continue`; `model` / `effort` change its tier within what the role allows. Never on yourself.")
+    policy = _policy_line(context_policy) if squad_id else None
+    if policy:
+        lines.append(policy)
     if may_restart:
         lines.append("9. **Restart Almanac**: `mesh_restart()` (CLI `restart`) only after a merge that changed Python code, "
                      "and never with a failing suite; static files need no restart. Almanac refuses if its preflight "
@@ -550,6 +572,7 @@ def _spawn_agent(
         add_dirs=add_dirs,
         may_restart=bool((role or {}).get("may_restart")),
         may_respawn=bool(squad_id and (role or {}).get("may_spawn")),
+        context_policy=(role or {}).get("context_policy"),
     )
     charter_file = spawn_dir / "charter.md"
     charter_file.write_text(charter, encoding="utf-8")
