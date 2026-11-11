@@ -2310,14 +2310,17 @@ async function loadTask(ref) {
     + `${!l.status_to ? "" : l.kind === "create" ? ` as ${l.status_to}` : ` ${l.status_from || "–"} → ${l.status_to}`}`
     + `${l.owner_to ? ` owner → ${l.owner_to}` : ""}`;
   const logCls = (k) => (k === "dead" ? "error" : k === "message" ? "peer_out" : k === "status" || k === "assign" || k === "dispatch" ? "tool" : "claude");
-  $("mesh-ctx-feed").replaceChildren(
+  // a refresh (every objects_rev change re-runs this for the open task) keeps the reader's place, measured from the
+  // bottom because new log entries arrive at the top; only a newly opened task, or a reader at the top, starts at the top
+  const feed = $("mesh-ctx-feed"), fromBottom = feed.scrollTop ? feed.scrollHeight - feed.scrollTop : 0;
+  feed.replaceChildren(
     el("li", { cls: "you" }, o.body ? renderMd(o.body) : "(no body)"),
     el("li", { cls: "result", text: o.files?.length ? `files: ${o.files.join(", ")}` : "files: none" }),
     ...(log.length
       ? log.map((l) => el("li", { cls: logCls(l.kind), title: new Date(l.ts * 1000).toLocaleString() }, logHead(l), l.body ? renderMd(l.body) : null))
       : [el("li", { cls: "result", text: "no log entries yet" })]),
   );
-  $("mesh-ctx-feed").scrollTop = 0;                    // the log is newest first
+  feed.scrollTop = fromBottom ? feed.scrollHeight - fromBottom : 0;   // the log is newest first
 }
 
 // ------------------------------------------------------------------ mesh: backlog (tasks no squad has taken yet)
