@@ -210,8 +210,8 @@ class SpawnTokenTests(Fixture):
         self.assertTrue(service.wake.is_set(), "a launch wakes the transcript loop")
         claude_argv, claude_kw = launched[0]
         mcp = json.loads(Path(claude_argv[claude_argv.index("--mcp-config") + 1]).read_text(encoding="utf-8"))
-        self.assertEqual(mcp["mcpServers"]["almanac-mesh"]["env"]["ALMANAC_TOKEN"], web.agent_token(TOKEN, "lead"))
-        self.assertEqual(claude_kw["env"]["ALMANAC_TOKEN"], web.agent_token(TOKEN, "lead"))
+        self.assertEqual(mcp["mcpServers"]["almanac-mesh"]["env"]["ALMANAC_TOKEN"], web.agent_token(TOKEN, "lead", claude_argv[claude_argv.index("--session-id") + 1]))
+        self.assertEqual(claude_kw["env"]["ALMANAC_TOKEN"], web.agent_token(TOKEN, "lead", claude_argv[claude_argv.index("--session-id") + 1]))
         self.assertNotIn(TOKEN, json.dumps(mcp) + " ".join(claude_argv))
         brief = claude_argv[claude_argv.index("--append-system-prompt") + 1]
         self.assertIn(f"  - Role: {store_mod.REVIEWER}", brief, "every agent's brief says who does what")
@@ -221,8 +221,8 @@ class SpawnTokenTests(Fixture):
             bundle = Path(argv[argv.index("--add-dir") + 1])
             bundles.append(bundle)
             cfg = json.loads((bundle / ".agents/plugins/almanac-mesh/mcp_config.json").read_text(encoding="utf-8"))
-            self.assertEqual(cfg["mcpServers"]["almanac-mesh"]["env"]["ALMANAC_TOKEN"], web.agent_token(TOKEN, name))
-            self.assertEqual(kw["env"]["ALMANAC_TOKEN"], web.agent_token(TOKEN, name))
+            self.assertEqual(cfg["mcpServers"]["almanac-mesh"]["env"]["ALMANAC_TOKEN"], web.agent_token(TOKEN, name, argv[argv.index("--session-id") + 1]))
+            self.assertEqual(kw["env"]["ALMANAC_TOKEN"], web.agent_token(TOKEN, name, argv[argv.index("--session-id") + 1]))
         self.assertNotEqual(bundles[0], bundles[1], "Gemini peers no longer share one bundle")
         channels = {s["agent_name"]: s["channels"] for s in store.spawned()}
         self.assertEqual(channels["lead"], ["#squad", "#architecture"])

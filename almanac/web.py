@@ -67,19 +67,36 @@ AGENT_PATHS = "/api/mesh"       # an agent token opens this route and everything
 RESERVED_AGENT_NAMES = frozenset({"operator", "almanac-hub", "hub", "peer", "all", "squad"})
 
 
-def agent_token(token: str, name: str) -> str:
-    """A spawned agent's own bearer: it names its holder and only opens AGENT_PATHS, so an agent cannot post as
-    someone else or reach /api/kill and /api/spawn. Derived from the door's secret, so nothing is stored."""
+def agent_token(token: str, name: str, session: str | None = None) -> str:
+    """A spawned agent's own bearer: it names its holder (and, when given, the session it was spawned as) and only
+    opens AGENT_PATHS, so an agent cannot post as someone else or reach /api/kill and /api/spawn. Derived from the
+    door's secret, so nothing is stored."""
     # ponytail: stops accidents, not an adversary: an agent runs as this user and can read <state>/token itself.
     # Upgrade path: run agents under another account, or keep the secret out of their reach.
+    assert "." not in name + (session or ""), "agent names and sessions never contain a dot"
+    if session:
+        return f"agent.{name}.{session}.{_sign(token, f'agent:{name}:{session}')}"
     return f"agent.{name}.{_sign(token, 'agent:' + name)}"
 
 
+def agent_identity(bearer: str, token: str) -> tuple[str, str | None] | None:
+    """(name, session) a bearer was minted for, or None. Names and session uuids never contain a dot
+    (`spawner.AGENT_NAME_RE`), so `agent.<name>.<session>.<sig>` splits one way. A two-part `agent.<name>.<sig>`
+    (minted before tokens carried the session, still held by agents alive across a restart) is handle-only."""
+    parts = bearer.split(".")
+    if len(parts) == 3 and parts[0] == "agent" and parts[1]:
+        name, session, value = parts[1], None, "agent:" + parts[1]
+    elif len(parts) == 4 and parts[0] == "agent" and parts[1] and parts[2]:
+        name, session, value = parts[1], parts[2], f"agent:{parts[1]}:{parts[2]}"
+    else:
+        return None
+    return (name, session) if _equal(parts[-1], _sign(token, value)) else None
+
+
 def agent_of(bearer: str, token: str) -> str | None:
-    """The agent name a bearer was minted for, or None. Names never contain a dot (`spawner.AGENT_NAME_RE`)."""
-    kind, _, rest = bearer.partition(".")
-    name, _, signature = rest.rpartition(".")
-    return name if kind == "agent" and name and _equal(signature, _sign(token, "agent:" + name)) else None
+    """The agent name a bearer was minted for, or None."""
+    found = agent_identity(bearer, token)
+    return found[0] if found else None
 
 
 def new_session(token: str) -> str:
@@ -129,6 +146,7 @@ class JsonHandler(BaseHTTPRequestHandler):
     log = logging.getLogger("almanac.web")
     _cache = None
     agent: str | None = None        # set by the door when the request carries an agent token
+    agent_session: str | None = None    # the session that token was minted for (None: an old handle-only token)
 
     def log_message(self, *args):
         pass
@@ -215,7 +233,7 @@ def protect(handler_class, *, token: str, hosts=(), timeout: float = 60):
             for name in ("_almanac_body", "_almanac_length"):
                 if hasattr(self, name):
                     delattr(self, name)
-            self.agent = None               # a keep-alive connection must not carry one request's agent into the next
+            self.agent = self.agent_session = None   # a keep-alive connection must not carry one request's agent into the next
             try:
                 self._check()
             except Refused as exc:
@@ -250,7 +268,7 @@ def protect(handler_class, *, token: str, hosts=(), timeout: float = 60):
             if path == "/login":
                 return                      # checks its own token
             bearer = (self.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
-            self.agent = agent_of(bearer, token)
+            self.agent, self.agent_session = agent_identity(bearer, token) or (None, None)
             if self.agent:
                 if self.agent.lower() in RESERVED_AGENT_NAMES:
                     raise Refused(403, f"{self.agent!r} is a reserved name; no agent may hold it")

@@ -81,6 +81,19 @@ create table if not exists squads (
     created_ts real not null,
     status text default 'active'
 );
+create table if not exists objects (
+    id integer primary key autoincrement, kind text not null, project text not null, squad_id text,
+    title text not null, body text not null default '', status text not null,
+    owner_session text, parent_id integer references objects(id),
+    files text not null default '[]', sha text, branch text,
+    created_by text, created_by_name text not null, created_ts real not null, updated_ts real not null,
+    data text not null default '{}');
+create index if not exists objects_squad on objects(squad_id, kind, status);
+create table if not exists object_log (
+    id integer primary key autoincrement, object_id integer not null references objects(id), ts real not null,
+    session text, agent_name text not null, role_id text, provider text, kind text not null, body text not null,
+    status_from text, status_to text, owner_to text, message_id integer);
+create index if not exists object_log_object on object_log(object_id, id);
 """
 # One row per spawn. Keyed by session: squads reuse handles like `impl-claude`, and a later squad must not erase
 # an earlier squad's roster. Lookups by name take the newest row.
@@ -108,6 +121,11 @@ EDIT_TOOLS = ("Edit", "Write", "NotebookEdit", "MultiEdit", "replace_file_conten
 ANY_ROLE = "*"                # a squad's spawn_role that lets its architect add any role the operator defined
 NEEDS = (None, "reply", "blocking")        # a message may ask for an answer; `blocking` means the sender cannot go on
 OPERATOR_NAMES = ("operator", "almanac-hub")  # the human, by every name the hub answers to in the journal
+TASK_STATUSES = ("queued", "in progress", "in review", "accepted", "blocked")
+OBJECT_KINDS = {"T": "task"}                  # stage 1: tasks only; F finding and N note come later
+OBJECT_COLUMNS = ("id, kind, project, squad_id, title, body, status, owner_session, parent_id, files, sha, branch, "
+                  "created_by, created_by_name, created_ts, updated_ts, data")
+LOG_COLUMNS = "id, object_id, ts, session, agent_name, role_id, provider, kind, body, status_from, status_to, owner_to, message_id"
 MESSAGE_COLUMNS = ("id, msg_id, ts, from_name, from_session, from_provider, to_name, to_session, to_provider, "
                    "channel, squad_id, body, transport, needs, answered_ts, answered_by, read_ts")
 DUPLICATE_WINDOW = 900      # seconds: a transcript copy of a message the hub journaled this recently is the same message
@@ -349,7 +367,8 @@ class Store:
                 if r.get("allowed_commands"):
                     self.db.execute("update roles set allowed_commands = ? where id = ? and coalesce(allowed_commands, '[]') = '[]'",
                                     (json.dumps(r["allowed_commands"]), r["id"]))
-        self.db.execute("insert or replace into meta values ('schema', '9')")
+        # v10: work objects (`objects`, `object_log`) are new tables in SCHEMA; nothing to backfill
+        self.db.execute("insert or replace into meta values ('schema', '10')")
         if self.db.execute("select count(*) from roles").fetchone()[0] == 0:
             now = time.time()
             for r in DEFAULT_ROLES:
@@ -907,7 +926,10 @@ class Store:
         squad_id: str | None = None,
         transport: str = "uds",
         needs: str | None = None,
+        answers: bool = True,
     ) -> dict:
+        """`answers`: False for a message the hub sends about work (an assignment, a status notice), which must
+        not close anyone's open flag."""
         needs = needs or None
         if needs not in NEEDS:
             raise ValueError("needs must be 'reply', 'blocking' or empty")
@@ -923,7 +945,8 @@ class Store:
             )
             if cur.rowcount:
                 row_id = cur.lastrowid
-                self._close_answered(row_id, stamp, from_name, to_name, squad_id)
+                if answers:
+                    self._close_answered(row_id, stamp, from_name, to_name, squad_id)
                 if needs:
                     self._close_if_answered(row_id, stamp, from_name, to_name, squad_id)
             else:
@@ -1004,7 +1027,9 @@ class Store:
         squad_id: str | None = None,
         since_id: int = 0,
         limit: int = 100,
+        unscoped: bool = False,
     ) -> list[dict]:
+        """`unscoped`: with `squad_id`, rows in no squad (an operator's @all) count too."""
         clauses = ["id > ?"]
         params: list = [max(0, int(since_id))]
         if peer:
@@ -1014,7 +1039,7 @@ class Store:
             clauses.append("channel = ?")
             params.append(channel)
         if squad_id:
-            clauses.append("squad_id = ?")
+            clauses.append("(squad_id = ? or squad_id is null)" if unscoped else "squad_id = ?")
             params.append(squad_id)
         return self._message_rows(clauses, params, since_id, limit)
 
@@ -1133,10 +1158,12 @@ class Store:
         since_id: int = 0,
         timeout: float = 30.0,
         stop_event: threading.Event | None = None,
+        unscoped: bool = False,
     ) -> list[dict]:
         deadline = time.monotonic() + max(0.0, min(600.0, float(timeout)))
         while True:
-            found = self.messages(peer=peer, channel=channel, squad_id=squad_id, since_id=since_id, limit=100)
+            found = self.messages(peer=peer, channel=channel, squad_id=squad_id, since_id=since_id, limit=100,
+                                  unscoped=unscoped)
             # When waiting as a specific peer, exclude messages sent BY that peer itself
             if peer:
                 found = [m for m in found if m["from_name"] != peer and m["from_session"] != peer]
@@ -1484,6 +1511,130 @@ class Store:
             )
             for a in rows
         ]
+
+    # ------------------------------------------------------------------ work objects (stage 1: tasks)
+    def create_object(self, *, kind: str, project: str, squad_id: str | None, title: str, body: str, status: str,
+                      owner_session: str | None, parent_id: int | None, files: list[str], created_by: str | None,
+                      created_by_name: str, who: dict, owner_name: str | None = None) -> dict:
+        """Insert an object and its `create` log row in one transaction. `who`: the log row's session, agent_name,
+        role_id, provider."""
+        now = time.time()
+        with self.lock:
+            cur = self.db.execute(
+                "insert into objects (kind, project, squad_id, title, body, status, owner_session, parent_id, files, "
+                "created_by, created_by_name, created_ts, updated_ts) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (kind, project, squad_id, title, body, status, owner_session, parent_id, json.dumps(files),
+                 created_by, created_by_name, now, now))
+            oid = cur.lastrowid
+            self._insert_log(oid, now, who, "create", "", None, status, owner_name, None)
+            self.db.commit()
+        return self.object_row(oid)
+
+    def _insert_log(self, oid, ts, who, kind, body, status_from, status_to, owner_to, message_id) -> int:
+        return self.db.execute(
+            f"insert into object_log ({LOG_COLUMNS.removeprefix('id, ')}) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (oid, ts, who.get("session"), who.get("agent_name") or "operator", who.get("role_id"), who.get("provider"),
+             kind, body, status_from, status_to, owner_to, message_id)).lastrowid
+
+    def log_object(self, oid: int, *, who: dict, kind: str, body: str = "", status: str | None = None,
+                   owner_session: str | None = None, owner_name: str | None = None,
+                   message_id: int | None = None) -> dict:
+        """Append a log row; a `status` or `owner_session` also changes the object (and its updated_ts)."""
+        now = time.time()
+        with self.lock:
+            row = self.db.execute("select status from objects where id = ?", (oid,)).fetchone()
+            if row is None:
+                raise LookupError(oid)
+            sets, params = ["updated_ts = ?"], [now]
+            if status is not None:
+                sets.append("status = ?")
+                params.append(status)
+            if owner_session is not None:
+                sets.append("owner_session = ?")
+                params.append(owner_session)
+            self.db.execute(f"update objects set {', '.join(sets)} where id = ?", (*params, oid))
+            lid = self._insert_log(oid, now, who, kind, body, row[0] if status is not None else None, status,
+                                   owner_name, message_id)
+            self.db.commit()
+            r = self.db.execute(f"select {LOG_COLUMNS} from object_log where id = ?", (lid,)).fetchone()
+        return _log(r)
+
+    def object_row(self, oid: int) -> dict | None:
+        with self.lock:
+            r = self.db.execute(f"select {OBJECT_COLUMNS} from objects where id = ?", (oid,)).fetchone()
+        return _object(r) if r else None
+
+    def objects(self, *, squad_id: str | None, kind: str | None = None, statuses=(), owner: str | None = None,
+                q: str | None = None) -> list[dict]:
+        """Matching objects of one squad, by id. `owner`: a handle, or 'none' for unowned."""
+        clauses, params = ["squad_id is ?"], [squad_id]
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if statuses:
+            clauses.append(f"status in ({','.join('?' * len(statuses))})")
+            params += list(statuses)
+        if owner == "none":
+            clauses.append("owner_session is null")
+        elif owner:
+            clauses.append("owner_session in (select session_id from spawned_agents where agent_name = ?)")
+            params.append(owner)
+        if q:
+            like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            clauses.append("(title like ? escape '\\' or body like ? escape '\\')")
+            params += [like, like]
+        with self.lock:
+            rows = self.db.execute(f"select {OBJECT_COLUMNS} from objects where {' and '.join(clauses)} order by id",
+                                   params).fetchall()
+        return [_object(r) for r in rows]
+
+    def object_stats(self, ids: list[int]) -> dict:
+        """{id: dict(children=(total, accepted), log_count, last_log)} for the plan view's rows."""
+        out = {i: dict(children=(0, 0), log_count=0, last_log=None) for i in ids}
+        if not ids:
+            return out
+        marks = ",".join("?" * len(ids))
+        with self.lock:
+            for pid, total, accepted in self.db.execute(
+                    f"select parent_id, count(*), sum(status = 'accepted') from objects where parent_id in ({marks}) "
+                    "group by parent_id", ids).fetchall():
+                out[pid]["children"] = (total, accepted or 0)
+            last_ids = []
+            for oid, count, last in self.db.execute(
+                    f"select object_id, count(*), max(id) from object_log where object_id in ({marks}) "
+                    "group by object_id", ids).fetchall():
+                out[oid]["log_count"] = count
+                last_ids.append(last)
+            if last_ids:
+                for r in self.db.execute(f"select {LOG_COLUMNS} from object_log where id in "
+                                         f"({','.join('?' * len(last_ids))})", last_ids).fetchall():
+                    out[r[1]]["last_log"] = _log(r)
+        return out
+
+    def object_log(self, oid: int, limit: int = 20) -> list[dict]:
+        """An object's log, newest first."""
+        with self.lock:
+            rows = self.db.execute(f"select {LOG_COLUMNS} from object_log where object_id = ? order by id desc limit ?",
+                                   (oid, limit)).fetchall()
+        return [_log(r) for r in rows]
+
+    def objects_rev(self) -> int:
+        with self.lock:
+            return self.db.execute("select coalesce(max(id), 0) from object_log").fetchone()[0]
+
+    def spawn_by_session(self, session_id: str) -> dict | None:
+        with self.lock:
+            a = self.db.execute(f"select {SPAWNED_COLUMNS} from spawned_agents where session_id = ?",
+                                (session_id,)).fetchone()
+        return dict(zip(SPAWNED_COLUMNS.split(", "), a), channels=_json_list(a[11])) if a else None
+
+
+def _object(r) -> dict:
+    return dict(zip(OBJECT_COLUMNS.split(", "), r), files=_json_list(r[9]))
+
+
+def _log(r) -> dict:
+    return dict(zip(LOG_COLUMNS.split(", "), r))
 
 
 def _message(r) -> dict:
