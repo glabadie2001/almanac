@@ -77,6 +77,23 @@ class AgentChoiceTests(ElasticRig):
         self.assertIn("allows high, low, medium", res["error"])
         self.assertEqual((self.argv, self.used(), self.store.objects_rev()), ([], 0, 0), "nothing started, nothing filed")
 
+    def test_an_effort_written_into_the_model_is_a_pick_too(self):                # review of d29c103
+        self.assertEqual(self.spawn_as_arch(model="claude-haiku-5-5-low")[0], 200)
+        self.assertEqual((self.flag("--model"), self.flag("--effort")), (HAIKU, "low"))
+        status, _, res = self.spawn_as_arch(model="sonnet-max")
+        self.assertEqual(status, 400)
+        self.assertIn("effort 'sonnet-max'", res["error"])
+        self.assertEqual(self.spawn_as_arch(model="Claude-Haiku-5.5", effort="MEDIUM")[0], 200, "case does not matter")
+        self.assertEqual((self.flag("--model"), self.flag("--effort")), (HAIKU, "medium"))
+
+    def test_the_operators_choice_is_recorded_normalized(self):                    # review of d29c103
+        status, _, res = self.request(self.handler, "/api/squad/member", method="POST", body={
+            "squad_id": "sq-1", "role_id": "implementer-claude", "task": TASK, "model": "haiku-5.5", "effort": "med"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["choice"], dict(model=HAIKU, effort="medium", why=None))
+        data = json.loads(self.store.db.execute("select data from objects order by id desc limit 1").fetchone()[0])
+        self.assertEqual(data, dict(model=HAIKU, effort="medium"))
+
     def test_empty_sets_run_the_role_as_before(self):
         self.store.upsert_role(dict(self.store.role("implementer-claude"), models=[], efforts=[]))
         self.assertEqual(self.spawn_as_arch(model=HAIKU)[0], 400)

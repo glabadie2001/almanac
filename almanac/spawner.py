@@ -81,7 +81,7 @@ def normalize_model(provider: str | None, raw: str | None) -> str | None:
         return low
     if prov == "claude" or low.startswith(("claude-", *CLAUDE_FAMILY_PREFIXES)):
         # Convert version dots like 5.5 -> 5-5 for Claude model IDs
-        norm = re.sub(r"(?<=\d)\.(?=\d)", "-", val)
+        norm = re.sub(r"(?<=\d)\.(?=\d)", "-", low)          # Claude model ids are lower case
         if norm.lower().startswith(CLAUDE_FAMILY_PREFIXES):
             norm = "claude-" + norm
         return norm
@@ -968,8 +968,9 @@ def join_squad(
         report_to = (" or ".join(f"`{r}`" for r in relays) if relays
                      else "`#squad` (`mesh_send(to=\"#squad\")`), since nobody live in the squad may page the operator")
     # the model and effort it runs on (a spawner's pick, else the role's), recorded so outcomes can be compared by tier
-    choice = dict(model=operator_overrides.get("model") or role.get("model") or None,
-                  effort=operator_overrides.get("effort") or role.get("effort") or None, why=why or None)
+    model, effort = split_model_effort(role["provider"], operator_overrides.get("model") or role.get("model") or None,
+                                       operator_overrides.get("effort") or role.get("effort") or None)
+    choice = dict(model=model, effort=effort, why=why or None)     # normalized as spawn_agent normalizes them
     task_row = file_spawn_task(service, squad_id, task, files, by=spawned_by, by_session=spawned_by_session,
                                data={k: v for k, v in choice.items() if v})
     kickoff = []
