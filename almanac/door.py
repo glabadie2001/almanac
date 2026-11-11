@@ -30,9 +30,12 @@ POST /api/squad/member       {squad_id, role_id, agent_name?, task?, model?, ...
 POST /api/mesh/object/respawn {ref, model?, effort?}: end a task owner's session and start a fresh one of the same
                              handle and worktree on that task, its log as the kickoff (the operator, or a squadmate
                              whose role may spawn; never on itself)
-POST /api/mesh/spawn         {task, name?, role?}: an agent whose role may_spawn adds one member of the squad's
+POST /api/mesh/spawn         {task, name?, role?, ref?}: an agent whose role may_spawn adds one member of the squad's
                              spawn_role (or of `role` when spawn_role is `*`), within spawn_limit (403 or 400 with
-                             the reason otherwise)
+                             the reason otherwise). `ref`: put it on an existing queued, unowned task of the squad
+                             instead of filing a new one (`task` is then optional extra instructions)
+POST /api/squads/assign      {ref, squad_id}: move a queued backlog task into a running squad of its project (the
+                             operator's only); the squad's lead is told (409 with the reason otherwise)
 GET  /api/models             known & CLI-discovered Claude and Gemini model identifiers
 POST /api/model {pid, created, model}  set or switch the model on a live Claude or Gemini session
 POST /api/kill  {pid, created}         end the process tree
@@ -1676,18 +1679,84 @@ def dispatch_task(service, ref, *, almanac_url: str, token: str) -> dict:
     return res
 
 
+def assign_task(service, ref, squad_id) -> dict:
+    """POST /api/squads/assign (the operator's): move a queued backlog task into a running squad of its project. It
+    stays queued and unowned; the squad's lead (the member the squad was launched with first) is told, once, how to
+    put someone on it. No live lead: the task still joins, and the answer says so."""
+    row = load_object(service, None, None, ref)
+    ref = ref_of(row)
+    squad = service.store.squad(str(squad_id or "").strip())
+    if squad is None:
+        raise _refused(404, f"no squad {squad_id!r}")
+    from almanac.spawner import project_root
+    with _DISPATCH_LOCK:                 # a double click assigns once
+        row = service.store.object_row(row["id"])
+        if row["squad_id"] or row["id"] in _DISPATCHING:
+            raise _refused(409, f"{ref} is not in the backlog: it belongs to squad {row['squad_id']}"
+                           if row["squad_id"] else f"{ref} is being dispatched")
+        if row["status"] != "queued":
+            raise _refused(409, f"{ref} is {row['status']}; only a queued task is assigned")
+        if squad["status"] != "active":
+            raise _refused(409, f"squad {squad['id']} is {squad['status']}")
+        if project_root(squad["cwd"]) != row["project"]:
+            raise _refused(409, f"squad {squad['id']} works in {squad['cwd']}, not in {ref}'s project {row['project']}")
+        service.store.log_object(row["id"], who=dict(agent_name="operator"), kind="assign", squad_id=squad["id"],
+                                 body=f"moved from the backlog into squad {squad['name']} ({squad['id']}) by operator")
+    lead = next((a for a in squad["agents"] if not a["spawned_by"]), None)        # oldest first: launched first
+    live = {p.get("session_id") for p in service.mesh_peers(squad_id=squad["id"])}
+    lead = lead and _owner(service, squad["id"], lead["agent_name"])               # its newest session
+    out = dict(ok=True, ref=ref, squad_id=squad["id"], lead=lead and lead["agent_name"], lead_live=False, delivered=False)
+    if lead and lead["session_id"] in live:
+        out["delivered"], _ = _hub_tell(
+            service, to_name=lead["agent_name"], to_session=lead["session_id"], agent=None, caller=None, squad=squad["id"],
+            text=(f"[{ref} moved from the backlog into your squad by the operator] {row['title']}\n\nIt is queued and "
+                  f"unowned. Put a fresh member on it with mesh_spawn(ref=\"{ref}\", ...), or hand it to a live member "
+                  f"with mesh_log(ref=\"{ref}\", owner=...)."))
+    out["lead_live"] = out["delivered"]
+    if not out["delivered"]:
+        out["note"] = (f"{ref} joined squad {squad['id']}, but its lead {out['lead'] or '(none)'} is not live: nobody was "
+                       "told. Put someone on it from the plan.")
+    out["object"] = object_docs(service, [service.store.object_row(row["id"])], body=True)[0]
+    return out
+
+
+def spawn_ref_row(service, ref, squad_id: str) -> dict:
+    """mesh_spawn(ref): the task a new member is put on. It must be a task of `squad_id`, queued and unowned."""
+    row = load_object(service, None, None, ref)
+    name = ref_of(row)
+    if row["squad_id"] != squad_id:
+        raise _refused(403, f"{name} belongs to "
+                       + (f"squad {row['squad_id']}" if row["squad_id"] else "the backlog (an operator assigns it to a squad first)")
+                       + f", not to squad {squad_id}")
+    if row["status"] != "queued":
+        raise _refused(409, f"{name} is {row['status']}; only a queued task takes a new member")
+    if row["owner_session"]:
+        raise _refused(409, f"{name} already has an owner; hand it over with mesh_log(ref, owner=...)")
+    return row
+
+
 def respawn_kickoff(row: dict, log: list[dict], squad: dict, name: str, room: int) -> str:
     """A respawned owner's first prompt: the mission, its task, the task's log oldest first, and what to do, in at most
-    `room` characters when it can (spawner.fit_prompt gives the room a Claude command line has left). The oldest log
-    entries go first, and the prompt says how to read them; the task itself is never cut."""
+    `room` characters when it can (spawner.fit_prompt gives the room a Claude command line has left)."""
     ref = ref_of(row)
-    head = [f"## Squad Mission ({squad['name']})\n{squad['brief'].strip()}"] if (squad.get("brief") or "").strip() else []
-    head.append(f"## Your task (`{ref}`): {row['title']}\n{row['body'] or '(no body)'}\n\n"
-                f"Files: {', '.join(row['files']) or '(none named)'}")
     tail = (f"You are a fresh session of `{name}`, started on {ref} in place of the previous one (its context had grown "
             "too large, or it stalled). Carry on from the log: `git status` and `git log` in your worktree show what is "
             f"already done. Hand in as usual: mesh_log(ref=\"{ref}\", status=\"in review\", body=<files touched, the "
             "test command and its result, what is left>).")
+    return task_kickoff(row, log, squad, room, tail)
+
+
+def task_kickoff(row: dict, log: list[dict], squad: dict, room: int, tail: str, *, extra: str = "",
+                 files: list[str] | None = None) -> str:
+    """A session's first prompt on an existing task: the mission, the task (`extra`: more instructions from whoever
+    put the session on it; `files` replace the task's), the task's log oldest first, then `tail`. The oldest log
+    entries go first, and the prompt says how to read them; the task and `tail` are never cut."""
+    ref = ref_of(row)
+    head = [f"## Squad Mission ({squad['name']})\n{squad['brief'].strip()}"] if (squad.get("brief") or "").strip() else []
+    head.append(f"## Your task (`{ref}`): {row['title']}\n{row['body'] or '(no body)'}\n\n"
+                f"Files: {', '.join(files or row['files']) or '(none named)'}")
+    if extra:
+        head.append(f"## More instructions\n{extra}")
     entries = []
     for e in log:                                         # oldest first
         line = f"- {time.strftime('%Y-%m-%d %H:%M', time.localtime(e['ts']))} {e['agent_name']} [{e['kind']}]"
@@ -1918,7 +1987,9 @@ def make_handler(service, token, *, hosts=()):
                 if path == "/api/roles":
                     return self._send(200, dict(roles=service.store.roles()))
                 if path == "/api/squads":
-                    return self._send(200, dict(squads=service.store.squads(int(query.get("limit", "50")))))
+                    from almanac.spawner import project_root     # `project`: what [ASSIGN] matches a backlog task on
+                    return self._send(200, dict(squads=[dict(s, project=project_root(s["cwd"]))
+                                                        for s in service.store.squads(int(query.get("limit", "50")))]))
                 if path == "/api/mesh":
                     squad_q, unscoped = self._squad_q(query)
                     msg_limit = max(0, min(300, int(query.get("limit", "80"))))
@@ -2067,8 +2138,10 @@ def make_handler(service, token, *, hosts=()):
                 from almanac import spawner
                 body = self._body()
                 task = str(body.get("task") or "").strip()
-                if len(task) < 20:
-                    raise ValueError("task is required: at least 20 characters saying what the new member is to do")
+                if len(task) < 20 and not body.get("ref"):
+                    raise ValueError("task is required: at least 20 characters saying what the new member is to do "
+                                     "(or ref: an existing queued, unowned task of the squad)")
+                task_row = None
                 port = getattr(self.server, "server_port", 8812)
                 overrides = {}
                 with service.spawn_lock:
@@ -2088,11 +2161,13 @@ def make_handler(service, token, *, hosts=()):
                         if not squad_id or not role_id:
                             raise ValueError("the operator names squad_id and role_id")
                         overrides = {k: body[k] for k in ("model", "effort", "workspace_mode", "permission_mode") if body.get(k)}
+                    if body.get("ref"):          # checked under the lock: two calls cannot both take the task
+                        task_row = spawn_ref_row(service, body["ref"], squad_id)
                     try:
                         res = spawner.join_squad(service, almanac_url=f"http://127.0.0.1:{port}", token=token,
                                                  squad_id=squad_id, role_id=role_id, task=task, agent_name=body.get("name"),
                                                  spawned_by=by, spawned_by_session=by_session, files=body.get("files"),
-                                                 why=_why(body.get("why")), **overrides)
+                                                 why=_why(body.get("why")), task_row=task_row, **overrides)
                     except (RuntimeError, OSError) as exc:
                         res = dict(ok=False, agent_name=body.get("name"), role_id=role_id, error=str(exc))
                 choice = res.get("choice") or {}
@@ -2200,6 +2275,13 @@ def make_handler(service, token, *, hosts=()):
                               for a in res["squad"]["agents"] if not a.get("ok")),
                     self._who())
                 return self._send(200 if res["dispatched"] else 409, res)
+            if method == "POST" and path == "/api/squads/assign":      # the operator's only, like dispatch
+                body = self._body()
+                res = assign_task(service, body.get("ref") or "", body.get("squad_id") or "")
+                service.store.log_action("squad", 0, dict(name=res["squad_id"], ref=res["ref"]), True,
+                                         f"assigned {res['ref']} to squad {res['squad_id']}"
+                                         + ("" if res["lead_live"] else "; its lead is not live"), self._who())
+                return self._send(200, res)
             if method == "POST" and path == "/api/squads":
                 from almanac import spawner
                 body = self._body()

@@ -408,7 +408,7 @@ details table td:first-child, details table th:first-child { text-align: left; }
 .plan td.task, .plan td.last { max-width: none; }
 /* backlog: its own five columns (the id outranks .plan's); TASK and SQUAD TO LAUNCH share what is left */
 #backlog-table th:nth-child(3) { width: auto; } #backlog-table th:nth-child(4) { width: 6ch; }
-#backlog-table th:nth-child(5) { width: 24ch; }
+#backlog-table th:nth-child(5) { width: 46ch; }
 #backlog-table td:nth-child(5) { text-overflow: clip; }
 
 /* markdown (renderMd): agents' words as blocks, in the theme's colours; wide code and tables scroll inside */

@@ -15,6 +15,7 @@ CLI mode (usable from any agent shell or script):
     python -m almanac.mcp_mesh --cli file <title> [--body <text>] [--files <path> ...] [--owner <name>] [--parent <ref>]
     python -m almanac.mcp_mesh --cli log <ref> [<body...>] [--kind <k>] [--status <s>] [--owner <name>]
     python -m almanac.mcp_mesh --cli respawn <ref> [--model <m>] [--effort <e>]
+    python -m almanac.mcp_mesh --cli spawn [<task...>] [--ref <T-n>] [--role <r>] [--name <n>] [--model <m>] [--effort <e>]
     python -m almanac.mcp_mesh --cli restart
 """
 from __future__ import annotations
@@ -153,14 +154,21 @@ MCP_TOOLS = [
             "spawn_role, spawn_limit and spawn_used. You give the task, and the model and effort: both are required when "
             "the role offers more than one (its model plus `models`, its effort plus `efforts`, in mesh_roster's roles), "
             "optional when it offers one. Refused with the reason when the limit is used up or a pick is missing or "
-            "not allowed. The squad is told who joined."
+            "not allowed. The squad is told who joined. With `ref` it puts the new member on an existing task of your "
+            "squad that is queued and unowned (one the operator assigned from the backlog, say) instead of filing a "
+            "new one: the task's body and log are its task and `task` is optional extra instructions."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "task": {
                     "type": "string",
-                    "description": "The new member's slice: what to build, which files it may touch, how to test it, whom to report to.",
+                    "description": ("The new member's slice: what to build, which files it may touch, how to test it, whom to "
+                                    "report to. Required unless `ref` is given; then extra instructions."),
+                },
+                "ref": {
+                    "type": "string",
+                    "description": "An existing task of your squad, e.g. 'T-12', queued and unowned: the member takes it on, with its log.",
                 },
                 "name": {
                     "type": "string",
@@ -179,7 +187,6 @@ MCP_TOOLS = [
                                                              "role offers more than one; else optional.")},
                 "why": {"type": "string", "description": "One line: why this model and effort fit the slice."},
             },
-            "required": ["task"],
         },
     },
     {
@@ -506,10 +513,12 @@ class MeshClient:
             payload = dict(ref=ref, **{k: str(args[k]) for k in ("model", "effort") if args.get(k)})
             return self._api("/api/mesh/object/respawn", method="POST", body=payload, timeout=120.0)
         if name == "mesh_spawn":
-            task = str(args.get("task") or "").strip()
-            if not task:
-                raise ValueError("'task' is required")
+            task, ref = str(args.get("task") or "").strip(), str(args.get("ref") or "").strip()
+            if not task and not ref:
+                raise ValueError("'task' is required (or 'ref': an existing queued, unowned task)")
             payload = {"task": task}
+            if ref:
+                payload["ref"] = ref
             if args.get("name"):
                 payload["name"] = str(args["name"])
             if args.get("role"):
@@ -623,7 +632,8 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
     p_send.add_argument("--re")
 
     p_spawn = sp.add_parser("spawn")
-    p_spawn.add_argument("task", nargs="+")
+    p_spawn.add_argument("task", nargs="*")
+    p_spawn.add_argument("--ref")
     p_spawn.add_argument("--name")
     p_spawn.add_argument("--role")
     p_spawn.add_argument("--files", nargs="*")
@@ -685,7 +695,7 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
             {"peer": ns.peer, "channel": ns.channel, "squad_id": ns.squad_id, "since_id": ns.since_id, "limit": ns.limit},
         )
     elif ns.cmd == "spawn":
-        res = client.call_tool("mesh_spawn", {"task": " ".join(ns.task), "name": ns.name, "role": ns.role,
+        res = client.call_tool("mesh_spawn", {"task": " ".join(ns.task), "ref": ns.ref, "name": ns.name, "role": ns.role,
                                               "files": ns.files, "model": ns.model, "effort": ns.effort, "why": ns.why})
     elif ns.cmd == "respawn":
         res = client.call_tool("mesh_respawn", {"ref": ns.ref, "model": ns.model, "effort": ns.effort})
