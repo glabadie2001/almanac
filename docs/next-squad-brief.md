@@ -57,6 +57,17 @@ none wrong. The exact tally has to be re-derived from the journal when the findi
 Notes v3: seed files and the read path first, then promotion, per `docs/engram-debate-2026-11-11.md` and the
 architect's ruling recorded in `docs/objects-and-knowledge.md`.
 
+Also in the backlog, from the operator: agents still write prose in their own windows, which looks like burnt
+tokens but may be part of their trail of thought. Measured on this squad's Claude transcripts, window prose is 9%
+of what the agents visibly wrote (5% end-of-turn text, 4% narration between tool calls), about 4% of their output
+tokens; the large spend is re-reading context, not this. Three steps, in order:
+
+1. Squad agents' feeds in FLEET and GALLERY default to messages and tools, with prose one click away. This changes
+   what the operator sees, not what agents do.
+2. The squad review shows prose share per agent, role and model, end-of-turn against narration.
+3. Then one charter line ("nobody reads your window; end a turn with one line, the hand-in is the report"), kept
+   only if the share drops and the reviewer's findings do not get worse. Narration is left alone.
+
 ## 6. Known small things left
 
 - A task's previous owner is not told when the task is reassigned.

@@ -43,6 +43,12 @@ form's "also allowed"); an agent adding a member through `mesh_spawn` may pick f
 gives a reason (`why`), and the choice is kept on the new member's task. The operator's own spawns keep their free
 overrides.
 
+**Backlog tasks and one-click dispatch** (the operator's ask). A task can be filed to the project's backlog with no
+squad yet, carrying the squad to launch (roster, spawn role and limit). MESH lists queued backlog tasks in a BACKLOG
+box; one confirmed click launches the squad, and the task becomes its lead's task, so nothing is filed twice. Only
+the operator dispatches; agents may file, read and log to their project's backlog. A lead that fails to start
+starts nobody else and leaves the task queued; a hand-in on a task filed outside the squad notifies the operator.
+
 **Also:** a Gemini role's `add_dirs` (extra workspace folders, `--add-dir`); `#squad` reaches every member of the
 sender's squad (role-form saves had wiped every role's channels, so it reached nobody); a role saved from the form
 keeps what the form does not send (`permission_mode` was reset too); the role form edits channels, allowed
@@ -255,6 +261,9 @@ can be indexed after the fact with a model pass over the saved transcripts, less
 - A restart relies on the launcher (`run.ps1` / `run.cmd` / `run.sh`, exit code 75, `ALMANAC_LAUNCHER=1`).
   A terminal that runs Almanac inside a kill-on-close job object would kill the agents only when that job closes;
   the launcher's loop keeps it open across a restart, but closing the terminal ends them as before.
+- A dispatch whose lead fails to start removes the squad but not a worktree already made for that lead.
+- A backlog task is a row in this machine's database; another machine does not see the backlog. Only a brief written
+  into the repo (such as `docs/next-squad-brief.md`) travels by git.
 - Not seen working against the real thing: auto-continue has never met a really stalled agent (only an injected
   transcript record through the real recover code); `mesh_restart` has never restarted the live hub (only stub
   interpreters and the preflight); a Gemini error class is never retried, for lack of a single saved agy error
