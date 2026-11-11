@@ -378,3 +378,19 @@ details table td:first-child, details table th:first-child { text-align: left; }
 /* gallery: an ended tile stays readable (its last output is the point), dashed and dim in the head */
 .gallery .box.gone { opacity: .85; border-style: dashed; }
 .gallery .box.gone .thead { opacity: .7; }
+/* plan (MESH): the squad's tasks, tree or by owner; status pills and owner chips reuse .flag */
+.plan-mission-row { display: flex; gap: 8px; align-items: baseline; padding-top: 0; }
+.plan-mission { margin: 0; flex: 1; min-width: 0; white-space: pre-wrap; word-break: break-word; color: var(--dim); }
+.plan-mission.clamp { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
+.plan td.task { max-width: 48ch; overflow: hidden; text-overflow: ellipsis; }
+.plan td.last { max-width: 44ch; overflow: hidden; text-overflow: ellipsis; color: var(--dim); }
+.plan .flag { margin-left: 0; }
+.plan tr.group th { color: var(--hi); padding-top: 8px; border-bottom: 1px dotted var(--line); }
+.plan tbody tr:focus-visible td { background: var(--sel); outline: none; }
+.st-queued { color: var(--dim); } .st-in-progress { color: var(--amber); } .st-in-review { color: var(--cyan); }
+.st-accepted { color: var(--hi); } .st-blocked { color: var(--red); font-weight: bold; }
+.own-busy { color: var(--amber); } .own-idle { color: var(--fg); }
+.own-ended { color: var(--dim); border-style: dashed; opacity: .7; } .own-none { color: var(--dim); border-color: transparent; }
+.own-stalled { color: var(--amber); border-style: dotted; }   /* stopped on an API error; an unknown state stays neutral */
+.plan tr.group { cursor: default; }
+.plan tr.group:hover th { background: none; }

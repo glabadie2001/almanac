@@ -62,6 +62,8 @@ const meshState = {
   peers: [], messages: [], selPeer: null, ctxKinds: "", msgScope: "all", channelFilter: "",
   seenMsgIds: new Set(), ctxSig: "", squadFilter: "", open: [], pair: null, squadChosen: false,
 };
+// MESH plan: the selected squad's tasks (GET /api/mesh/objects), refetched only when objects_rev or the squad changes
+const planState = { key: null, rev: undefined, rows: [], note: "", stale: true, sig: "", group: get("plan-group", "tree") };
 // feed filters shared by FLEET, GALLERY and the MESH context stream: [kinds= value, label]
 const KIND_SETS = [["", "all"], ["you,claude,gemini,peer_in,peer_out", "dialog"], ["peer_in,peer_out", "contacts"], ["tool,result,error", "tools"]];
 function fillKindSeg(id, current) {
@@ -1442,7 +1444,7 @@ $("mesh-spawn-jump").addEventListener("click", () => {
   show("fleet");
   setDrawer("spawn-drawer", "toggle-spawn", true);
 });
-$("mesh-refresh").addEventListener("click", () => { loadMesh(); if (meshState.selPeer) loadPeerContext(); });
+$("mesh-refresh").addEventListener("click", () => { planState.stale = true; loadMesh(); if (meshState.selPeer) loadPeerContext(); });
 
 // The selected peer is held by session id when there is one (a handle can be reused across squads, and
 // /api/mesh/context?peer=<handle> opens the newest live session of that name); the handle is kept beside it
@@ -1460,6 +1462,7 @@ function selectPeer(name, sid, setTo = true) {
   meshState.selPeer = sid || name || null;
   meshState.selName = name || sid || null;
   meshState.ctxSig = "";
+  closeTask();
   if (setTo && name && document.activeElement !== $("mesh-to")) setMeshTo(name);
 }
 function pickPeer(name, sid) { selectPeer(name, sid); loadMesh(); loadPeerContext(); }
@@ -1474,6 +1477,7 @@ function setMeshSquad(id) {
   meshState.squadFilter = id || "";
   meshState.squadChosen = true;
   meshState.revalidate = true;
+  closeTask();
   setPairFilter(null, null);
 }
 function clearPeerContext() {
@@ -1607,6 +1611,8 @@ async function loadMesh() {
     loadPeerContext();
   }
   paintMeshMessages();
+  paintPlan();                 // owner chips follow the roster on every poll
+  loadPlan(doc.objects_rev);   // the rows are refetched only when objects_rev (or the squad) changes
   loadHeat();      // only when the scope changed; the 30 s loop refreshes it
   loadTopo(false, doc.latest_id);
 }
@@ -1741,16 +1747,16 @@ function paintMeshMessages() {
 
 async function loadPeerContext() {
   const want = meshState.selPeer;
-  if (!want) return;
+  if (!want || meshState.selTask) return;          // a task holds the pane until a peer is picked
   let doc;
   try {
     const kindsQ = meshState.ctxKinds ? `&kinds=${encodeURIComponent(meshState.ctxKinds)}` : "";
     doc = await api(`/api/mesh/context?peer=${encodeURIComponent(want)}&limit=60${kindsQ}`);
   } catch (err) {
-    if (meshState.selPeer === want) $("mesh-ctx-head").replaceChildren(el("span", { cls: "red", text: err.message }));
+    if (meshState.selPeer === want && !meshState.selTask) $("mesh-ctx-head").replaceChildren(el("span", { cls: "red", text: err.message }));
     return;
   }
-  if (meshState.selPeer !== want) return;          // another peer was picked meanwhile
+  if (meshState.selPeer !== want || meshState.selTask) return;   // another peer or a task was picked meanwhile
   const p = doc.peer, u = doc.usage;
   $("mesh-ctx-box").setAttribute("data-title", `CONTEXT STREAM // ${p.name}`.slice(0, 56));
   $("mesh-ctx-head").replaceChildren(...[    // replaceChildren would print a null as "null"
@@ -1772,6 +1778,216 @@ async function loadPeerContext() {
     ? events.map((e) => el("li", { cls: e.kind, text: e.text, title: e.ts ? new Date(e.ts).toLocaleString() : null }))
     : [el("li", { cls: "result", text: "no matching context events yet" })]));
   if (atBottom) feed.scrollTop = feed.scrollHeight;
+}
+
+// ------------------------------------------------------------------ mesh: plan (the squad's tasks, who owns which)
+// Read-only. Titles, bodies and log lines are written by agents: set with textContent only (el()).
+const PLAN_STATUSES = ["queued", "in progress", "in review", "accepted", "blocked"];
+const PLAN_EMPTY = "No tasks filed. The architect files them with mesh_file.";
+const PLAN_FIXTURE = new URLSearchParams(location.search).get("plan") === "fixture";   // ?plan=fixture: draw sample rows
+const slug = (s) => String(s || "").toLowerCase().replace(/[^a-z]+/g, "-");
+
+// fetch, not api(): a server older than the plan answers 404 for these routes, which must neither flag the LINK as down
+// nor show an error; it returns null and the plan shows its empty state
+async function planGet(path) {
+  if (PLAN_FIXTURE) return planFixture(path);
+  const res = await fetch(path, { credentials: "same-origin" });
+  const doc = await res.json().catch(() => ({}));
+  if (res.status === 404 && doc.error === "Not found") return null;
+  if (!res.ok) throw new Error(doc.error || `${res.status}`);
+  return doc;
+}
+
+async function loadPlan(rev) {
+  const sq = meshState.squadFilter;
+  if (!planState.stale && sq === planState.key && rev === planState.rev) return;
+  if (sq !== planState.key) { planState.rows = []; planState.note = "loading plan…"; }
+  planState.stale = false; planState.key = sq; planState.rev = rev;
+  if (!sq) { planState.note = "pick a squad above to see its plan"; paintPlan(); return; }
+  let doc;
+  try {
+    doc = await planGet(`/api/mesh/objects?squad=${encodeURIComponent(sq)}&kind=task&limit=500`);
+  } catch (err) {
+    if (sq !== meshState.squadFilter) return;
+    planState.stale = true;                            // retried on the next poll, only while it fails
+    planState.note = `plan unavailable: ${err.message}`;
+    paintPlan();
+    return;
+  }
+  if (sq !== meshState.squadFilter) return;            // the squad changed while this was in flight
+  planState.rows = doc?.objects || [];
+  planState.note = "";
+  paintPlan();
+  if (meshState.selTask) loadTask(meshState.selTask);
+}
+
+// busy / idle / ended follow the roster on every poll (it is fresher than the fetched rows: a live owner is busy or
+// idle, an absent one has ended); any other value the door sends (stalled, later ones) is drawn as sent
+function planOwnerState(o) {
+  if (!o.owner_name) return "none";
+  if (o.owner_state && !["busy", "idle", "ended"].includes(o.owner_state)) return o.owner_state;
+  const p = meshState.peers.find((q) => (o.owner_session ? q.session_id === o.owner_session : q.name === o.owner_name));
+  return p ? (active(p) ? "busy" : "idle") : "ended";
+}
+const statusPill = (s) => el("span", { cls: `flag st-${slug(s)}`, text: s || "–" });
+function ownerChip(o) {
+  const own = planOwnerState(o);
+  return el("span", { cls: `flag own-${slug(own)}`, text: o.owner_name || "unowned",
+    title: own === "none" ? "nobody owns this task" : `${o.owner_name}: ${own}` });
+}
+function planLast(l) {
+  if (!l) return "";
+  const what = l.kind === "status" && l.status_to ? l.status_to
+    : `${["note", "status", "create"].includes(l.kind) ? "" : `${l.kind}: `}${(l.body || "").replace(/\s+/g, " ")}`;
+  return `${l.agent_name} · ${what} · ${age(l.ts)}`;
+}
+
+function planRow(o, depth, byOwner) {
+  const task = el("td", { cls: "task", title: o.title },
+    byOwner ? (o.parent ? el("span", { cls: "dim", text: `${o.parent} › ` }) : null) : (depth ? el("span", { cls: "dim", text: "└ " }) : null),
+    o.title,
+    o.children?.total ? el("span", { cls: "dim", text: ` · accepted ${o.children.accepted}/${o.children.total}` }) : null);
+  if (!byOwner && depth) task.style.paddingLeft = `${8 + depth * 16}px`;   // CSSOM: the CSP allows no style attribute
+  const tr = el("tr", { tabindex: "0", "data-ref": o.ref, cls: meshState.selTask === o.ref ? "sel" : "" },
+    el("td", { cls: "cyan", text: o.ref }),
+    task,
+    el("td", {}, statusPill(o.status)),
+    el("td", {}, ownerChip(o)),
+    el("td", { cls: "r", text: String(o.files?.length || 0), title: (o.files || []).join("\n") }),
+    el("td", { cls: "last", text: planLast(o.last_log), title: o.last_log?.body || "" }),
+  );
+  tr.addEventListener("click", () => openTask(o.ref));
+  tr.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTask(o.ref); } });
+  return tr;
+}
+
+function paintPlan() {
+  const squad = state.squads.find((s) => s.id === meshState.squadFilter);
+  const brief = squad?.brief || "", mp = $("plan-mission"), tog = $("plan-mission-toggle");
+  $("plan-mission-row").hidden = !brief;
+  if (mp.textContent !== brief) {
+    mp.textContent = brief;
+    mp.classList.add("clamp"); tog.setAttribute("aria-expanded", "false"); tog.textContent = "[more]";
+  }
+  if (brief) tog.hidden = mp.classList.contains("clamp") && mp.scrollHeight <= mp.clientHeight + 1;   // fits in two lines
+
+  const rows = planState.rows, byOwner = planState.group === "owner";
+  const sig = JSON.stringify([planState.group, meshState.selTask, planState.note, rows, rows.map(planOwnerState), rows.map((o) => planLast(o.last_log))]);
+  if (sig === planState.sig) return;                   // polled: do not rebuild (and drop focus) when nothing changed
+  planState.sig = sig;
+  $("plan-counts").replaceChildren(
+    el("span", { cls: "hi", text: `${rows.length} task${rows.length === 1 ? "" : "s"}` }),
+    ...PLAN_STATUSES.flatMap((s) => {
+      const n = rows.filter((o) => o.status === s).length;
+      return n ? [" · ", el("span", { cls: `st-${slug(s)}`, text: `${n} ${s}` })] : [];
+    }));
+  $("plan-empty").hidden = rows.length > 0;
+  $("plan-empty").textContent = planState.note || PLAN_EMPTY;
+  $("plan-table").hidden = !rows.length;
+  let trs;
+  if (byOwner) {
+    const groups = new Map();
+    for (const o of rows) { const k = o.owner_name || ""; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(o); }
+    const keys = [...groups.keys()].filter(Boolean).sort();
+    if (groups.has("")) keys.push("");                 // unowned last
+    trs = keys.flatMap((k) => [
+      el("tr", { cls: "group" }, el("th", { colspan: "6", text: `${k || "unowned"} · ${groups.get(k).length}` })),
+      ...groups.get(k).map((o) => planRow(o, 0, true))]);
+  } else {
+    const depth = new Map();                           // rows arrive in tree order: a parent before its children
+    for (const o of rows) depth.set(o.ref, o.parent && depth.has(o.parent) ? depth.get(o.parent) + 1 : 0);
+    trs = rows.map((o) => planRow(o, depth.get(o.ref), false));
+  }
+  const focused = document.activeElement?.closest?.("#plan-table tr")?.dataset.ref;
+  $("plan-table").querySelector("tbody").replaceChildren(...trs);
+  if (focused) $("plan-table").querySelector(`tr[data-ref="${CSS.escape(focused)}"]`)?.focus();
+}
+
+$("plan-group").addEventListener("click", (e) => {
+  if (!e.target.dataset.v) return;
+  planState.group = e.target.dataset.v;
+  put("plan-group", planState.group);
+  pressKindSeg("plan-group", planState.group);
+  paintPlan();
+});
+pressKindSeg("plan-group", planState.group);
+$("plan-mission-toggle").addEventListener("click", (e) => {
+  const open = !$("plan-mission").classList.toggle("clamp");
+  e.target.setAttribute("aria-expanded", String(open));
+  e.target.textContent = open ? "[less]" : "[more]";
+});
+
+// a task opens in the peer context pane and holds it until a peer is picked or the squad changes
+function openTask(ref) {
+  meshState.selTask = ref;
+  paintPlan();
+  $("mesh-ctx-box").setAttribute("data-title", `TASK // ${ref}`.slice(0, 56));
+  $("mesh-ctx-kinds").hidden = true;
+  $("mesh-ctx-head").replaceChildren(el("span", { cls: "dim", text: `loading ${ref}…` }));
+  $("mesh-ctx-feed").replaceChildren();
+  loadTask(ref);
+}
+function closeTask() {
+  if (!meshState.selTask) return;
+  meshState.selTask = null;
+  meshState.ctxSig = "";
+  $("mesh-ctx-kinds").hidden = false;
+  clearPeerContext();                                  // the next loadPeerContext() repaints the peer
+  paintPlan();
+}
+
+async function loadTask(ref) {
+  let doc;
+  try {
+    doc = await planGet(`/api/mesh/object?ref=${encodeURIComponent(ref)}&log_limit=500`);
+  } catch (err) {
+    if (meshState.selTask === ref) $("mesh-ctx-head").replaceChildren(el("span", { cls: "red", text: `${ref}: ${err.message}` }));
+    return;
+  }
+  if (meshState.selTask !== ref) return;
+  if (!doc) { $("mesh-ctx-head").replaceChildren(el("span", { cls: "dim", text: "this server predates tasks: restart Almanac" })); return; }
+  const o = doc.object, log = doc.log || [];
+  $("mesh-ctx-head").replaceChildren(...[            // replaceChildren would print a null as "null"
+    el("span", { cls: "title", text: `${o.ref} ${o.title}` }), " ", statusPill(o.status), " ", ownerChip(o),
+    el("span", { cls: "dim", text: ` · filed by ${o.created_by_name} ${age(o.created_ts)} ago${o.parent ? ` · part of ${o.parent}` : ""}` }),
+    o.children?.total ? el("span", { cls: "dim", text: ` · accepted ${o.children.accepted}/${o.children.total}` }) : null,
+  ].filter((n) => n !== null));
+  const logLine = (l) => `${clock(l.ts)} ${l.agent_name} [${l.kind}]`
+    + `${l.status_to ? ` ${l.status_from || "–"} → ${l.status_to}` : ""}${l.owner_to ? ` owner → ${l.owner_to}` : ""}`
+    + `${l.body ? `\n${l.body}` : ""}`;
+  const logCls = (k) => (k === "dead" ? "error" : k === "message" ? "peer_out" : k === "status" || k === "assign" ? "tool" : "claude");
+  $("mesh-ctx-feed").replaceChildren(
+    el("li", { cls: "you", text: o.body || "(no body)" }),
+    el("li", { cls: "result", text: o.files?.length ? `files: ${o.files.join(", ")}` : "files: none" }),
+    ...(log.length
+      ? log.map((l) => el("li", { cls: logCls(l.kind), text: logLine(l), title: new Date(l.ts * 1000).toLocaleString() }))
+      : [el("li", { cls: "result", text: "no log entries yet" })]),
+  );
+  $("mesh-ctx-feed").scrollTop = 0;                    // the log is newest first
+}
+
+// ponytail: sample data for ?plan=fixture, so the view can be checked without the backend; drop once it has real rows
+function planFixture(path) {
+  const now = Date.now() / 1000;
+  const t = (id, parent, title, status, owner, files, last, children = { total: 0, accepted: 0 }, ownerState = owner ? "idle" : null) => ({
+    ref: `T-${id}`, id, kind: "task", title, status, squad_id: meshState.squadFilter, parent: parent ? `T-${parent}` : null,
+    owner_name: owner, owner_session: null, owner_state: ownerState, files, created_by_name: "arch-claude",
+    created_ts: now - 3600, updated_ts: now - 60, children, log_count: 2,
+    last_log: last && { ts: now - last[0], agent_name: last[1], kind: last[2], body: last[3], status_to: last[2] === "status" ? last[3] : null } });
+  const objects = [
+    t(1, null, "Stage 1: the plan view", "in progress", "arch-claude", [], [300, "arch-claude", "note", "split into backend and view"], { total: 2, accepted: 1 }),
+    t(2, 1, "S1-backend: objects, object_log, routes", "accepted", "impl-backend", ["almanac/store.py", "almanac/web.py"], [900, "rev-gemini", "status", "accepted"]),
+    t(3, 1, "S1-view: PLAN in MESH <b>stays text</b>", "in review", "impl-plan", ["almanac/static/app.js"], [240, "impl-plan", "status", "in review"]),
+    t(4, null, "Engram export to markdown", "queued", null, [], null),
+    t(5, null, "Old two-part tokens keep parsing", "blocked", "gone-agent", ["almanac/web.py"], [60, "gone-agent", "dead", "three-way split broke them"]),
+    t(6, 5, "Retry after the API error", "in progress", "impl-claude", [], null, undefined, "stalled"),
+  ];
+  if (path.startsWith("/api/mesh/objects")) return { objects, rev: 1 };
+  const o = objects.find((x) => x.ref === new URLSearchParams(path.split("?")[1]).get("ref"));
+  if (!o) throw new Error("unknown ref");
+  return { object: { ...o, body: `Body of ${o.ref}.\n<i>markup</i> stays text.` }, log: [
+    { id: 2, ts: now - 240, agent_name: o.owner_name || "arch-claude", kind: "status", body: "handed in", status_from: "in progress", status_to: o.status },
+    { id: 1, ts: now - 3600, agent_name: "arch-claude", kind: "create", body: "filed" }] };
 }
 
 // ------------------------------------------------------------------ mesh: topology (who talks to whom)
@@ -2763,7 +2979,7 @@ function show(tab) {
   if (tab === "inbox") { inboxState.sig = ""; inboxState.squadsStale = true; loadInbox(); paintNotifyToggle(); }
   if (tab === "fleet") loadFleet();
   if (tab === "gallery") loadFleet().then(loadGallery);
-  if (tab === "mesh") { loadMesh().then(() => { loadHeat(true); loadTopo(true); }); if (meshState.selPeer) loadPeerContext(); }
+  if (tab === "mesh") { planState.stale = true; loadMesh().then(() => { loadHeat(true); loadTopo(true); }); if (meshState.selPeer) loadPeerContext(); }
 }
 document.querySelectorAll(".tabs [role=tab]").forEach((b) => b.addEventListener("click", () => show(b.dataset.tab)));
 $("help-btn").addEventListener("click", () => { $("help").hidden = !$("help").hidden; });
