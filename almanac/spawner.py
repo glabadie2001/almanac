@@ -603,7 +603,7 @@ def _spawn_agent(
             initial_prompt = initial_prompt(PROMPT_UNBOUNDED) if callable(initial_prompt) else initial_prompt
             if before_launch:
                 before_launch()
-            out_fh =(spawn_dir / "claude-stream.jsonl").open("a", encoding="utf-8")
+            out_fh = (spawn_dir / "claude-stream.jsonl").open("a", encoding="utf-8")
             err_fh = (spawn_dir / "claude-stderr.log").open("a", encoding="utf-8")
             try:
                 proc = subprocess.Popen(
