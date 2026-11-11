@@ -428,3 +428,6 @@ details table td:first-child, details table th:first-child { text-align: left; }
 .md th { color: var(--hi); }
 .md a { color: var(--cyan); text-decoration: underline; }
 .md strong { color: var(--hi); }
+/* a stalled agent (stopped on an API error) in FLEET and the MESH roster; a notice from Almanac in the inbox */
+.flag.stalled { color: var(--amber); margin-left: 0; font-weight: bold; }
+#inbox-feed li.from-sys { box-shadow: inset 2px 0 0 var(--amber); padding-left: 6px; }

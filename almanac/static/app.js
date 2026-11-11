@@ -73,6 +73,12 @@ function pressKindSeg(id, current) {
   document.querySelectorAll(`#${id} button`).forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.v === current)));
 }
 const OPERATOR = new Set(["operator", "almanac-hub"]);
+// a hub notice (transport "system", e.g. an escalation "[stalled] impl-x ...") is sent as almanac-hub but is not the
+// operator's own: it comes from the system, about the agent its body names. Rows without the field read as before.
+const isSystem = (m) => m.transport === "system";
+const sysAgent = (m) => (isSystem(m) && /^\[stalled\]\s+(\S+)/.exec(m.body || "")?.[1]) || null;
+const isMine = (m) => OPERATOR.has(m.from_name) && !isSystem(m);
+const msgFrom = (m) => (isSystem(m) ? sysAgent(m) || "system" : m.from_name);   // who a message is about, for a label
 const ANY_ROLE_NOTE = "any role the operator has defined, including ones that may page you or add members themselves "
   + "(an architect); every member added still counts against this one limit";
 const hhmm = (ts) => new Date(ts * 1000).toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit" });
@@ -814,7 +820,8 @@ function syncRoleControls() {
     tbody.replaceChildren(...state.roles.map((r) => {
       const tr = el("tr", {},
         el("td", {}, r.id, r.may_page_operator ? el("span", { cls: "amber", text: " ✉", title: "may page the operator" }) : null,
-          r.may_spawn ? el("span", { cls: "cyan", text: " ⊕", title: "may add squad members" }) : null),
+          r.may_spawn ? el("span", { cls: "cyan", text: " ⊕", title: "may add squad members" }) : null,
+          r.may_restart ? el("span", { cls: "red", text: " ⟳", title: "may restart Almanac" }) : null),
         el("td", {}, providerBadge(r.provider)),
         el("td", { text: r.title }),
         el("td", { cls: "model", text: fmtModel(r.model) }),
@@ -1012,6 +1019,8 @@ function rowName(p) {
 }
 function rowState(p) {
   if (p.role !== "session") return el("span", { cls: "dim", text: p.role === "desktop" ? "app" : p.role });
+  if (p.stall) return el("span", { cls: "flag stalled", text: `▲ STALLED${p.stall.error ? ` · ${p.stall.error}` : ""}`,
+    title: [p.stall.text, p.stall.since ? `since ${age(p.stall.since)} ago` : ""].filter(Boolean).join("\n") || "stopped on an API error" });
   if (active(p)) return el("span", { cls: "state-busy" }, el("span", { cls: "spin", "data-spin": "1", text: SPIN[state.frame % SPIN.length] }), ` ${p.status.toUpperCase()}`);
   return el("span", { cls: "state-idle", text: `· ${p.status || "starting"}` });
 }
@@ -1661,6 +1670,7 @@ function populateRoleForm(r) {
   $("role-prompt").value = r ? (r.system_prompt || "") : "";
   $("role-page").checked = !!r?.may_page_operator;
   $("role-grow").checked = !!r?.may_spawn;
+  $("role-restart").checked = !!r?.may_restart;
   $("role-channels").value = (r?.channels || []).join(", ");
   $("role-commands").value = (r?.allowed_commands || []).join("\n");
   $("role-dirs").value = (r?.add_dirs || []).join("\n");
@@ -1690,6 +1700,7 @@ $("role-save").closest("form").addEventListener("submit", async (e) => {
       system_prompt: $("role-prompt").value.trim(),
       may_page_operator: $("role-page").checked,
       may_spawn: $("role-grow").checked,
+      may_restart: $("role-restart").checked,          // a server without the flag ignores the key
       channels: $("role-channels").value.split(",").map((s) => s.trim()).filter(Boolean),
       allowed_commands: $("role-commands").value,
       add_dirs: $("role-dirs").value,
@@ -1966,8 +1977,8 @@ function paintSquadStrip() {
   const brief = (squad.brief || "").replace(/\s+/g, " ").trim();
   const waits = meshState.open.map((m) => {
     const toOp = OPERATOR.has(m.to_name);
-    const text = toOp && m.needs === "blocking" ? `${m.from_name} blocked on operator for ${age(m.ts)}`
-      : `${m.from_name} waits on ${toOp ? "operator" : m.to_name} ${age(m.ts)} (${m.needs})`;
+    const text = toOp && m.needs === "blocking" ? `${msgFrom(m)} blocked on operator for ${age(m.ts)}`
+      : `${msgFrom(m)} waits on ${toOp ? "operator" : m.to_name} ${age(m.ts)} (${m.needs})`;
     return el("span", { cls: m.needs === "blocking" ? "flag blocking" : "flag reply", text, title: m.body.slice(0, 400) });
   });
   paintStripTools(squad);
@@ -3010,7 +3021,7 @@ async function notifyBlocking() {
   for (const m of doc.messages) {
     if (m.needs !== "blocking" || m.answered_ts || !OPERATOR.has(m.to_name) || inboxState.notified.has(m.id)) continue;
     inboxState.notified.add(m.id);
-    const n = new Notification(`${m.from_name} is blocked on you`, { body: m.body.slice(0, 200), tag: `almanac-${m.id}` });
+    const n = new Notification(isSystem(m) ? `${msgFrom(m)} is stalled` : `${m.from_name} is blocked on you`, { body: m.body.slice(0, 200), tag: `almanac-${m.id}` });
     n.onclick = () => { window.focus(); show("inbox"); selectThread(threadKey(m)); n.close(); };
   }
   put("notified", JSON.stringify([...inboxState.notified].slice(-500)));
@@ -3037,7 +3048,7 @@ $("inbox-notify").addEventListener("click", async () => {
 });
 
 // a thread is everything between the operator and one other party in one squad
-const threadKey = (m) => `${OPERATOR.has(m.from_name) ? m.to_name : m.from_name}\u0000${m.squad_id || ""}`;
+const threadKey = (m) => `${isMine(m) ? m.to_name : msgFrom(m)}\u0000${m.squad_id || ""}`;
 function buildThreads(messages) {
   const by = new Map();
   for (const m of messages) {
@@ -3046,7 +3057,7 @@ function buildThreads(messages) {
     const t = by.get(k) || { key: k, other, squad, session: null, msgs: [], unread: 0, open: [], last: 0 };
     t.msgs.push(m);
     // handles repeat across squads: address the other party by its newest session id, never by name alone
-    const sid = OPERATOR.has(m.from_name) ? m.to_session : m.from_session;
+    const sid = isMine(m) ? m.to_session : isSystem(m) ? null : m.from_session;   // a notice's session is the hub's
     if (sid && m.ts >= (t.sessionTs || 0)) { t.session = sid; t.sessionTs = m.ts; }
     t.last = Math.max(t.last, m.ts);
     if (OPERATOR.has(m.to_name) && !m.read_ts) t.unread += 1;
@@ -3106,14 +3117,14 @@ function paintThreads() {
     const last = t.msgs.at(-1);
     const btn = el("button", { type: "button", cls: `thread${t.key === inboxState.sel ? " sel" : ""}`, "aria-current": t.key === inboxState.sel ? "true" : null },
       el("span", { cls: "thread-head" },
-        el("span", { cls: OPERATOR.has(last.from_name) ? "cyan" : "hi", text: t.other }),
+        el("span", { cls: isMine(last) ? "cyan" : "hi", text: t.other }),
         t.squad ? el("span", { cls: "dim", text: ` · ${t.squad}` }) : null,
         el("span", { cls: "grow" }),
         t.unread ? el("span", { cls: "unread", text: `${t.unread} new` }) : null,
         blocking.length ? el("span", { cls: "flag blocking", text: `BLOCKING ${age(oldest)}` })
           : replying.length ? el("span", { cls: "flag reply", text: "REPLY" }) : null,
         el("span", { cls: "dim", text: ` ${when(last.ts)}` })),
-      el("span", { cls: "thread-last dim", text: `${OPERATOR.has(last.from_name) ? "you: " : ""}${last.body}`.replace(/\s+/g, " ").slice(0, 90) }));
+      el("span", { cls: "thread-last dim", text: `${isMine(last) ? "you: " : isSystem(last) ? "system: " : ""}${last.body}`.replace(/\s+/g, " ").slice(0, 90) }));
     btn.addEventListener("click", () => selectThread(t.key));
     return el("li", {}, btn);
   }));
@@ -3139,7 +3150,7 @@ async function markThreadRead(t) {
 function paintThread() {
   const t = inboxState.threads.find((x) => x.key === inboxState.sel);
   const form = $("inbox-form"), feed = $("inbox-feed");
-  form.hidden = !t;
+  form.hidden = !t || t.other === "system";             // a notice naming no agent has nobody to answer
   if (!t) {
     $("inbox-head").replaceChildren(el("span", { cls: "dim", text: inboxState.threads.length ? "select a thread on the left" : "" }));
     feed.replaceChildren();
@@ -3153,14 +3164,14 @@ function paintThread() {
     t.squad ? el("span", { cls: "dim", text: ` · squad ${t.squad}` }) : null,
     t.session ? el("span", { cls: "dim", text: ` · session ${t.session.slice(0, 8)}`, title: t.session }) : null,
     el("span", { cls: "dim", text: ` · ${t.msgs.length} message${t.msgs.length === 1 ? "" : "s"}` }),
-    peer ? el("span", { cls: "dim", text: ` · ${peer.status || "idle"}` }) : null].filter(Boolean));
+    peer ? el("span", { cls: peer.stall ? "amber" : "dim", text: ` · ${peer.stall ? `stalled (${peer.stall.error || "API error"})` : peer.status || "idle"}` }) : null].filter(Boolean));
   $("inbox-to").textContent = t.session ? `${t.other} (${t.session.slice(0, 8)})` : t.other;
   const sig = JSON.stringify(t.msgs.map((m) => [m.id, m.answered_ts])) + Math.floor(Date.now() / 30000);
   if (sig !== inboxState.feedSig) {
     inboxState.feedSig = sig;
     const atBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 40;
     feed.replaceChildren(...t.msgs.map((m) => {
-      const mine = OPERATOR.has(m.from_name);
+      const mine = isMine(m), sys = isSystem(m);
       const resolve = m.needs && !m.answered_ts
         ? el("button", { type: "button", cls: "btn", text: "[RESOLVE ✓]", title: "close this flag by hand (no reply needed)" }) : null;
       resolve?.addEventListener("click", async () => {
@@ -3171,10 +3182,11 @@ function paintThread() {
         } catch (err) { $("inbox-msg").textContent = `failed: ${err.message}`; }
         inboxState.sig = ""; await loadInbox(); loadInboxCounts();
       });
-      return el("li", { cls: mine ? "from-op" : "" },
+      return el("li", { cls: mine ? "from-op" : sys ? "from-sys" : "" },
         el("div", { cls: "msg-head" },
           el("span", { cls: "dim", text: clock(m.ts) }),
-          el("span", { cls: mine ? "cyan" : "hi", text: mine ? "you" : m.from_name }),
+          el("span", { cls: mine ? "cyan" : sys ? "amber" : "hi", text: mine ? "you" : sys ? "system" : m.from_name,
+            title: sys ? "a notice from Almanac itself, not from you" : null }),
           el("span", { cls: "dim", text: "──▸" }),
           el("span", { cls: "dim", text: OPERATOR.has(m.to_name) ? "you" : m.to_name }),
           m.channel ? el("span", { cls: "violet", text: m.channel }) : null,
