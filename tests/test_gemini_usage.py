@@ -98,3 +98,38 @@ class GeminiUsageTests(Fixture):
         self.store.close()
         self.store = Store(self.state / "almanac.db")      # and only once
         self.assertTrue(self.store.db.execute("select count(*) from files").fetchone()[0])
+
+    def test_ingest_stores_the_step_figure_as_the_sessions_context(self):
+        own = turn("g1", 1, 13302, 84, 8263)
+        own["context_tokens"] = 11248
+        write_jsonl(self.path, [own])
+        self.store.ingest(self.gem, provider="gemini")
+        self.assertEqual(self.store.session_context("g1"), 11248)
+        self.assertEqual(self.rows(), [(13302, 84, 8263)])          # usage keeps the turn's counts
+
+
+class GeminiStepContextTests(Fixture):
+    """A step's own re-read is `input_tokens + cache_read_tokens` of its step_update usage; result.usage is the total."""
+    STEP1 = {"event": "step_update", "step_update": {"step_index": 1, "step_type": "agent_response", "state": "DONE", "usage": {
+        "input_tokens": 10317, "output_tokens": 24, "thinking_tokens": 19, "cache_read_tokens": 0, "total_tokens": 10341}}}
+    STEP3 = {"event": "step_update", "step_update": {"step_index": 3, "step_type": "agent_response", "state": "DONE", "usage": {
+        "input_tokens": 2985, "output_tokens": 784, "thinking_tokens": 27, "cache_read_tokens": 8263, "total_tokens": 3769}}}
+    RESULT = {"event": "result", "result": {"usage": {"input_tokens": 13302, "cache_read_tokens": 8263}}}
+
+    def test_a_step_is_its_own_input_plus_cache_read(self):
+        from almanac.gemini_host import step_context
+        self.assertEqual([step_context(e) for e in (self.STEP1, self.STEP3)], [10317, 11248])
+        self.assertIsNone(step_context(self.RESULT))                      # the running total is not a step
+        self.assertIsNone(step_context({"event": "step_update", "step_update": {"step_type": "tool"}}))
+
+    def test_read_tail_prefers_the_step_figure_and_marks_a_total_only_when_it_is_all_there_is(self):
+        from almanac import fleet as fl
+        path = self.root / "g.jsonl"
+        own = turn("g1", 1, 13302, 84, 8263)
+        own["context_tokens"] = 11248
+        write_jsonl(path, [own])
+        meta = fl.read_tail(path)[1]
+        self.assertEqual((meta["context"], meta["context_total"]), (11248, False))
+        write_jsonl(path, [turn("g1", 1, 13302, 84, 8263)])               # an old transcript: the total, marked
+        meta = fl.read_tail(path)[1]
+        self.assertEqual((meta["context"], meta["context_total"]), (21565, True))

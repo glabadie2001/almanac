@@ -1276,7 +1276,7 @@ async function loadFleet() {
       el("td", { cls: "role-tag", text: p.role === "session" ? (p.agent_role || "–").slice(0, 18) : "" }),
       modelCell,
       effortCell,
-      el("td", { cls: `r${ctxWarn(p.context)}`, text: p.role === "session" ? ctxText(p.context, p.provider) : "", title: p.context ? `${ctxTitle(p.provider)} (${p.context})` : null }),
+      el("td", { cls: `r${ctxWarn(p.context)}`, text: p.role === "session" ? ctxText(p.context, p.context_total) : "", title: p.context ? `${ctxTitle(p.context_total)} (${p.context})` : null }),
       el("td", {}, rowState(p)), el("td", { cls: "r", text: p.cpu === null ? "–" : `${num(p.cpu)}%` }),
       el("td", { cls: "spark", text: spark(state.cpu.get(key), Math.max(5, ...state.cpu.get(key))) }),
       el("td", { cls: "r", text: `${p.mem_mb}M` }), el("td", { cls: "r", text: age(p.started) }));
@@ -2177,10 +2177,14 @@ async function loadPlan(rev) {
 // the roster decides on every poll, as it is fresher than the fetched rows: a live owner is stalled (stopped on an API
 // error), busy or idle, and an absent one has ended. The rows are only fetched after a roster poll, so the door's own
 // owner_state is never needed here.
-// A step's re-read, in k. A Gemini number is agy's running total for the conversation, not one step's: Σ says so.
-const ctxText = (n, provider) => n ? `${ktok(n)}${provider === "gemini" ? "Σ" : ""}` : "";
+// A step's re-read, in k. Σ: only agy's running total for the conversation is known (a Gemini record without its own step figure).
+const ctxText = (n, total) => n ? `${ktok(n)}${total ? "Σ" : ""}` : "";
 const ctxWarn = (n) => n && state.ctxWarn && n >= state.ctxWarn ? " ctx-warn" : "";
-const ctxTitle = (provider) => provider === "gemini" ? "tokens agy reports for the whole conversation so far (not one step's re-read)" : "tokens its last step re-read";
+const ctxTitle = (total) => total ? "tokens agy reports for the whole conversation so far (not one step's re-read)" : "tokens its last step re-read";
+function planOwnerCtx(o) {      // the live peer's, else what the doc carried (an ended owner's last stored)
+  const peer = meshState.peers.find((q) => o.owner_session && q.session_id === o.owner_session);
+  return peer ? [peer.context, !!peer.context_total] : [o.owner_context, !!o.owner_context_total];
+}
 function planOwnerState(o) {
   if (!o.owner_name) return "none";
   const p = meshState.peers.find((q) => (o.owner_session ? q.session_id === o.owner_session : q.name === o.owner_name));
@@ -2190,11 +2194,11 @@ const statusPill = (s) => el("span", { cls: `flag st-${slug(s)}`, text: s || "�
 function ownerChip(o) {
   const own = planOwnerState(o);
   const plain = ["none", "busy", "idle", "ended"].includes(own);   // colour says these; any other state is spelled out
-  const peer = meshState.peers.find((q) => o.owner_session && q.session_id === o.owner_session);   // live; owner_context is the fallback
-  const ctx = ctxText(peer ? peer.context : o.owner_context, peer?.provider);
+  const [n, total] = planOwnerCtx(o);
+  const ctx = ctxText(n, total);
   const base = plain ? o.owner_name || "unowned" : `${o.owner_name} · ${own}`;
-  return el("span", { cls: `flag own-${slug(own)}${ctxWarn(peer ? peer.context : o.owner_context)}`, text: ctx && own !== "none" ? `${base} · ${ctx}` : base,
-    title: own === "none" ? "nobody owns this task" : `${o.owner_name}: ${own}${ctx ? ` · context ${ctx}: ${ctxTitle(peer?.provider)}` : ""}` });
+  return el("span", { cls: `flag own-${slug(own)}${ctxWarn(n)}`, text: ctx && own !== "none" ? `${base} · ${ctx}` : base,
+    title: own === "none" ? "nobody owns this task" : `${o.owner_name}: ${own}${ctx ? ` · context ${ctx}: ${ctxTitle(total)}` : ""}` });
 }
 function planLast(l) {
   if (!l) return "";
@@ -2236,7 +2240,7 @@ function paintPlan() {
   if (brief) tog.hidden = mp.classList.contains("clamp") && mp.scrollHeight <= mp.clientHeight + 1;   // fits in two lines
 
   const rows = planState.rows, byOwner = planState.group === "owner";
-  const sig = JSON.stringify([planState.group, meshState.selTask, planState.note, rows, rows.map(planOwnerState), rows.map((o) => planLast(o.last_log))]);
+  const sig = JSON.stringify([planState.group, meshState.selTask, planState.note, rows, rows.map(planOwnerState), state.ctxWarn, rows.map(planOwnerCtx), rows.map((o) => planLast(o.last_log))]);
   if (sig === planState.sig) return;                   // polled: do not rebuild (and drop focus) when nothing changed
   planState.sig = sig;
   $("plan-counts").replaceChildren(

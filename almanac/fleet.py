@@ -229,7 +229,7 @@ def read_tail(path: Path, window: int = 600_000, keep: int | None = None) -> tup
     every assistant record carries `message.model` and the session's `effort` at that turn. `stall` is
     {error, text, ts} while the newest main-thread assistant record is an API error (`isApiErrorMessage`), else None.
     Only assistant output ends it: a user record does not, or the `continue` sent to recover would end every stall."""
-    meta = dict(model=None, effort=None, last_ts=None, stall=None, context=None)
+    meta = dict(model=None, effort=None, last_ts=None, stall=None, context=None, context_total=False)
     try:
         size = path.stat().st_size
         with path.open("rb") as fh:
@@ -292,10 +292,14 @@ def read_tail(path: Path, window: int = 600_000, keep: int | None = None) -> tup
                 meta["effort"] = eff_rec
             meta["last_ts"] = ts or meta["last_ts"]
             use = (rec.get("message") or {}).get("usage")
-            if isinstance(use, dict) and model != "<synthetic>":
+            ctx, total = 0, False
+            if rec.get("context_tokens"):                      # gemini_host: one step's own re-read
+                ctx = int(rec["context_tokens"])
+            elif isinstance(use, dict) and model != "<synthetic>":
                 ctx = sum(int(use.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
-                if ctx:
-                    meta["context"] = ctx      # the newest step's re-read; a Gemini record's is one turn's (gemini_host)
+                total = speaker == "gemini"                    # Gemini usage without a step's own: running totals
+            if ctx:
+                meta["context"], meta["context_total"] = ctx, total
             # `since`: the first error of an unbroken run, so a `continue` that fails again is the same stall, and
             # a reply in between (even within one recover tick) starts a new one
             stall = _stall(rec, ts)
@@ -447,7 +451,7 @@ class Fleet:
                            started=round((f["created"] - 116444736000000000) / 1e7, 3), created=str(f["created"]),
                            cpu=cpu, mem_mb=round(f["mem"] / 1048576), cmd=short(cmd, 220), path=f["path"],
                            name=None, status=None, kind=None, cwd=None, session_id=None, version=None,
-                           remote_url=None, updated=None, model=None, effort=None, stall=None, context=None)
+                           remote_url=None, updated=None, model=None, effort=None, stall=None, context=None, context_total=False)
                 if record:
                     pipe = record.get("messagingSocketPath") or None
                     has_key = bool(pipe and (sessions_dir / f"{p['pid']}.{uds.sha256_pipe(pipe)}.key").exists())
@@ -478,7 +482,7 @@ class Fleet:
                         from almanac.gemini_host import split_agy_model_effort
                         raw_m, raw_e = split_agy_model_effort(raw_m, raw_e)
                     # stalled: alive, idle, and the transcript ended on an API error (`recover` acts on it)
-                    row.update(model=raw_m, effort=raw_e, context=meta.get("context"), stall=meta.get("stall") if row["status"] == "idle" else None)
+                    row.update(model=raw_m, effort=raw_e, context=meta.get("context"), context_total=meta.get("context_total", False), stall=meta.get("stall") if row["status"] == "idle" else None)
                 row["can_send"] = role == "session"
                 row["can_kill"] = role in ("session", "headless", "desktop", "daemon", "pty-host", "mcp", "other")
                 procs.append(row)

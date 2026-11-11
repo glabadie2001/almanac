@@ -611,7 +611,7 @@ class Store:
                     counts = self._gemini_turn(session, counts)
             if main and session and usage and any(counts) and msg.get("model") not in (None, "<synthetic>"):
                 self.db.execute("update sessions set model = ?, context = ? where id = ?", (
-                    msg.get("model"), counts[0] + counts[1] + counts[2], session))
+                    msg.get("model"), int(rec.get("context_tokens") or 0) or counts[0] + counts[1] + counts[2], session))
             if usage and msg.get("id"):
                 self.db.execute("insert or replace into usage values (?, ?, ?, ?, ?, ?, ?, ?)",
                                 (msg["id"], session, ts, msg.get("model"), *counts))

@@ -146,7 +146,7 @@ class FleetTests(Fixture):
         d = self.fleet.detail(100)
         self.assertTrue(d["transcript"].endswith("sess-a.jsonl"))
         self.assertEqual(d["events"], [dict(ts="t", kind="you", text="hello"), dict(ts="t1", kind="claude", text="hi")])
-        self.assertEqual(d["meta"], dict(model="claude-test", effort="high", last_ts="t1", stall=None, context=1000))
+        self.assertEqual(d["meta"], dict(model="claude-test", effort="high", last_ts="t1", stall=None, context=1000, context_total=False))
         self.assertEqual(len(self.fleet.detail(100, limit=1)["events"]), 1)
         path = Path(d["transcript"])
         before = self.fleet.tails[path][0]

@@ -683,6 +683,7 @@ class Service:
                     has_uds=bool(p.get("has_uds")),
                     pipe=p.get("pipe"),
                     context=p.get("context"),
+                    context_total=bool(p.get("context_total")),
                     cpu=p.get("cpu"),
                     mem_mb=p.get("mem_mb"),
                     started=p.get("started"),
@@ -1347,6 +1348,7 @@ def object_docs(service, rows: list[dict], *, body: bool = False) -> list[dict]:
     peers = [p for p in service.mesh_peers() if p.get("session_id")]
     states = {p["session_id"]: ("idle" if p.get("status") in (None, "idle") else "busy") for p in peers}
     contexts = {p["session_id"]: p.get("context") for p in peers}
+    totals = {p["session_id"]: bool(p.get("context_total")) for p in peers}
     names = {}
     for r in rows:
         sid = r["owner_session"]
@@ -1360,7 +1362,8 @@ def object_docs(service, rows: list[dict], *, body: bool = False) -> list[dict]:
         doc = dict(ref=ref_of(r), id=r["id"], kind=r["kind"], title=r["title"], status=r["status"],
                    squad_id=r["squad_id"], parent=f"T-{r['parent_id']}" if r["parent_id"] else None,
                    owner_name=names.get(sid), owner_session=sid,
-                   owner_state=(states.get(sid, "ended") if sid else None), owner_context=contexts.get(sid), files=r["files"],
+                   owner_state=(states.get(sid, "ended") if sid else None), owner_context=contexts[sid] if sid in contexts else (service.store.session_context(sid) if sid else None),
+                   owner_context_total=totals.get(sid, False), files=r["files"],
                    created_by_name=r["created_by_name"], created_ts=r["created_ts"], updated_ts=r["updated_ts"],
                    project=r["project"], data=r["data"],
                    children=dict(total=st["children"][0], accepted=st["children"][1]), log_count=st["log_count"],
