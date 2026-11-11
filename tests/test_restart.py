@@ -144,6 +144,26 @@ class RetryTests(Fixture):
             self.assertEqual(mcp_mesh.http_api_retrying("http://x", "t", "/api/mesh/wait"), {"ok": 1})
         self.assertEqual((api.call_count, sleep.call_count), (3, 2))
 
+    def test_a_reset_is_retried_only_for_a_get(self):
+        reset = urllib.error.URLError(ConnectionResetError(10054, "reset"))
+        for method, calls in (("POST", 1), ("GET", 2)):
+            with mock.patch.object(mcp_mesh, "http_api", side_effect=[reset, {"ok": 1}]) as api,                     mock.patch.object(mcp_mesh.time, "sleep"):
+                if calls == 1:
+                    with self.assertRaises(urllib.error.URLError):
+                        mcp_mesh.http_api_retrying("http://x", "t", "/api/mesh/spawn", method=method, body={})
+                else:
+                    self.assertEqual(mcp_mesh.http_api_retrying("http://x", "t", "/api/mesh/wait", method=method), {"ok": 1})
+            self.assertEqual(api.call_count, calls, method)
+        with mock.patch.object(mcp_mesh, "http_api", side_effect=[ConnectionResetError(), {"ok": 1}]) as api:
+            with self.assertRaises(ConnectionResetError):
+                mcp_mesh.http_api_retrying("http://x", "t", "/api/mesh/restart", method="POST", body={})
+        self.assertEqual(api.call_count, 1, "a raw reset on a POST too")
+
+    def test_a_refused_post_is_retried(self):
+        with mock.patch.object(mcp_mesh, "http_api", side_effect=[self.refused(), {"ok": 1}]) as api,                 mock.patch.object(mcp_mesh.time, "sleep"):
+            self.assertEqual(mcp_mesh.http_api_retrying("http://x", "t", "/api/mesh/spawn", method="POST", body={}), {"ok": 1})
+        self.assertEqual(api.call_count, 2, "nothing was listening, so nothing happened")
+
     def test_it_gives_up_after_the_limit_and_never_retries_an_answer(self):
         with mock.patch.object(mcp_mesh, "http_api", side_effect=self.refused()), \
                 mock.patch.object(mcp_mesh, "RETRY_S", 0), mock.patch.object(mcp_mesh.time, "sleep"):

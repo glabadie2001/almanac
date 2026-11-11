@@ -330,20 +330,25 @@ def http_api(base_url: str, token: str, path: str, *, method: str = "GET", body:
 RETRY_S = 30.0          # how long a call waits out a door that is down (a restart), refused or reset connections only
 
 
-def _down(exc: BaseException) -> bool:
+def _retryable(exc: BaseException, method: str) -> bool:
+    """A refused connection means nothing was listening, so nothing happened: safe to send again whatever the method.
+    A reset may come after the door carried the request out (a spawn, a restart), so only a GET is sent again."""
     reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
-    return isinstance(reason, (ConnectionRefusedError, ConnectionResetError))
+    if isinstance(reason, ConnectionRefusedError):
+        return True
+    return isinstance(reason, ConnectionResetError) and method.upper() == "GET"
 
 
 def http_api_retrying(base_url: str, token: str, path: str, **kw) -> dict:
-    """`http_api`, but a refused or reset connection is retried for about RETRY_S seconds: a `mesh_wait` in flight
-    across Almanac's restart must not end an agent's turn with a tool error. A 4xx or 5xx is never retried."""
+    """`http_api`, but a door that is down (a restart) is waited out for about RETRY_S seconds, so a `mesh_wait` in
+    flight across it does not end an agent's turn with a tool error. See `_retryable`; a 4xx or 5xx is never retried."""
     deadline = time.monotonic() + RETRY_S
     while True:
         try:
             return http_api(base_url, token, path, **kw)
         except (urllib.error.URLError, ConnectionError) as exc:
-            if isinstance(exc, urllib.error.HTTPError) or not _down(exc) or time.monotonic() >= deadline:
+            if (isinstance(exc, urllib.error.HTTPError) or not _retryable(exc, kw.get("method") or "GET")
+                    or time.monotonic() >= deadline):
                 raise
         time.sleep(1.0)
 
