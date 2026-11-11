@@ -209,6 +209,13 @@ can be indexed after the fact with a model pass over the saved transcripts, less
   tested.
 - An agent's MCP server keeps the tool list it started with: agents alive across a restart lack the new tools
   (`needs`, `mesh_spawn`) until respawned. The CLI fallback runs the code on disk and works.
+- `mesh_restart` refuses while any headless Claude agent is live: its stdin is a pipe Almanac holds
+  (`spawner.py`, `service.headless_procs`), so it would end with Almanac. Console Claude agents and Gemini hosts
+  have their own consoles and survive. There is no override yet; one would need a headless agent whose stdin is not
+  Almanac's (a named pipe it reopens, or the hub's uds pipe alone).
+- A restart relies on the launcher (`run.ps1` / `run.cmd` / `run.sh`, exit code 75, `ALMANAC_LAUNCHER=1`).
+  A terminal that runs Almanac inside a kill-on-close job object would kill the agents only when that job closes;
+  the launcher's loop keeps it open across a restart, but closing the terminal ends them as before.
 - A server restarted mid-edit runs a mix of old API and new static files (the topology now says so instead of
   failing). Consider an API version stamp the page checks once.
 - Review in this squad: the Gemini reviewer could not start at launch (no runner), so every slice was reviewed by

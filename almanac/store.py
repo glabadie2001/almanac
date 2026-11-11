@@ -153,12 +153,35 @@ REVIEWER = (
     "(`mesh_context_stream`), run the tests yourself, and probe edge cases. Send findings (file:line, what breaks, "
     "how to reproduce) to the implementer, and sign-off or the open findings to the architect, over `mesh_send`."
 )
+ORCHESTRATOR = (
+    "You are the Squad Orchestrator: you lead the squad and you may also act. Break the mission into slices with a "
+    "named owner and the files it may touch, and review what comes back. You may yourself: make small edits in the "
+    "main checkout (a few lines in one or two files; never auth, migrations or the spawn path), committed as the user "
+    "with no AI trailers; merge a teammate's worktree branch into the checkout once its slice is reviewed and the full "
+    "suite passes on the merged tree; restart Almanac with `mesh_restart` after a merge that changed Python code. Hand "
+    "anything larger to an implementer. Every edit of your own goes to the reviewer afterwards, with its commit. Never "
+    "force-push, reset or discard work; never delete a worktree with unmerged commits; never restart with a failing suite."
+)
 # the briefs as first shipped; a stored role still equal to one of these is upgraded once (schema v4)
 OLD_ARCHITECT = "You are the Lead Architect. Break down missions into clear stages and contracts, inspect teammates' live context streams (`mesh_context_stream`) before unblocking dependencies, and coordinate handoffs over `mesh_send`."
 OLD_IMPLEMENTER = 'You are a Software Implementer. Own your assigned slice end-to-end with tests, check peer context and contact streams (`mesh_context_stream`, `mesh_contact_stream`) to stay aligned on shared interfaces, and report wave completion to the architect/reviewer via `mesh_send`.'
 OLD_REVIEWER = "You are the Cross-Model Peer Reviewer. Watch implementers' context streams (`mesh_context_stream`), verify diffs, edge cases, and test results when notified, and send actionable sign-off or findings back over `mesh_send`."
 
 DEFAULT_ROLES = (
+    dict(
+        id="orchestrator-claude",
+        title="Squad Orchestrator (Claude)",
+        provider="claude",
+        model="opus",
+        effort="high",
+        workspace_mode="shared",
+        permission_mode="auto",
+        channels=["#squad", "#architecture"],
+        system_prompt=ORCHESTRATOR,
+        may_page_operator=True,
+        may_spawn=True,
+        may_restart=True,
+    ),
     dict(
         id="architect-gemini",
         title="System Architect (Gemini)",
@@ -321,6 +344,9 @@ class Store:
         # v10: a notice (an assignment, a status notice, the hub's own messages) answers nothing and grants nothing
         if "notice" not in {r[1] for r in self.db.execute("pragma table_info(messages)")}:
             self.db.execute("alter table messages add column notice integer default 0")
+        # v10: a role that may restart Almanac (POST /api/mesh/restart)
+        if "may_restart" not in {r[1] for r in self.db.execute("pragma table_info(roles)")}:
+            self.db.execute("alter table roles add column may_restart integer default 0")
         # v9: folders outside its workspace a Gemini role's runner may read (agy `--add-dir`)
         if "add_dirs" not in {r[1] for r in self.db.execute("pragma table_info(roles)")}:
             self.db.execute("alter table roles add column add_dirs text default '[]'")
@@ -378,20 +404,28 @@ class Store:
                             "and files.path like '%' || s.id || '.jsonl')")
             self.db.execute("delete from meta where key like 'gemini_usage:%'")
             self.db.execute("insert into meta values ('gemini_usage_deltas', '1')")
+        seeded = self.db.execute("select count(*) from roles").fetchone()[0] > 0
+        if version < 10 and seeded:
+            # v10: the orchestrator role, once: a database that has roles gets it unless it has that id already (and
+            # an operator who deletes it later keeps it deleted). A new database gets it with the others below.
+            self._insert_role(next(r for r in DEFAULT_ROLES if r["id"] == "orchestrator-claude"), ignore=True)
         # v10: work objects (`objects`, `object_log`) are new tables in SCHEMA; nothing to backfill
         self.db.execute("insert or replace into meta values ('schema', '10')")
-        if self.db.execute("select count(*) from roles").fetchone()[0] == 0:
-            now = time.time()
+        if not seeded:
             for r in DEFAULT_ROLES:
-                self.db.execute(
-                    "insert into roles (id, title, provider, model, effort, workspace_mode, permission_mode, system_prompt, "
-                    "channels, updated_ts, may_page_operator, may_spawn, allowed_commands) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (r["id"], r["title"], r["provider"], r["model"], r["effort"], r["workspace_mode"],
-                     r["permission_mode"], r["system_prompt"], json.dumps(r["channels"]), now,
-                     int(bool(r.get("may_page_operator"))), int(bool(r.get("may_spawn"))),
-                     json.dumps(r.get("allowed_commands") or [])),
-                )
+                self._insert_role(r)
         self.db.commit()
+
+    def _insert_role(self, r: dict, ignore: bool = False):
+        self.db.execute(
+            f"insert {'or ignore ' if ignore else ''}into roles (id, title, provider, model, effort, workspace_mode, "
+            "permission_mode, system_prompt, channels, updated_ts, may_page_operator, may_spawn, allowed_commands, "
+            "may_restart) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (r["id"], r["title"], r["provider"], r["model"], r["effort"], r["workspace_mode"],
+             r["permission_mode"], r["system_prompt"], json.dumps(r["channels"]), time.time(),
+             int(bool(r.get("may_page_operator"))), int(bool(r.get("may_spawn"))),
+             json.dumps(r.get("allowed_commands") or []), int(bool(r.get("may_restart")))),
+        )
 
     def _rekey_spawned(self):
         """Spawns were keyed by agent name before 2026-11-10; key them by session. Rename, create, copy and drop
@@ -1217,7 +1251,7 @@ class Store:
         with self.lock:
             rows = self.db.execute(
                 "select id, title, provider, model, effort, workspace_mode, permission_mode, system_prompt, channels, updated_ts, "
-                "may_page_operator, may_spawn, allowed_commands, add_dirs from roles order by id"
+                "may_page_operator, may_spawn, allowed_commands, add_dirs, may_restart from roles order by id"
             ).fetchall()
         out = []
         for r in rows:
@@ -1241,6 +1275,7 @@ class Store:
                     may_spawn=bool(r[11]),
                     allowed_commands=[str(c) for c in _json_list(r[12])],
                     add_dirs=[str(d) for d in _json_list(r[13])],
+                    may_restart=bool(r[14]),
                 )
             )
         return out
@@ -1293,6 +1328,8 @@ class Store:
         page = None if page is None else int(page is True or str(page).strip().lower() in ("1", "true", "yes", "on"))
         grow = doc.get("may_spawn")
         grow = None if grow is None else int(grow is True or str(grow).strip().lower() in ("1", "true", "yes", "on"))
+        boot = doc.get("may_restart")
+        boot = None if boot is None else int(boot is True or str(boot).strip().lower() in ("1", "true", "yes", "on"))
         cmds = doc.get("allowed_commands")              # a list, or one command per line; absent keeps what it was
         if isinstance(cmds, str):
             cmds = cmds.splitlines()
@@ -1312,14 +1349,16 @@ class Store:
         with self.lock:
             self.db.execute(
                 "insert into roles (id, title, provider, model, effort, workspace_mode, permission_mode, system_prompt, channels, "
-                "updated_ts, may_page_operator, may_spawn, allowed_commands, add_dirs) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "updated_ts, may_page_operator, may_spawn, allowed_commands, add_dirs, may_restart) "
+                "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "on conflict(id) do update set title=excluded.title, provider=excluded.provider, model=excluded.model, "
                 "effort=excluded.effort, workspace_mode=excluded.workspace_mode, permission_mode=excluded.permission_mode, "
                 "system_prompt=excluded.system_prompt, channels=excluded.channels, updated_ts=excluded.updated_ts, "
                 "may_page_operator=coalesce(?, roles.may_page_operator), may_spawn=coalesce(?, roles.may_spawn), "
-                "allowed_commands=coalesce(?, roles.allowed_commands), add_dirs=coalesce(?, roles.add_dirs)",
+                "allowed_commands=coalesce(?, roles.allowed_commands), add_dirs=coalesce(?, roles.add_dirs), "
+                "may_restart=coalesce(?, roles.may_restart)",
                 (rid, title, provider, model, effort, wmode, pmode, prompt, json.dumps(channels), now, page or 0, grow or 0,
-                 cmds or "[]", dirs or "[]", page, grow, cmds, dirs),
+                 cmds or "[]", dirs or "[]", boot or 0, page, grow, cmds, dirs, boot),
             )
             self.db.commit()
         return self.role(rid)

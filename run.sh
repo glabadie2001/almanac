@@ -49,6 +49,25 @@ open_url() {
   fi
 }
 
+# Runs Almanac and starts it again while it exits with 75 (a restart it was asked for: POST /api/mesh/restart).
+# ALMANAC_LAUNCHER tells the door that something will bring it back; the browser opens on the first start only.
+run_almanac() {
+  local open="$1"
+  shift
+  export ALMANAC_LAUNCHER=1
+  while true; do
+    local code=0
+    if [[ "$open" == 1 ]]; then
+      "${PY[@]}" -m almanac --open "$@" || code=$?
+    else
+      "${PY[@]}" -m almanac "$@" || code=$?
+    fi
+    [[ "$code" == 75 ]] || return "$code"
+    open=0
+    echo "Almanac asked to restart; starting it again"
+  done
+}
+
 case "${1:-}" in
   "")
     # If Almanac is already listening on its configured port, open the signed-in tab instead of failing on port bind
@@ -65,7 +84,8 @@ raise SystemExit(0 if doc.get('kind') == 'almanac' else 1)
       open_url "$LOGIN_URL"
       exit 0
     fi
-    exec "${PY[@]}" -m almanac --open
+    run_almanac 1
+    exit $?
     ;;
   restart)
     shift
@@ -79,7 +99,8 @@ if doc.get('kind') == 'almanac' and int(doc.get('pid') or 0) > 0:
     os.kill(int(doc['pid']), signal.SIGTERM)
     time.sleep(0.4)
 " >/dev/null 2>&1 || true
-    exec "${PY[@]}" -m almanac --open "$@"
+    run_almanac 1 "$@"
+    exit $?
     ;;
   url)
     shift
@@ -98,7 +119,8 @@ if doc.get('kind') == 'almanac' and int(doc.get('pid') or 0) > 0:
     exec "${PY[@]}" -m unittest discover tests "$@"
     ;;
   *)
-    exec "${PY[@]}" -m almanac "$@"
+    run_almanac 0 "$@"
+    exit $?
     ;;
 esac
 

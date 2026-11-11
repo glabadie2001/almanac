@@ -35,7 +35,7 @@ class MigrationV5Tests(Fixture):
         [old] = s.messages()
         self.assertEqual((old["msg_id"], old["body"], old["needs"], old["read_ts"]), ("old", "hi", None, None))
         paging = {r["id"] for r in s.roles() if r["may_page_operator"]}
-        self.assertEqual(paging, {"architect-claude", "architect-gemini"})
+        self.assertEqual(paging, {"architect-claude", "architect-gemini", "orchestrator-claude"})   # v10 adds the orchestrator
         self.assertGreaterEqual(int(s.db.execute("select value from meta where key = 'schema'").fetchone()[0]), 5)
 
     def test_upsert_role_keeps_the_paging_bit_unless_told(self):

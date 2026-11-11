@@ -131,6 +131,7 @@ def build_mesh_charter(
     grow: dict | None = None,
     allowed_commands: list[str] | None = None,
     add_dirs: list[str] | None = None,
+    may_restart: bool = False,
 ) -> str:
     """System charter giving every Claude and Gemini agent shared stream awareness and uds-messaging etiquette."""
     # no --state in the CLI line: with it, a CLI that lacks a token falls back to the door's master token file.
@@ -163,7 +164,7 @@ def build_mesh_charter(
         "`mesh_log(ref, status=\"in review\", body=<files touched, test command and result, what is left>)`. As you go, "
         "`mesh_log` what you learned (`kind=\"learned\"`), dead ends (`kind=\"dead\"`, or `kind=\"parked\"` with "
         "\"retry when ...\") and what comes next (`kind=\"next\"`). Reply about a task with `mesh_send(..., re=\"T-12\")`.",
-        f"6. **Shell CLI Fallback**: You can also run `\"{python_exe}\" -P -m almanac.mcp_mesh --self {agent_name} --cli <roster|context|contacts|send|wait|spawn|objects|object|file|log> ...` (with `PYTHONPATH=\"{REPO_ROOT}\"`; your own token and Almanac's address come from the environment).",
+        f"6. **Shell CLI Fallback**: You can also run `\"{python_exe}\" -P -m almanac.mcp_mesh --self {agent_name} --cli <roster|context|contacts|send|wait|spawn|objects|object|file|log|restart> ...` (with `PYTHONPATH=\"{REPO_ROOT}\"`; your own token and Almanac's address come from the environment).",
         "7. **Operator**: `mesh_send(to=\"operator\", ...)` reaches the human running this squad; use it for decisions only they can make and for the final report; `needs=\"blocking\"` raises an alert on their screen, so use it only when the squad cannot proceed."
         if may_page_operator else
         "7. **Operator**: your role does not page the operator; route through a teammate whose role does. You may always answer a message the operator sends you.",
@@ -176,6 +177,10 @@ def build_mesh_charter(
             "(the operator sets it; `mesh_roster` shows what is left). Use it for slices that can run in parallel on separate "
             "files; give each a named slice and its files; you stay responsible for integrating their branches."
         )
+    if may_restart:
+        lines.append("9. **Restart Almanac**: `mesh_restart()` (CLI `restart`) only after a merge that changed Python code, "
+                     "and never with a failing suite; static files need no restart. Almanac refuses if its preflight "
+                     "fails, and your mesh tools wait while it comes back.")
     if allowed_commands and provider == "gemini":     # agy's allow rules; for Claude the role field is informational
         lines.append("- **Shell**: your runner only permits these exact command lines, typed character for character: "
                      + ", ".join(f"`{c}`" for c in allowed_commands) + "; anything else is denied, so do not try variants.")
@@ -367,9 +372,23 @@ def write_claude_mcp_config(
     return target_path
 
 
-def spawn_agent(
+def spawn_agent(service, **kwargs) -> dict:
+    """Spawn one Claude or Gemini agent (see `_spawn_agent`). The session id is minted here, before the agent's token
+    (which carries it), and is in `service.spawning` until the spawn returns or raises: the door waits for a session
+    in that set rather than refusing it (door.Service.caller), and never for one left behind by a failure."""
+    session_id = str(uuid.uuid4())
+    spawning = service.__dict__.setdefault("spawning", set())
+    spawning.add(session_id)
+    try:
+        return _spawn_agent(service, session_id=session_id, **kwargs)
+    finally:
+        spawning.discard(session_id)
+
+
+def _spawn_agent(
     service,
     *,
+    session_id: str,
     almanac_url: str,
     token: str,
     cwd: str,
@@ -426,9 +445,6 @@ def spawn_agent(
             return dict(ok=False, pid=None, agent_name=eff_name, session_id=None, provider=eff_provider, role_id=role_id,
                         error=f"Gemini runner not found; looked in: {'; '.join(runner['searched'])}; "
                               "set \"gemini\" in config.json")
-    session_id = str(uuid.uuid4())              # minted before the token, which carries it
-    # until its row is recorded the door waits for this session rather than refusing it (door.Service.caller)
-    service.__dict__.setdefault("spawning", set()).add(session_id)
     token = web.agent_token(token, eff_name, session_id)    # the agent's own bearer: names it, opens /api/mesh only
 
     repo_dir = Path(cwd).expanduser().resolve()
@@ -473,6 +489,7 @@ def spawn_agent(
         grow=_grow_line(service, role, squad_id),
         allowed_commands=(role or {}).get("allowed_commands") or [],
         add_dirs=add_dirs,
+        may_restart=bool((role or {}).get("may_restart")),
     )
     charter_file = spawn_dir / "charter.md"
     charter_file.write_text(charter, encoding="utf-8")
@@ -644,7 +661,6 @@ def spawn_agent(
         code = proc.poll()
         if code is not None:
             reason = resume.last_error(log_file) if log_file.exists() else f"process exited at once (code {code})"
-            service.spawning.discard(session_id)
             return dict(ok=False, pid=proc.pid, agent_name=eff_name, session_id=session_id, provider=eff_provider, error=reason)
         time.sleep(0.05)
 
@@ -663,7 +679,6 @@ def spawn_agent(
         channels=eff_channels,
         spawned_by=spawned_by,
     )
-    service.spawning.discard(session_id)
     with service.fleet_lock:
         if service.fleet:
             service.fleet.last["at"] = 0

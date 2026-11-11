@@ -41,6 +41,19 @@ $pyPrefix = if ($py.Count -gt 1) { $py[1..($py.Count - 1)] } else { @() }
 $first = if ($args.Count -gt 0) { [string]$args[0] } else { "" }
 $rest  = if ($args.Count -gt 1) { $args[1..($args.Count - 1)] } else { @() }
 
+# Runs Almanac and starts it again while it exits with 75 (a restart it was asked for: POST /api/mesh/restart).
+# ALMANAC_LAUNCHER tells the door that something will bring it back; the browser opens on the first start only.
+function Invoke-Almanac([bool]$Open, [object[]]$Flags) {
+    $env:ALMANAC_LAUNCHER = "1"
+    while ($true) {
+        $openFlag = @(if ($Open) { "--open" })
+        & $pyExe @pyPrefix -m almanac @openFlag @Flags | Out-Host
+        if ($LASTEXITCODE -ne 75) { return $LASTEXITCODE }
+        $Open = $false
+        Write-Host "Almanac asked to restart; starting it again"
+    }
+}
+
 switch ($first) {
     "" {
         $probe = "import json, urllib.request; from almanac.config import load; p = load('config.json')['port']; r = urllib.request.urlopen(f'http://127.0.0.1:{p}/ident', timeout=1.0); d = json.loads(r.read().decode()); raise SystemExit(0 if d.get('kind') == 'almanac' else 1)"
@@ -55,14 +68,12 @@ switch ($first) {
             Start-Process $loginUrl | Out-Null
             exit 0
         }
-        & $pyExe @pyPrefix -m almanac --open
-        exit $LASTEXITCODE
+        exit (Invoke-Almanac $true @())
     }
     "restart" {
         $stopScript = "import json, os, signal, time, urllib.request; from almanac.config import load; p = load('config.json')['port']; r = urllib.request.urlopen(f'http://127.0.0.1:{p}/ident', timeout=1.0); d = json.loads(r.read().decode()); pid = int(d.get('pid') or 0); os.kill(pid, signal.SIGTERM) if d.get('kind') == 'almanac' and pid > 0 else None; time.sleep(0.4)"
         try { & $pyExe @pyPrefix -c $stopScript *> $null } catch {}
-        & $pyExe @pyPrefix -m almanac --open @rest
-        exit $LASTEXITCODE
+        exit (Invoke-Almanac $true $rest)
     }
     "url" {
         & $pyExe @pyPrefix -m almanac --url @rest
@@ -81,8 +92,7 @@ switch ($first) {
         exit $LASTEXITCODE
     }
     default {
-        & $pyExe @pyPrefix -m almanac @args
-        exit $LASTEXITCODE
+        exit (Invoke-Almanac $false $args)
     }
 }
 
