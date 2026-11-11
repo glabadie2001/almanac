@@ -1237,13 +1237,15 @@ def elastic_choice(role: dict, body: dict) -> dict:
     """The model and effort an agent picked for a member of `role`, each checked against what the role allows: its own
     default plus its `models` / `efforts` (additional choices). Absent: the role's default. 400 naming what is allowed."""
     from almanac.spawner import split_model_effort
+    raw_m, raw_e = str(body.get("model") or "").strip(), str(body.get("effort") or "").strip()
+    # an effort written into the model (`claude-haiku-5-5-low`, `sonnet-max`) is a pick too, checked like `effort`
+    # (as everywhere else, an explicit effort wins)
+    model, embedded = split_model_effort(role["provider"], raw_m) if raw_m else (None, None)
+    effort = (split_model_effort(role["provider"], None, raw_e)[1] or raw_e) if raw_e else embedded
     out = {}
-    for key, pick in (("model", lambda v: split_model_effort(role["provider"], v)[0]),
-                      ("effort", lambda v: split_model_effort(role["provider"], None, v)[1])):
-        raw = str(body.get(key) or "").strip()
-        if not raw:
+    for key, raw, value in (("model", raw_m, model or raw_m), ("effort", raw_e or raw_m, effort)):
+        if not value:
             continue
-        value = pick(raw) or raw
         allowed = list(dict.fromkeys(([role[key]] if role.get(key) else []) + list(role.get(key + "s") or [])))
         if value not in allowed:
             raise ValueError(f"{key} {raw!r}: role {role['id']} allows "
