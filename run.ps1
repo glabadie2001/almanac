@@ -50,6 +50,7 @@ function Invoke-Almanac([bool]$Open, [object[]]$Flags) {
         & $pyExe @pyPrefix -m almanac @openFlag @Flags | Out-Host
         if ($LASTEXITCODE -ne 75) { return $LASTEXITCODE }
         $Open = $false
+        $Flags = @($Flags | Where-Object { $_ -ne "--open" })     # the browser opens on the first start only
         Write-Host "Almanac asked to restart; starting it again"
     }
 }

@@ -64,6 +64,9 @@ run_almanac() {
     fi
     [[ "$code" == 75 ]] || return "$code"
     open=0
+    local keep=() arg                                   # the browser opens on the first start only
+    for arg in "$@"; do [[ "$arg" == --open ]] || keep+=("$arg"); done
+    set -- ${keep[@]+"${keep[@]}"}
     echo "Almanac asked to restart; starting it again"
   done
 }

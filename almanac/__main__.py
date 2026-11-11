@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 import threading
 import webbrowser
 from pathlib import Path
@@ -10,9 +11,37 @@ from almanac.store import Store
 from almanac.web import ensure_token
 
 
-def check(state: Path, modules=None) -> int:
-    """The restart preflight: import every module, run the migrations on a copy of the database, build the door's
-    handler. 0 and "ok", or the traceback and 1. Never touches the live database."""
+def build_service(settings: dict, state: Path, store) -> Service:
+    """The service a real start runs: fleet, prices, namer and runners from `settings`. The restart preflight builds
+    the same one, so a tree that passes the check also starts."""
+    from almanac.config import is_shim
+    from almanac.fleet import Fleet
+    from almanac.namer import Namer
+    from almanac.resume import Prices
+    # never name chats through a .cmd shim: cmd.exe would re-parse the command line
+    namer = Namer(model=settings["naming_model"], claude=settings["claude"],
+                  workdir=state.resolve() / "namer-cwd") if settings["naming"] and not is_shim(settings["claude"]) else None
+    gemini_projects = state.resolve() / "gemini" / "projects"
+    service = Service(store, settings["transcripts"], settings["interval"],
+                      fleet=Fleet(Path(settings["transcripts"]).parent, extra_projects=[gemini_projects]),
+                      state=state, claude=settings["claude_configured"], gemini=settings["gemini_configured"],
+                      prices=Prices(settings["prices"]), namer=namer)
+    service.auto_continue = settings["auto_continue"]      # recover.py: continue a squad agent stalled on an API error
+    return service
+
+
+def take_launcher_mark() -> bool:
+    """Whether a launcher started us (it loops on RESTART_CODE). The mark comes off the environment, so nothing
+    Almanac starts (agents, resumed consoles, a hand-started second Almanac in their shells) inherits it."""
+    from almanac.door import LAUNCHER_ENV
+    return os.environ.pop(LAUNCHER_ENV, None) == "1"
+
+
+def check(state: Path, config: Path = Path("config.json"), modules=None) -> int:
+    """The restart preflight: what a real start does, short of listening. Load the config it will start with,
+    import every module, run the migrations on a copy of the database, build the service (fleet, prices, runners)
+    and the door's handler with the configured hosts. 0 and "ok", or the traceback and 1. Never touches the live
+    database."""
     import importlib
     import pkgutil
     import sqlite3
@@ -21,6 +50,7 @@ def check(state: Path, modules=None) -> int:
     import almanac
     from almanac.door import make_handler
     try:
+        settings = load(config)
         for name in modules or [f"almanac.{m.name}" for m in pkgutil.iter_modules(almanac.__path__)]:
             importlib.import_module(name)
         with tempfile.TemporaryDirectory() as tmp:
@@ -34,7 +64,9 @@ def check(state: Path, modules=None) -> int:
                     dst.close()
             store = Store(copy)
             try:
-                make_handler(Service(store, Path(tmp), 300, state=Path(tmp)), "0" * 64)
+                service = build_service(settings, Path(tmp), store)
+                service.runners()
+                make_handler(service, "0" * 64, hosts=settings["hosts"])
             finally:
                 store.close()
     except BaseException:
@@ -57,7 +89,8 @@ def main(argv=None):
                         help="restart preflight: import everything, migrate a copy of the database, build the door; exit")
     args = parser.parse_args(argv)
     if args.check:
-        return check(args.state)
+        return check(args.state, args.config)
+    launcher = take_launcher_mark()
     settings = load(args.config)
     if args.port is not None:
         if not 1 <= args.port <= 65535:
@@ -74,19 +107,8 @@ def main(argv=None):
     if args.seed:
         print(f"seeded {store.seed_legacy(args.seed)} legacy calls from {args.seed}")
         return 0
-    from almanac.fleet import Fleet
-    from almanac.namer import Namer
-    from almanac.resume import Prices
-    from almanac.config import is_shim
-    # never name chats through a .cmd shim: cmd.exe would re-parse the command line
-    namer = Namer(model=settings["naming_model"], claude=settings["claude"],
-                  workdir=args.state.resolve() / "namer-cwd") if settings["naming"] and not is_shim(settings["claude"]) else None
-    gemini_projects = args.state.resolve() / "gemini" / "projects"
-    service = Service(store, settings["transcripts"], settings["interval"],
-                      fleet=Fleet(Path(settings["transcripts"]).parent, extra_projects=[gemini_projects]),
-                      state=args.state, claude=settings["claude_configured"], gemini=settings["gemini_configured"],
-                      prices=Prices(settings["prices"]), namer=namer)
-    service.auto_continue = settings["auto_continue"]
+    service = build_service(settings, args.state, store)
+    service.launcher, service.config_path = launcher, args.config.resolve()
     for kind, runner in service.runners().items():
         if not runner["ok"]:
             logging.warning("%s runner not found; looked in: %s; set \"%s\" in config.json",

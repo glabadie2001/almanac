@@ -125,6 +125,10 @@ class Service:
         self.error = ""
         self.exit_code = 0                            # what `python -m almanac` returns when the door stops
         self.on_exit = None                           # set by __main__: stops the server; tests inject their own
+        self.launcher = False                         # set by __main__: a launcher will start Almanac again
+        self.config_path = None                       # set by __main__: the config this Almanac started with
+        self.restart_lock = threading.Lock()          # one restart at a time
+        self.restarting = False                       # latched once a restart is under way
 
     def exit(self, code: int) -> None:
         """Stop the door, so that `python -m almanac` returns `code` (RESTART_CODE: the launcher starts it again)."""
@@ -138,7 +142,10 @@ class Service:
         import sys as _sys
         root = Path(__file__).resolve().parents[1]
         try:
-            proc = _sp.run([_sys.executable, "-m", "almanac", "--check", "--state", str(self.state)], cwd=str(root),
+            argv = [_sys.executable, "-m", "almanac", "--check", "--state", str(self.state)]
+            if self.config_path:
+                argv += ["--config", str(self.config_path)]       # the config the relaunch will read
+            proc = _sp.run(argv, cwd=str(root),
                            capture_output=True, timeout=PREFLIGHT_TIMEOUT, creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0))
         except (OSError, _sp.TimeoutExpired) as exc:
             return False, f"preflight could not run: {exc}"
@@ -1955,17 +1962,30 @@ def make_handler(service, token, *, hosts=()):
                 role = service.store.role(caller["role_id"]) if caller and caller.get("role_id") else None
                 if not role or not role.get("may_restart"):
                     return self._send(403, dict(ok=False, error=f"{self.agent}'s role may not restart Almanac"))
-            if os.environ.get(LAUNCHER_ENV) != "1":
+            if not service.launcher:
                 return self._send(409, dict(ok=False, error="Almanac was not started by run.ps1, run.cmd or run.sh, so "
                                                             "nothing would start it again; restart it by hand"))
+            if service.restarting or not service.restart_lock.acquire(blocking=False):
+                return self._send(409, dict(ok=False, error="a restart is already under way"))
+            try:
+                return self._restart_locked(who)
+            finally:
+                service.restart_lock.release()
+
+        def _restart_locked(self, who):
             headless = service.headless_live()
             if headless:
                 return self._send(409, dict(ok=False, error="headless Claude agents would end with Almanac: "
                                                             + ", ".join(headless)))
             ok, output = service.preflight()
+            headless = service.headless_live()         # the preflight takes seconds: one may have started meanwhile
+            if ok and headless:
+                return self._send(409, dict(ok=False, error="headless Claude agents would end with Almanac: "
+                                                            + ", ".join(headless)))
             if not ok:
                 service.store.log_action("restart", 0, None, False, "preflight failed", who)
                 return self._send(409, dict(ok=False, error="preflight failed: nothing restarted", output=output))
+            service.restarting = True                   # latched: nothing restarts twice
             service.store.log_action("restart", os.getpid(), None, True, f"restart asked by {who}", who)
             for squad in sorted({p["squad_id"] for p in service.mesh_peers() if p.get("squad_id")}):
                 try:

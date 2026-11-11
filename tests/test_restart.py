@@ -66,10 +66,8 @@ class RestartTests(MeshRig):
 
     def restart(self, who="arch", env=LAUNCHED):
         token = web.agent_token(TOKEN, who, f"sess-{who}") if who else TOKEN
-        with mock.patch.dict(os.environ, env, clear=False):
-            if not env:
-                os.environ.pop(door.LAUNCHER_ENV, None)
-            return self.request(self.spy, "/api/mesh/restart", token=token, method="POST", body={})
+        self.service.launcher = bool(env)
+        return self.request(self.spy, "/api/mesh/restart", token=token, method="POST", body={})
 
     def test_a_role_without_the_flag_is_refused(self):
         self.assertEqual(self.restart("impl")[0], 403)
@@ -110,6 +108,26 @@ class RestartTests(MeshRig):
     def test_the_operator_may_restart(self):
         self.assertEqual(self.restart(who=None)[0], 200)
 
+    def test_one_restart_at_a_time_and_never_twice(self):                          # O3
+        self.assertEqual(self.restart()[0], 200)
+        status, _, res = self.restart()
+        self.assertEqual((status, res["error"]), (409, "a restart is already under way"), "latched")
+        self.assertEqual(self.order.count("exit"), 1)
+        self.service.restarting = False
+        with self.service.restart_lock:                     # another restart is mid-preflight
+            self.assertEqual(self.restart()[0], 409)
+
+    def test_a_headless_agent_started_during_the_preflight_stops_it(self):         # O3
+        def started(*_):
+            self.service.headless_procs = {"sess-impl": mock.Mock(**{"poll.return_value": None})}
+            return True, "almanac check: ok"
+        self.service.preflight.side_effect = started
+        status, _, res = self.restart()
+        self.assertEqual(status, 409)
+        self.assertIn("impl", res["error"])
+        self.assertNotIn("exit", self.order)
+        self.assertFalse(self.service.restarting)
+
 
 class CheckTests(Fixture):
     def test_check_passes_on_this_tree_and_never_touches_the_live_database(self):
@@ -125,6 +143,34 @@ class CheckTests(Fixture):
 
     def test_check_fails_on_a_module_that_does_not_import(self):
         self.assertEqual(check(self.root, modules=["almanac.no_such_module"]), 1)
+
+    def test_check_fails_on_a_config_the_relaunch_could_not_start_with(self):      # O2
+        for text in ("{not json", '{"interval": 5}', '{"port": 0}', '{"nope": 1}'):
+            config = self.root / "config.json"
+            config.write_text(text, encoding="utf-8")
+            self.assertEqual(check(self.root / "state", config), 1, text)
+        from almanac import __main__ as entry
+        with mock.patch.object(entry, "load", side_effect=RuntimeError("config.load broke in the merge")):
+            self.assertEqual(check(self.root / "state", self.root / "absent.json"), 1)
+        with mock.patch.object(entry, "build_service", side_effect=RuntimeError("Prices broke")):
+            self.assertEqual(check(self.root / "state", self.root / "absent.json"), 1)
+
+    def test_the_preflight_checks_the_config_almanac_started_with(self):            # O2
+        store = Store(self.root / "s" / "almanac.db")
+        self.addCleanup(store.close)
+        service = door.Service(store, self.root, state=self.root / "s")
+        service.config_path = self.root / "bad.json"
+        service.config_path.write_text('{"interval": 5}', encoding="utf-8")
+        ok, out = service.preflight()
+        self.assertFalse(ok)
+        self.assertIn("interval", out)
+
+    def test_the_launcher_mark_comes_off_the_environment(self):                     # O4
+        from almanac.__main__ import take_launcher_mark
+        with mock.patch.dict(os.environ, LAUNCHED):
+            self.assertTrue(take_launcher_mark())
+            self.assertNotIn(door.LAUNCHER_ENV, os.environ, "agents and resumed consoles never inherit it")
+            self.assertFalse(take_launcher_mark())
 
     def test_the_preflight_runs_the_check_in_a_subprocess(self):
         store = Store(self.root / "s" / "almanac.db")
@@ -158,6 +204,27 @@ class RetryTests(Fixture):
             with self.assertRaises(ConnectionResetError):
                 mcp_mesh.http_api_retrying("http://x", "t", "/api/mesh/restart", method="POST", body={})
         self.assertEqual(api.call_count, 1, "a raw reset on a POST too")
+
+    def test_a_wait_open_longer_than_the_window_still_waits_out_a_restart(self):  # O1
+        clock = [1000.0]
+        refused = self.refused()
+
+        def call(*a, **k):
+            if api.call_count == 1:
+                clock[0] += 120                     # the mesh_wait was open for two minutes when the door went away
+                raise ConnectionAbortedError(10053, "aborted")
+            if api.call_count == 2:
+                raise refused                       # still down
+            return {"ok": 1}
+        with mock.patch.object(mcp_mesh, "http_api", side_effect=call) as api,                 mock.patch.object(mcp_mesh.time, "monotonic", side_effect=lambda: clock[0]),                 mock.patch.object(mcp_mesh.time, "sleep", side_effect=lambda s: clock.__setitem__(0, clock[0] + s)):
+            self.assertEqual(mcp_mesh.http_api_retrying("http://x", "t", "/api/mesh/wait"), {"ok": 1})
+        self.assertEqual(api.call_count, 3)
+
+    def test_an_aborted_post_is_not_retried(self):                                  # O1
+        with mock.patch.object(mcp_mesh, "http_api", side_effect=ConnectionAbortedError(10053, "aborted")) as api:
+            with self.assertRaises(ConnectionAbortedError):
+                mcp_mesh.http_api_retrying("http://x", "t", "/api/mesh/spawn", method="POST", body={})
+        self.assertEqual(api.call_count, 1)
 
     def test_a_refused_post_is_retried(self):
         with mock.patch.object(mcp_mesh, "http_api", side_effect=[self.refused(), {"ok": 1}]) as api,                 mock.patch.object(mcp_mesh.time, "sleep"):
