@@ -826,6 +826,21 @@ document.addEventListener("click", (e) => {             // a multi-pick closes o
 refillRoleModels([]);
 refillRoleEfforts(["high"]);
 
+// a role's context_policy: none | fresh-per-task | compact-at-<tokens>; the form splits it into a select and a token field
+const fmtContextPolicy = (p) => (p || "none") === "fresh-per-task" ? "fresh per task"
+  : /^compact-at-\d+$/.test(p || "") ? `compact at ${Number(p.slice(11)).toLocaleString("en-US")}` : "none";
+function setRoleContext(p) {
+  const compact = /^compact-at-/.test(p || "");
+  $("role-context").value = compact ? "compact" : p === "fresh-per-task" ? p : "none";
+  $("role-context-n").value = compact ? p.slice(11) : "";
+  $("role-context-n-field").hidden = !compact;
+}
+$("role-context").addEventListener("change", () => {
+  const compact = $("role-context").value === "compact";
+  $("role-context-n-field").hidden = !compact;
+  if (compact && !$("role-context-n").value) $("role-context-n").value = "300000";
+});
+
 async function loadRoles() {
   try {
     const doc = await api("/api/roles");
@@ -882,6 +897,7 @@ function syncRoleControls() {
         el("td", { cls: "model", text: roleOptions(r.models, r.model).map(fmtModel).join(", ") || "–" }),
         el("td", {}, effortBadge(r.effort), elasticAlt(r.efforts, r.effort).length
           ? el("span", { cls: "dim", text: `, ${elasticAlt(r.efforts, r.effort).map(fmtEffortLabel).join(", ")}` }) : null),
+        el("td", { cls: "dim", text: fmtContextPolicy(r.context_policy) }),
         el("td", { cls: "dim", text: r.workspace_mode || "shared" }),
       );
       tr.addEventListener("click", () => populateRoleForm(r));
@@ -1215,6 +1231,7 @@ async function loadFleet() {
   let doc;
   try { doc = await api("/api/fleet"); } catch (err) { $("fleet-summary").textContent = `fleet unavailable: ${err.message}`; return; }
   state.fleet = doc;
+  if (doc.context_warn) state.ctxWarn = doc.context_warn;
   trackSessions();       // before any early return: every fleet refresh notices sessions leaving, whatever the tab
   const s = doc.summary || {};
   const byProv = s.providers || {};
@@ -1275,6 +1292,7 @@ async function loadFleet() {
       el("td", { cls: "role-tag", text: p.role === "session" ? (p.agent_role || "–").slice(0, 18) : "" }),
       modelCell,
       effortCell,
+      el("td", { cls: `r${ctxWarn(p.context)}`, text: p.role === "session" ? ctxText(p.context, p.context_total) : "", title: p.context ? `${ctxTitle(p.context_total)} (${p.context})` : null }),
       el("td", {}, rowState(p)), el("td", { cls: "r", text: p.cpu === null ? "–" : `${num(p.cpu)}%` }),
       el("td", { cls: "spark", text: spark(state.cpu.get(key), Math.max(5, ...state.cpu.get(key))) }),
       el("td", { cls: "r", text: `${p.mem_mb}M` }), el("td", { cls: "r", text: age(p.started) }));
@@ -1727,6 +1745,7 @@ function populateRoleForm(r) {
   refillRoleModels([...new Set([mod, ...(r?.models || [])])].filter(Boolean));
   refillRoleEfforts([...new Set([eff, ...(r?.efforts || [])])].filter(Boolean));
   $("role-workspace").value = r ? (r.workspace_mode || "shared") : "shared";
+  setRoleContext(r ? r.context_policy : "none");
   $("role-prompt").value = r ? (r.system_prompt || "") : "";
   $("role-page").checked = !!r?.may_page_operator;
   $("role-grow").checked = !!r?.may_spawn;
@@ -1766,6 +1785,7 @@ $("role-save").closest("form").addEventListener("submit", async (e) => {
       // every tick, most capable first; a single tick saves [] (the role is fixed at it, as before)
       models: models.length > 1 ? models : [],
       efforts: efforts.length > 1 ? efforts : [],
+      context_policy: $("role-context").value === "compact" ? `compact-at-${$("role-context-n").value.trim()}` : $("role-context").value,
       allowed_commands: $("role-commands").value,
       add_dirs: $("role-dirs").value,
     });
@@ -1868,6 +1888,7 @@ async function loadMesh() {
   }
   if (sq !== meshState.squadFilter) return;       // the squad changed while this was in flight: the newer call paints
   meshState.peers = doc.peers || [];
+  if (doc.context_warn) state.ctxWarn = doc.context_warn;
   meshState.messages = doc.messages || [];
   meshState.open = doc.open || [];
   if (doc.roles?.length) { state.roles = doc.roles; syncRoleControls(); }
@@ -2174,6 +2195,14 @@ async function loadPlan(rev) {
 // the roster decides on every poll, as it is fresher than the fetched rows: a live owner is stalled (stopped on an API
 // error), busy or idle, and an absent one has ended. The rows are only fetched after a roster poll, so the door's own
 // owner_state is never needed here.
+// A step's re-read, in k. Σ: only agy's running total for the conversation is known (a Gemini record without its own step figure).
+const ctxText = (n, total) => n ? `${ktok(n)}${total ? "Σ" : ""}` : "";
+const ctxWarn = (n) => n && state.ctxWarn && n >= state.ctxWarn ? " ctx-warn" : "";
+const ctxTitle = (total) => total ? "tokens agy reports for the whole conversation so far (not one step's re-read)" : "tokens its last step re-read";
+function planOwnerCtx(o) {      // the live peer's, else what the doc carried (an ended owner's last stored)
+  const peer = meshState.peers.find((q) => o.owner_session && q.session_id === o.owner_session);
+  return peer ? [peer.context, !!peer.context_total] : [o.owner_context, !!o.owner_context_total];
+}
 function planOwnerState(o) {
   if (!o.owner_name) return "none";
   const p = meshState.peers.find((q) => (o.owner_session ? q.session_id === o.owner_session : q.name === o.owner_name));
@@ -2183,8 +2212,11 @@ const statusPill = (s) => el("span", { cls: `flag st-${slug(s)}`, text: s || "�
 function ownerChip(o) {
   const own = planOwnerState(o);
   const plain = ["none", "busy", "idle", "ended"].includes(own);   // colour says these; any other state is spelled out
-  return el("span", { cls: `flag own-${slug(own)}`, text: plain ? o.owner_name || "unowned" : `${o.owner_name} · ${own}`,
-    title: own === "none" ? "nobody owns this task" : `${o.owner_name}: ${own}` });
+  const [n, total] = planOwnerCtx(o);
+  const ctx = ctxText(n, total);
+  const base = plain ? o.owner_name || "unowned" : `${o.owner_name} · ${own}`;
+  return el("span", { cls: `flag own-${slug(own)}${ctxWarn(n)}`, text: ctx && own !== "none" ? `${base} · ${ctx}` : base,
+    title: own === "none" ? "nobody owns this task" : `${o.owner_name}: ${own}${ctx ? ` · context ${ctx}: ${ctxTitle(total)}` : ""}` });
 }
 function planLast(l) {
   if (!l) return "";
@@ -2227,8 +2259,16 @@ function paintPlan() {
 
   const rows = planState.rows, byOwner = planState.group === "owner";
   const sig = JSON.stringify([planState.group, meshState.selTask, planState.note, rows, rows.map(planOwnerState), rows.map((o) => planLast(o.last_log))]);
-  if (sig === planState.sig) return;                   // polled: do not rebuild (and drop focus) when nothing changed
-  planState.sig = sig;
+  // what the owner chips show (rounded k and the warn class), not the raw count: that moves on every step
+  const ctxSig = JSON.stringify(rows.map((o) => { const [n, t] = planOwnerCtx(o); return [ctxText(n, t), ctxWarn(n)]; }));
+  if (sig === planState.sig) {                         // polled: do not rebuild (and drop focus) when nothing changed
+    if (ctxSig !== planState.ctxSig) {                 // only a chip's size or warning moved: swap the chips, leave the rows
+      planState.ctxSig = ctxSig;
+      for (const o of rows) $("plan-table").querySelector(`tr[data-ref="${CSS.escape(o.ref)}"] td:nth-child(4)`)?.replaceChildren(ownerChip(o));
+    }
+    return;
+  }
+  planState.sig = sig; planState.ctxSig = ctxSig;
   $("plan-counts").replaceChildren(
     el("span", { cls: "hi", text: `${rows.length} task${rows.length === 1 ? "" : "s"}` }),
     ...PLAN_STATUSES.flatMap((s) => {
@@ -2254,7 +2294,7 @@ function paintPlan() {
   }
   const focused = document.activeElement?.closest?.("#plan-table tr")?.dataset.ref;
   $("plan-table").querySelector("tbody").replaceChildren(...trs);
-  if (focused) $("plan-table").querySelector(`tr[data-ref="${CSS.escape(focused)}"]`)?.focus();
+  if (focused) $("plan-table").querySelector(`tr[data-ref="${CSS.escape(focused)}"]`)?.focus({ preventScroll: true });   // a polled repaint must not scroll the page back to the row
 }
 
 $("plan-group").addEventListener("click", (e) => {
@@ -2347,14 +2387,17 @@ async function loadTask(ref) {
     + `${!l.status_to ? "" : l.kind === "create" ? ` as ${l.status_to}` : ` ${l.status_from || "–"} → ${l.status_to}`}`
     + `${l.owner_to ? ` owner → ${l.owner_to}` : ""}`;
   const logCls = (k) => (k === "dead" ? "error" : k === "message" ? "peer_out" : k === "status" || k === "assign" || k === "dispatch" || k === "respawn" ? "tool" : "claude");
-  $("mesh-ctx-feed").replaceChildren(
+  // a refresh (every objects_rev change re-runs this for the open task) keeps the reader's place, measured from the
+  // bottom because new log entries arrive at the top; only a newly opened task, or a reader at the top, starts at the top
+  const feed = $("mesh-ctx-feed"), fromBottom = feed.scrollTop ? feed.scrollHeight - feed.scrollTop : 0;
+  feed.replaceChildren(
     el("li", { cls: "you" }, o.body ? renderMd(o.body) : "(no body)"),
     el("li", { cls: "result", text: o.files?.length ? `files: ${o.files.join(", ")}` : "files: none" }),
     ...(log.length
       ? log.map((l) => el("li", { cls: logCls(l.kind), title: new Date(l.ts * 1000).toLocaleString() }, logHead(l), l.body ? renderMd(l.body) : null))
       : [el("li", { cls: "result", text: "no log entries yet" })]),
   );
-  $("mesh-ctx-feed").scrollTop = 0;                    // the log is newest first
+  feed.scrollTop = fromBottom ? feed.scrollHeight - fromBottom : 0;   // the log is newest first
 }
 
 // ------------------------------------------------------------------ mesh: backlog (tasks no squad has taken yet)
@@ -2419,7 +2462,7 @@ function paintBacklog() {
   $("backlog-msg").textContent = backlogState.msg || backlogState.note || (rows.length ? "" : BACKLOG_EMPTY);
   const focused = document.activeElement?.closest?.("#backlog-table tr")?.dataset.ref;
   $("backlog-table").querySelector("tbody").replaceChildren(...rows.map(backlogRow));
-  if (focused) $("backlog-table").querySelector(`tr[data-ref="${CSS.escape(focused)}"]`)?.focus();
+  if (focused) $("backlog-table").querySelector(`tr[data-ref="${CSS.escape(focused)}"]`)?.focus({ preventScroll: true });   // a polled repaint must not scroll the page back to the row
 }
 
 async function dispatchBacklog(o) {

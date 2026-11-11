@@ -231,6 +231,21 @@ def parse_agy_stream_event(event: dict) -> dict:
     return dict(kind="other")
 
 
+def step_context(event: dict) -> int | None:
+    """One step's own re-read (`input_tokens + cache_read_tokens`) from a `step_update` event's usage, else None.
+    `result.usage` is the conversation's running total; each step's usage is that step's alone."""
+    if str(event.get("event") or event.get("type") or "").lower() != "step_update":
+        return None
+    su = event.get("step_update") if isinstance(event.get("step_update"), dict) else event
+    use = su.get("usage")
+    if not isinstance(use, dict):
+        return None
+    try:
+        return (int(use.get("input_tokens") or 0) + int(use.get("cache_read_tokens") or 0)) or None
+    except (TypeError, ValueError):
+        return None
+
+
 RUNNER_EXITED = "runner_exited"     # agy's stdout closed before a `result`: the process died; not retried
 RUNNER_ERROR = "runner_error"       # the turn raised (agy missing, a pipe that will not take the prompt); not retried
 
@@ -451,6 +466,7 @@ class GeminiHost:
             proc.stdin.flush()
 
         self._turn_error = None
+        self._step_context = None
         ended = False                   # a `result` event came: without one, agy's output closed mid-turn
         text_chunks: list[str] = []
         final_text = ""
@@ -474,6 +490,7 @@ class GeminiHost:
             if not isinstance(raw_ev, dict):
                 continue
             ev = parse_agy_stream_event(raw_ev)
+            self._step_context = step_context(raw_ev) or self._step_context      # the turn's newest step with usage
             if ev.get("conversation_id"):
                 self.conversation_id = str(ev["conversation_id"])
             if ev["kind"] == "init":
@@ -599,6 +616,8 @@ class GeminiHost:
                         "content": [{"type": "text", "text": reply or "(completed)"}],
                         "usage": usage,
                     },
+                    # one step's re-read, beside the running totals in `usage` (which store._gemini_turn needs)
+                    **({"context_tokens": self._step_context} if getattr(self, "_step_context", None) else {}),
                 }
             )
         except Exception as exc:

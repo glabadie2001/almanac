@@ -391,13 +391,14 @@ details table td:first-child, details table th:first-child { text-align: left; }
 .st-accepted { color: var(--hi); } .st-blocked { color: var(--red); font-weight: bold; }
 .own-busy { color: var(--amber); } .own-idle { color: var(--fg); }
 .own-ended { color: var(--dim); border-style: dashed; opacity: .7; } .own-none { color: var(--dim); border-color: transparent; }
+.flag.ctx-warn, td.ctx-warn { color: var(--red); }   /* context at or above the context_warn threshold */
 .own-stalled { color: var(--amber); border-style: dotted; }   /* stopped on an API error; an unknown state stays neutral */
 .plan tr.group { cursor: default; }
 .plan tr.group:hover th { background: none; }
 /* plan table: fixed columns, so TASK and LAST share what is left and cut with an ellipsis, rather than the table
    growing past the box (it still scrolls below 640px) */
 .plan { table-layout: fixed; min-width: 640px; }
-.plan th:nth-child(1) { width: calc(6ch + 16px); } .plan th:nth-child(3) { width: 14ch; } .plan th:nth-child(4) { width: 22ch; }
+.plan th:nth-child(1) { width: calc(6ch + 16px); } .plan th:nth-child(3) { width: 14ch; } .plan th:nth-child(4) { width: 30ch; }
 .plan th:nth-child(5) { width: 7ch; }
 .plan td { overflow: hidden; text-overflow: ellipsis; }
 /* REF (PLAN and BACKLOG): border-box widths include the cell's 2 x 8px padding, so the column is a four-digit ref

@@ -45,6 +45,18 @@ class TailTests(Fixture):
         self.assertEqual(len(tail_transcript(path, limit=2)), 2)
         self.assertEqual(tail_transcript(self.projects / "missing.jsonl"), [])
 
+    def test_meta_context_is_the_newest_main_step_reread(self):
+        path = self.projects / "p" / "c.jsonl"
+        side = assistant("s", "t3", "m3", [{"type": "text", "text": "side"}], usage={"input_tokens": 9_000_000})
+        side["isSidechain"] = True
+        err = assistant("s", "t4", "m4", [{"type": "text", "text": "x"}], usage={"input_tokens": 7})
+        err["message"]["model"] = "<synthetic>"
+        write_jsonl(path, [assistant("s", "t1", "m1", [{"type": "text", "text": "a"}]),
+                           assistant("s", "t2", "m2", [{"type": "text", "text": "b"}], usage={"input_tokens": 5, "cache_creation_input_tokens": 10, "cache_read_input_tokens": 100, "output_tokens": 99}),
+                           side, err])
+        self.assertEqual(fl.read_tail(path)[1]["context"], 115)
+        self.assertIsNone(fl.read_tail(self.projects / "none.jsonl")[1]["context"])
+
 
 class FakeMachine:
     """A process table the Fleet can scan: two sessions, a daemon, the desktop app and a helper."""
@@ -134,7 +146,7 @@ class FleetTests(Fixture):
         d = self.fleet.detail(100)
         self.assertTrue(d["transcript"].endswith("sess-a.jsonl"))
         self.assertEqual(d["events"], [dict(ts="t", kind="you", text="hello"), dict(ts="t1", kind="claude", text="hi")])
-        self.assertEqual(d["meta"], dict(model="claude-test", effort="high", last_ts="t1", stall=None))
+        self.assertEqual(d["meta"], dict(model="claude-test", effort="high", last_ts="t1", stall=None, context=1000, context_total=False))
         self.assertEqual(len(self.fleet.detail(100, limit=1)["events"]), 1)
         path = Path(d["transcript"])
         before = self.fleet.tails[path][0]
