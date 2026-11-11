@@ -1512,8 +1512,12 @@ def _roster(service, raw) -> list[dict]:
         role, name = m["role"].strip(), m.get("name")
         if service.store.role(role) is None:
             raise ValueError(f"roster: no role {role!r}")
-        if name is not None and (not isinstance(name, str) or not 0 < len(name.strip()) <= 40):
-            raise ValueError("roster: a name is 1 to 40 characters")
+        if name is not None:
+            from almanac import spawner, web
+            if not isinstance(name, str) or not spawner.AGENT_NAME_RE.match(name.strip()):
+                raise ValueError(f"roster: name {name!r}: letters, digits, '-' or '_', at most 48")
+            if name.strip().lower() in web.RESERVED_AGENT_NAMES:
+                raise ValueError(f"roster: {name.strip()!r} is reserved")
         out.append(dict(role=role, **({"name": name.strip()} if name else {})))
     return out
 
@@ -1589,6 +1593,8 @@ def log_to_object(service, agent, caller, body: dict) -> dict:
     status = status if status != row["status"] else None
     if body.get("owner") and not row["squad_id"]:
         raise ValueError(f"{ref_of(row)} is in the backlog: it has no owner until it is dispatched")
+    if agent and body.get("status") and not row["squad_id"] and body["status"] != row["status"]:
+        raise _refused(403, f"{ref_of(row)} is in the backlog: only the operator changes its status")
     owner = _owner(service, row["squad_id"], body["owner"]) if body.get("owner") else None
     owner = owner if owner and owner["session_id"] != row["owner_session"] else None
     if not (text or status or owner):
@@ -1603,7 +1609,10 @@ def log_to_object(service, agent, caller, body: dict) -> dict:
     by_creator = (row["created_by"] == who.get("session")) if row["created_by"] else row["created_by_name"] == who["agent_name"]
     if status and not by_creator:
         notice = f"[{ref_of(row)} {row['status']} → {status} by {who['agent_name']}] {row['title']}"
-        _hub_tell(service, to_name=row["created_by_name"], to_session=row["created_by"],
+        to_name, to_session = row["created_by_name"], row["created_by"]
+        if to_session and (service.store.spawn_by_session(to_session) or {}).get("squad_id") != row["squad_id"]:
+            to_name, to_session = "operator", None     # filed in the backlog by another squad, dispatched since
+        _hub_tell(service, to_name=to_name, to_session=to_session,
                   text=notice + (f"\n\n{text}" if text else ""), agent=agent, caller=caller, squad=row["squad_id"])
     return dict(object=object_docs(service, [service.store.object_row(row["id"])], body=True)[0],
                 entry=log_doc(entry), delivered=delivered)
@@ -1631,6 +1640,8 @@ def dispatch_task(service, ref, *, almanac_url: str, token: str) -> dict:
         if current["squad_id"] or row["id"] in _DISPATCHING:
             raise _refused(409, f"{ref} is already dispatched"
                            + (f" to squad {current['squad_id']}" if current["squad_id"] else ""))
+        if current["status"] != "queued":
+            raise _refused(409, f"{ref} is {current['status']}; only a queued task is dispatched")
         _DISPATCHING.add(row["id"])
     try:
         res = spawner.launch_squad(service, almanac_url=almanac_url, token=token, name=row["title"],

@@ -1412,6 +1412,13 @@ class Store:
 
     _KEEP = object()
 
+    def delete_squad(self, squad_id: str) -> None:
+        """Take back a squad row whose launch stopped before it had a member (a dispatch whose lead did not start).
+        A spawn row the failed lead left keeps its squad_id, which then names no squad."""
+        with self.lock:
+            self.db.execute("delete from squads where id = ?", (squad_id,))
+            self.db.commit()
+
     def update_squad(self, squad_id: str, *, spawn_role=_KEEP, spawn_limit=_KEEP) -> dict | None:
         """Change what agents may add to a running squad. Left out = unchanged. None if there is no such squad."""
         current = self.squad(squad_id)

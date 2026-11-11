@@ -1927,6 +1927,7 @@ async function loadMesh() {
   paintMeshMessages();
   paintPlan();                 // owner chips follow the roster on every poll
   loadPlan(doc.objects_rev);   // the rows are refetched only when objects_rev (or the squad) changes
+  paintBacklog();              // the age moves and a selection shows
   loadBacklog(doc.objects_rev); // every project's, whatever squad is selected
   loadHeat();      // only when the scope changed; the 30 s loop refreshes it
   loadTopo(false, doc.latest_id);
@@ -2238,7 +2239,7 @@ $("plan-mission-toggle").addEventListener("click", (e) => {
 // a task opens in the peer context pane and holds it until a peer is picked or the squad changes
 function openTask(ref) {
   meshState.selTask = ref;
-  paintPlan();
+  paintPlan(); paintBacklog();
   $("mesh-ctx-box").setAttribute("data-title", `TASK // ${ref}`.slice(0, 56));
   $("mesh-ctx-kinds").hidden = true;
   $("mesh-ctx-head").replaceChildren(el("span", { cls: "dim", text: `loading ${ref}…` }));
@@ -2251,7 +2252,7 @@ function closeTask() {
   meshState.ctxSig = "";
   $("mesh-ctx-kinds").hidden = false;
   clearPeerContext();                                  // the next loadPeerContext() repaints the peer
-  paintPlan();
+  paintPlan(); paintBacklog();
 }
 
 async function loadTask(ref) {
@@ -2305,7 +2306,7 @@ async function loadBacklog(rev) {
   if (rev === backlogState.rev) return;
   backlogState.rev = rev;
   try {
-    const doc = await planGet("/api/mesh/objects?backlog=1&kind=task&limit=500");
+    const doc = await planGet("/api/mesh/objects?backlog=1&kind=task&status=queued&limit=500");   // what can dispatch
     backlogState.rows = doc?.objects || [];
     backlogState.note = doc ? "" : "this server predates the backlog: restart Almanac";
   } catch (err) {
@@ -2318,7 +2319,8 @@ async function loadBacklog(rev) {
 function backlogRow(o) {
   const armed = backlogState.armed === o.ref;
   const btn = el("button", { type: "button", cls: `btn ${armed ? "confirm" : "hi"}`, disabled: backlogState.busy,
-    text: armed ? `[LAUNCH ${backlogRoster(o)}; ${backlogLimit(o)}? click again]` : "[DISPATCH ▸]" });
+    text: armed ? "[LAUNCH? click again]" : "[DISPATCH ▸]",
+    title: `${backlogRoster(o)}; ${backlogLimit(o)}` });
   btn.addEventListener("click", (e) => { e.stopPropagation(); dispatchBacklog(o); });
   btn.addEventListener("keydown", (e) => e.stopPropagation());   // Enter on the button is the button's, not the row's
   const project = String(o.project || "").split(/[\\/]/).filter(Boolean).pop() || "";
@@ -2351,10 +2353,13 @@ function paintBacklog() {
 async function dispatchBacklog(o) {
   if (backlogState.busy) return;
   if (backlogState.armed !== o.ref) {                  // the first click arms; the second, within 5 s, launches
-    backlogState.armed = o.ref; backlogState.armedAt = Date.now(); backlogState.msg = "";
+    backlogState.armed = o.ref; backlogState.armedAt = Date.now();
+    backlogState.msg = `${o.ref}: launch ${backlogRoster(o)}; ${backlogLimit(o)}. Click [LAUNCH?] again within 5 s.`;
     paintBacklog();
     setTimeout(() => {
-      if (backlogState.armed === o.ref && Date.now() - backlogState.armedAt >= 5000) { backlogState.armed = null; paintBacklog(); }
+      if (backlogState.armed === o.ref && Date.now() - backlogState.armedAt >= 5000) {
+        backlogState.armed = null; backlogState.msg = `${o.ref}: not launched`; paintBacklog();
+      }
     }, 5100);
     return;
   }

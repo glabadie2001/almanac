@@ -464,8 +464,9 @@ class MeshClient:
         if name == "mesh_file":
             payload = {k: args[k] for k in ("kind", "title", "body", "files", "owner", "parent", "status", "backlog",
                                             "roster", "spawn_role") if args.get(k)}
-            if args.get("spawn_limit") is not None:
-                payload["spawn_limit"] = args["spawn_limit"]
+            for k in ("roster", "spawn_limit"):           # an empty roster or a limit of 0 still goes, to be checked
+                if args.get(k) is not None:
+                    payload[k] = args[k]
             if self.squad_id:
                 payload["squad"] = self.squad_id
             return self._api("/api/mesh/object", method="POST", body=payload)
@@ -668,7 +669,7 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
                                              "backlog": ns.backlog, "spawn_role": ns.spawn_role,
                                              "spawn_limit": ns.spawn_limit,
                                              "roster": [dict(zip(("role", "name"), m.split(":", 1)))
-                                                        for m in ns.roster or []]})
+                                                        for m in ns.roster] if ns.roster is not None else None})
     elif ns.cmd == "log":
         res = client.call_tool("mesh_log", {"ref": ns.ref, "body": " ".join(ns.body), "kind": ns.kind,
                                             "status": ns.status, "owner": ns.owner})

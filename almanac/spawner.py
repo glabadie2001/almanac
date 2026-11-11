@@ -729,7 +729,8 @@ def launch_squad(
     """Spawn a multi-agent cross-model squad with pre-wired peer rosters and a shared kickoff brief.
     `spawn_role` / `spawn_limit`: what an agent whose role may_spawn can add later (see `join_squad`).
     `lead_task`: a backlog task being dispatched. It is the first member's T (no second one is filed), and only once
-    that member has started does it join the squad, owned and in progress, with one `dispatch` log row."""
+    that member has started does it join the squad, owned and in progress, with one `dispatch` log row. A lead that
+    does not start stops the launch: nobody else is started and the squad row is deleted."""
     if not isinstance(members, list) or not members:
         raise ValueError("members must be a non-empty list of agent specs")
     if len(members) > 20:
@@ -826,17 +827,20 @@ def launch_squad(
             # one member that cannot start (a worktree git refuses, a bad role) must not orphan the ones already running
             res = dict(ok=False, pid=None, agent_name=p["agent_name"], session_id=None, provider=p["provider"],
                        role_id=p["role_id"], error=str(exc))
+        launched_agents.append(res)
         if lead_task and task_row is lead_task:
-            if res.get("ok") and res.get("session_id"):
-                service.store.log_object(lead_task["id"], who=dict(agent_name="operator"), kind="dispatch",
-                                         body=f"squad {squad_id}, led by {res.get('agent_name')}",
-                                         squad_id=squad_id, status="in progress", owner_session=res["session_id"],
-                                         owner_name=res.get("agent_name"))
+            if not (res.get("ok") and res.get("session_id")):
+                # no leaderless squad: start nobody else, and take back the squad row spawn_agent needed to exist
+                service.store.delete_squad(squad_id)
+                return dict(ok=False, squad=dict(squad_doc, agents=launched_agents), launched=0, failed=1)
+            service.store.log_object(lead_task["id"], who=dict(agent_name="operator"), kind="dispatch",
+                                     body=f"squad {squad_id}, led by {res.get('agent_name')}",
+                                     squad_id=squad_id, status="in progress", owner_session=res["session_id"],
+                                     owner_name=res.get("agent_name"))
         else:
             own_spawn_task(service, task_row, res)
-        launched_agents.append(res)
 
-    if brief and brief.strip():
+    if brief and brief.strip() and any(a.get("ok") for a in launched_agents):   # no notice to a squad of nobody
         service.store.record_message(
             from_name="operator",
             to_name="@squad",

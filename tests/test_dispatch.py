@@ -66,7 +66,10 @@ class BacklogTests(BacklogRig):
     def test_bad_backlog_filings_are_refused(self):
         cases = [dict(roster=[{"role": "ghost"}]), dict(roster=[]), dict(roster="architect-claude"),
                  dict(roster=[{"name": "x"}]), dict(spawn_role="ghost"), dict(spawn_limit=21), dict(owner="impl"),
-                 dict(parent="T-1"), dict(status="in progress"), dict(project=str(self.root / "nowhere"))]
+                 dict(parent="T-1"), dict(status="in progress"), dict(project=str(self.root / "nowhere")),
+                 dict(roster=[{"role": "architect-claude", "name": "operator"}]),
+                 dict(roster=[{"role": "architect-claude", "name": "Hub"}]),
+                 dict(roster=[{"role": "architect-claude", "name": "two words"}])]
         for body in cases:
             self.assertEqual(self.backlog(**body)[0], 400, body)
         self.assertEqual(self.post("/api/mesh/object", squad="sq-1", title="x", roster=ROSTER)[0], 400,
@@ -86,6 +89,19 @@ class BacklogTests(BacklogRig):
                                       token=web.agent_token(TOKEN, "far", "sess-far"))[0], 403)
         self.assertEqual(self.post("/api/mesh/object/log", arch, ref="T-1", owner="impl")[0], 400,
                          "no owner before dispatch")
+
+    def test_an_agent_logs_to_a_backlog_task_but_only_the_operator_sets_its_status(self):
+        arch = web.agent_token(TOKEN, "arch", "sess-arch")
+        self.backlog(arch)
+        self.assertEqual(self.post("/api/mesh/object/log", arch, ref="T-1", body="more context")[0], 200)
+        self.assertEqual(self.post("/api/mesh/object/log", arch, ref="T-1", status="accepted")[0], 403)
+        self.assertEqual(self.store.object_row(1)["status"], "queued")
+        self.assertEqual(self.post("/api/mesh/object/log", ref="T-1", status="accepted", body="not needed")[0], 200)
+        self.assertEqual(self.listed(status="queued"), [], "a retired task leaves the box")
+        status, _, res = self.dispatch("T-1")
+        self.assertEqual(status, 409, res)
+        self.assertIn("only a queued task", res["error"])
+        self.assertEqual(self.argv, [])
 
     def test_tools_and_cli_carry_the_backlog_fields(self):
         seen = []
@@ -144,8 +160,12 @@ class DispatchTests(BacklogRig):
         self.backlog(roster=ROSTER)
         before = self.store.object_row(1)
         self.dies.add(1)                                           # the lead exits at once
+        squads = len(self.store.squads())
         status, _, res = self.dispatch("T-1")
-        self.assertEqual((status, res["dispatched"]), (409, False))
+        self.assertEqual((status, res["dispatched"], res["launched"]), (409, False, 0))
+        self.assertEqual(len(self.argv), 1, "nobody started after the lead")
+        self.assertEqual(len(self.store.squads()), squads, "no squad row left behind")
+        self.assertIsNone(self.store.squad(res["squad"]["id"]))
         self.assertEqual(self.store.object_row(1), before)
         self.assertEqual([e["kind"] for e in self.store.object_log(1, 10)], ["create"])
         self.assertEqual(self.listed(), ["T-1"])
@@ -157,6 +177,20 @@ class DispatchTests(BacklogRig):
             self.assertEqual(self.dispatch("T-1")[0], 400)
         self.assertEqual(self.store.object_row(1), before)
         self.assertEqual(self.dispatch("T-1")[0], 200, "and it can be dispatched again")
+
+    def test_a_hand_in_on_a_task_filed_by_another_squad_tells_the_operator(self):
+        self.backlog(web.agent_token(TOKEN, "arch", "sess-arch"), roster=ROSTER, project=None)  # squad A files it
+        status, _, res = self.dispatch("T-1")                                                   # squad B takes it
+        self.assertEqual(status, 200, res)
+        lead = res["squad"]["agents"][0]
+        self.inbox["arch"].clear()
+        status, _, out = self.post("/api/mesh/object/log", web.agent_token(TOKEN, "lead", lead["session_id"]),
+                                   ref="T-1", status="in review", body="done")
+        self.assertEqual(status, 200, out)
+        [notice] = [m for m in self.store.messages() if "→ in review" in m["body"]]
+        self.assertEqual((notice["to_name"], notice["to_session"]), ("operator", None))
+        self.assertEqual(self.inbox["arch"], [], "squad A's architect is not interrupted")
+        self.assertEqual(self.store.object_row(1)["created_by_name"], "arch", "the filer is still on record")
 
     def test_a_second_dispatch_is_refused(self):
         self.backlog(roster=ROSTER)
