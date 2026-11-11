@@ -349,6 +349,14 @@ class Store:
                 if r.get("allowed_commands"):
                     self.db.execute("update roles set allowed_commands = ? where id = ? and coalesce(allowed_commands, '[]') = '[]'",
                                     (json.dumps(r["allowed_commands"]), r["id"]))
+        if not self.db.execute("select 1 from meta where key = 'gemini_usage_deltas'").fetchone():
+            # Gemini usage was stored as agy's running totals: read the Gemini transcripts once more so each turn
+            # stores its own counts (rows are keyed by message id, so the re-read replaces them). A flag, not a
+            # schema step, so it cannot collide with a schema bump on another branch.
+            self.db.execute("delete from files where exists (select 1 from sessions s where s.provider = 'gemini' "
+                            "and files.path like '%' || s.id || '.jsonl')")
+            self.db.execute("delete from meta where key like 'gemini_usage:%'")
+            self.db.execute("insert into meta values ('gemini_usage_deltas', '1')")
         self.db.execute("insert or replace into meta values ('schema', '9')")
         if self.db.execute("select count(*) from roles").fetchone()[0] == 0:
             now = time.time()
@@ -433,6 +441,7 @@ class Store:
         if end < 0:
             return offset
         stats["bytes"] += end + 1
+        self._from_top, self._totals_reset = offset == 0, set()   # see _gemini_turn
         for raw in data[:end + 1].splitlines():
             try:
                 rec = json.loads(raw)
@@ -441,6 +450,23 @@ class Store:
             if isinstance(rec, dict):
                 self._record(rec, project, stats, default_provider=provider)
         return offset + end + 1
+
+    def _gemini_turn(self, session: str, totals: tuple) -> tuple:
+        """One Gemini turn's usage from agy's running totals: agy reports the conversation's totals so far, and
+        they carry on across a relaunch with `--conversation` (measured 2026-11-11: inputs 10,439, 12,598, then
+        14,884 after a kill and relaunch). The previous totals per session live in `meta`; a file read from the top
+        starts the session over, and any count below the previous one is a reset, taken as it is."""
+        key = f"gemini_usage:{session}"
+        prev = None
+        if not (getattr(self, "_from_top", False) and session not in self._totals_reset):
+            row = self.db.execute("select value from meta where key = ?", (key,)).fetchone()
+            prev = json.loads(row[0]) if row else None
+        elif getattr(self, "_from_top", False):
+            self._totals_reset.add(session)
+        self.db.execute("insert or replace into meta values (?, ?)", (key, json.dumps(list(totals))))
+        if prev is None or any(t < p for t, p in zip(totals, prev)):
+            return totals
+        return tuple(t - p for t, p in zip(totals, prev))
 
     def _record(self, rec: dict, project: str, stats: dict, *, default_provider: str = "claude"):
         kind = rec.get("type")
@@ -511,15 +537,17 @@ class Store:
                                     (" ".join(str(text).split())[:200], session))
         if kind == "assistant":
             usage = msg.get("usage")
+            if usage:
+                counts = tuple(int(usage.get(k) or 0) for k in (
+                    "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens"))
+                if prov == "gemini" and session:
+                    counts = self._gemini_turn(session, counts)
             if main and session and usage and msg.get("model") not in (None, "<synthetic>"):
                 self.db.execute("update sessions set model = ?, context = ? where id = ?", (
-                    msg.get("model"), int(usage.get("input_tokens") or 0) + int(usage.get("cache_creation_input_tokens") or 0)
-                    + int(usage.get("cache_read_input_tokens") or 0), session))
+                    msg.get("model"), counts[0] + counts[1] + counts[2], session))
             if usage and msg.get("id"):
-                self.db.execute("insert or replace into usage values (?, ?, ?, ?, ?, ?, ?, ?)", (
-                    msg["id"], session, ts, msg.get("model"), int(usage.get("input_tokens") or 0),
-                    int(usage.get("cache_creation_input_tokens") or 0), int(usage.get("cache_read_input_tokens") or 0),
-                    int(usage.get("output_tokens") or 0)))
+                self.db.execute("insert or replace into usage values (?, ?, ?, ?, ?, ?, ?, ?)",
+                                (msg["id"], session, ts, msg.get("model"), *counts))
                 stats["messages"] += 1
             for block in content if isinstance(content, list) else []:
                 if not isinstance(block, dict) or block.get("type") != "tool_use":
