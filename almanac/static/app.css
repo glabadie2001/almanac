@@ -391,6 +391,7 @@ details table td:first-child, details table th:first-child { text-align: left; }
 .st-accepted { color: var(--hi); } .st-blocked { color: var(--red); font-weight: bold; }
 .own-busy { color: var(--amber); } .own-idle { color: var(--fg); }
 .own-ended { color: var(--dim); border-style: dashed; opacity: .7; } .own-none { color: var(--dim); border-color: transparent; }
+.flag.ctx-warn, td.ctx-warn { color: var(--red); }   /* context at or above the context_warn threshold */
 .own-stalled { color: var(--amber); border-style: dotted; }   /* stopped on an API error; an unknown state stays neutral */
 .plan tr.group { cursor: default; }
 .plan tr.group:hover th { background: none; }

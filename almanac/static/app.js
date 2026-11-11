@@ -1215,6 +1215,7 @@ async function loadFleet() {
   let doc;
   try { doc = await api("/api/fleet"); } catch (err) { $("fleet-summary").textContent = `fleet unavailable: ${err.message}`; return; }
   state.fleet = doc;
+  if (doc.context_warn) state.ctxWarn = doc.context_warn;
   trackSessions();       // before any early return: every fleet refresh notices sessions leaving, whatever the tab
   const s = doc.summary || {};
   const byProv = s.providers || {};
@@ -1275,6 +1276,7 @@ async function loadFleet() {
       el("td", { cls: "role-tag", text: p.role === "session" ? (p.agent_role || "–").slice(0, 18) : "" }),
       modelCell,
       effortCell,
+      el("td", { cls: `r${ctxWarn(p.context)}`, text: p.role === "session" ? ctxText(p.context, p.provider) : "", title: p.context ? `${ctxTitle(p.provider)} (${p.context})` : null }),
       el("td", {}, rowState(p)), el("td", { cls: "r", text: p.cpu === null ? "–" : `${num(p.cpu)}%` }),
       el("td", { cls: "spark", text: spark(state.cpu.get(key), Math.max(5, ...state.cpu.get(key))) }),
       el("td", { cls: "r", text: `${p.mem_mb}M` }), el("td", { cls: "r", text: age(p.started) }));
@@ -1868,6 +1870,7 @@ async function loadMesh() {
   }
   if (sq !== meshState.squadFilter) return;       // the squad changed while this was in flight: the newer call paints
   meshState.peers = doc.peers || [];
+  if (doc.context_warn) state.ctxWarn = doc.context_warn;
   meshState.messages = doc.messages || [];
   meshState.open = doc.open || [];
   if (doc.roles?.length) { state.roles = doc.roles; syncRoleControls(); }
@@ -2174,6 +2177,10 @@ async function loadPlan(rev) {
 // the roster decides on every poll, as it is fresher than the fetched rows: a live owner is stalled (stopped on an API
 // error), busy or idle, and an absent one has ended. The rows are only fetched after a roster poll, so the door's own
 // owner_state is never needed here.
+// A step's re-read, in k. A Gemini number is agy's running total for the conversation, not one step's: Σ says so.
+const ctxText = (n, provider) => n ? `${ktok(n)}${provider === "gemini" ? "Σ" : ""}` : "";
+const ctxWarn = (n) => n && state.ctxWarn && n >= state.ctxWarn ? " ctx-warn" : "";
+const ctxTitle = (provider) => provider === "gemini" ? "tokens agy reports for the whole conversation so far (not one step's re-read)" : "tokens its last step re-read";
 function planOwnerState(o) {
   if (!o.owner_name) return "none";
   const p = meshState.peers.find((q) => (o.owner_session ? q.session_id === o.owner_session : q.name === o.owner_name));
@@ -2183,8 +2190,11 @@ const statusPill = (s) => el("span", { cls: `flag st-${slug(s)}`, text: s || "�
 function ownerChip(o) {
   const own = planOwnerState(o);
   const plain = ["none", "busy", "idle", "ended"].includes(own);   // colour says these; any other state is spelled out
-  return el("span", { cls: `flag own-${slug(own)}`, text: plain ? o.owner_name || "unowned" : `${o.owner_name} · ${own}`,
-    title: own === "none" ? "nobody owns this task" : `${o.owner_name}: ${own}` });
+  const peer = meshState.peers.find((q) => o.owner_session && q.session_id === o.owner_session);   // live; owner_context is the fallback
+  const ctx = ctxText(peer ? peer.context : o.owner_context, peer?.provider);
+  const base = plain ? o.owner_name || "unowned" : `${o.owner_name} · ${own}`;
+  return el("span", { cls: `flag own-${slug(own)}${ctxWarn(peer ? peer.context : o.owner_context)}`, text: ctx && own !== "none" ? `${base} · ${ctx}` : base,
+    title: own === "none" ? "nobody owns this task" : `${o.owner_name}: ${own}${ctx ? ` · context ${ctx}: ${ctxTitle(peer?.provider)}` : ""}` });
 }
 function planLast(l) {
   if (!l) return "";

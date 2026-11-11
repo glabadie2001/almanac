@@ -97,6 +97,7 @@ class Service:
                  prices=None, namer=None, probe=None):
         self.store, self.transcripts, self.interval = store, Path(transcripts), interval
         self.fleet = fleet
+        self.context_warn = 300_000       # tokens re-read per step at which the UI warns (config `context_warn`)
         # absolute: paths built from it are handed to an agent that runs in the chat's folder, not ours
         self.state = Path(state).resolve() if state else None
         self.archive_dir = self.state / "archive" / "projects" if self.state else None
@@ -273,6 +274,10 @@ class Service:
             if time.time() - self.fleet.last.get("at", 0) > FLEET_TTL:
                 self.fleet.snapshot()
             self._enrich_process_models(self.fleet.last.get("processes", []), prune=True)
+            for p in self.fleet.last.get("processes", []):
+                if p.get("session_id") and not p.get("context"):     # a tail with no usage: what the last ingest stored
+                    p["context"] = self.store.session_context(p["session_id"])
+            self.fleet.last["context_warn"] = self.context_warn
             return self.fleet.last
 
     def available_models(self) -> dict:
@@ -677,6 +682,7 @@ class Service:
                     mode_note=urec.get("mode_note"),       # e.g. agy fell back from `--mode auto`
                     has_uds=bool(p.get("has_uds")),
                     pipe=p.get("pipe"),
+                    context=p.get("context"),
                     cpu=p.get("cpu"),
                     mem_mb=p.get("mem_mb"),
                     started=p.get("started"),
@@ -1338,8 +1344,9 @@ def log_identity(agent, caller) -> dict:
 
 def object_docs(service, rows: list[dict], *, body: bool = False) -> list[dict]:
     """The API shape of `rows`: names, the owner's state from the live roster, child counts and the last log line."""
-    states = {p.get("session_id"): ("idle" if p.get("status") in (None, "idle") else "busy")
-              for p in service.mesh_peers() if p.get("session_id")}
+    peers = [p for p in service.mesh_peers() if p.get("session_id")]
+    states = {p["session_id"]: ("idle" if p.get("status") in (None, "idle") else "busy") for p in peers}
+    contexts = {p["session_id"]: p.get("context") for p in peers}
     names = {}
     for r in rows:
         sid = r["owner_session"]
@@ -1353,7 +1360,7 @@ def object_docs(service, rows: list[dict], *, body: bool = False) -> list[dict]:
         doc = dict(ref=ref_of(r), id=r["id"], kind=r["kind"], title=r["title"], status=r["status"],
                    squad_id=r["squad_id"], parent=f"T-{r['parent_id']}" if r["parent_id"] else None,
                    owner_name=names.get(sid), owner_session=sid,
-                   owner_state=(states.get(sid, "ended") if sid else None), files=r["files"],
+                   owner_state=(states.get(sid, "ended") if sid else None), owner_context=contexts.get(sid), files=r["files"],
                    created_by_name=r["created_by_name"], created_ts=r["created_ts"], updated_ts=r["updated_ts"],
                    project=r["project"], data=r["data"],
                    children=dict(total=st["children"][0], accepted=st["children"][1]), log_count=st["log_count"],
@@ -1778,6 +1785,7 @@ def make_handler(service, token, *, hosts=()):
                             hub_pipe=service.hub_peer.pipe_path if service.hub_peer else None,
                             open=service.store.open_needs(squad_id=squad_q),
                             objects_rev=service.store.objects_rev(),
+                            context_warn=service.context_warn,
                         ),
                     )
                 if path == "/api/mesh/objects":

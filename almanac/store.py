@@ -973,6 +973,11 @@ class Store:
                             "named_at = ?, name_error = ? where id = ?", (name, usd, time.time(), error, session))
             self.db.commit()
 
+    def session_context(self, session_id: str) -> int | None:
+        with self.lock:
+            row = self.db.execute("select context from sessions where id = ?", (session_id,)).fetchone()
+        return (row[0] or None) if row else None
+
     def chat(self, session_id: str) -> dict | None:
         found = [c for c in self.chats(session_id, 5) if c["id"] == session_id]
         return found[0] if found else None
