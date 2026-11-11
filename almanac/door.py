@@ -1679,15 +1679,18 @@ def make_handler(service, token, *, hosts=()):
                                                      f"mesh_spawn refused: {reason}", self._who())
                             return self._send(code, dict(ok=False, error=reason))
                         squad_id, role_id, by = squad["id"], role["id"], self.agent
+                        by_session = (service.caller(self.agent, self.agent_session) or {}).get("session_id")
                     else:
                         squad_id, role_id, by = body.get("squad_id"), body.get("role_id") or body.get("role"), None
+                        by_session = None
                         if not squad_id or not role_id:
                             raise ValueError("the operator names squad_id and role_id")
                         overrides = {k: body[k] for k in ("model", "effort", "workspace_mode", "permission_mode") if body.get(k)}
                     try:
                         res = spawner.join_squad(service, almanac_url=f"http://127.0.0.1:{port}", token=token,
                                                  squad_id=squad_id, role_id=role_id, task=task, agent_name=body.get("name"),
-                                                 spawned_by=by, **overrides)
+                                                 spawned_by=by, spawned_by_session=by_session, files=body.get("files"),
+                                                 **overrides)
                     except (RuntimeError, OSError) as exc:
                         res = dict(ok=False, agent_name=body.get("name"), role_id=role_id, error=str(exc))
                 service.store.log_action(
@@ -1719,7 +1722,7 @@ def make_handler(service, token, *, hosts=()):
                         res = spawner.join_squad(service, almanac_url=f"http://127.0.0.1:{port}", token=token,
                                                  squad_id=str(body.get("squad_id") or ""), role_id=str(body.get("role_id") or ""),
                                                  task=str(body.get("task") or ""), agent_name=body.get("agent_name") or body.get("name"),
-                                                 spawned_by=None, **overrides)      # the operator's adds never use the limit
+                                                 spawned_by=None, files=body.get("files"), **overrides)      # the operator's adds never use the limit
                     except (RuntimeError, OSError) as exc:
                         res = dict(ok=False, agent_name=body.get("agent_name"), role_id=body.get("role_id"), error=str(exc))
                 service.store.log_action(

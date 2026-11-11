@@ -274,3 +274,96 @@ class TwinSquadTests(ObjectRig):
         got = self.get("/api/mesh/messages", web.agent_token(TOKEN, "arch", "sess-arch"), peer="arch")[2]["messages"]
         self.assertEqual([m["body"] for m in got], ["one", "everyone"])
         self.assertEqual(len(self.get("/api/mesh/messages", peer="arch")[2]["messages"]), 3, "the operator sees all")
+
+
+class McpTests(ObjectRig):
+    """The four tools, `re` and the CLI verbs, through the real door."""
+
+    def client(self, name):
+        from almanac import mcp_mesh
+
+        def api(path, method="GET", body=None, timeout=30.0):
+            status, _, doc = self.request(self.handler, path, token=self.tok(name), method=method, body=body)
+            if status >= 400:
+                raise RuntimeError(doc.get("error"))
+            return doc
+        return mcp_mesh.MeshClient(url="http://x", token="t", self_name=name, squad_id="sq-1", api_fn=api)
+
+    def test_file_list_read_log_and_re(self):
+        arch, impl = self.client("arch"), self.client("impl")
+        res = arch.call_tool("mesh_file", {"kind": "task", "title": "Store", "body": "v10", "owner": "impl",
+                                           "files": ["almanac/store.py"]})
+        self.assertEqual((res["object"]["ref"], res["delivered"]), ("T-1", True))
+        self.assertEqual([o["ref"] for o in impl.call_tool("mesh_objects", {"owner": "impl"})["objects"]], ["T-1"])
+        impl.call_tool("mesh_send", {"to": "arch", "message": "on it", "re": "T-1"})
+        impl.call_tool("mesh_log", {"ref": "T-1", "status": "in review", "body": "done; 263 OK"})
+        doc = arch.call_tool("mesh_object", {"ref": "T-1", "log_limit": 10})
+        self.assertEqual([e["kind"] for e in doc["log"]], ["status", "message", "assign", "create"])
+        with self.assertRaises(RuntimeError):
+            arch.call_tool("mesh_object", {"ref": "T-9"})
+
+    def test_cli_verbs(self):
+        import contextlib
+        import io
+        from almanac import mcp_mesh
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mcp_mesh._run_cli(["file", "From the shell", "--body", "b", "--files", "a.py", "b.py", "--owner", "impl"],
+                              self.client("arch"))
+            mcp_mesh._run_cli(["log", "T-1", "learned", "a", "thing", "--kind", "learned"], self.client("impl"))
+            mcp_mesh._run_cli(["send", "arch", "hi", "--re", "T-1"], self.client("impl"))
+            mcp_mesh._run_cli(["objects", "--status", "in progress"], self.client("arch"))
+            mcp_mesh._run_cli(["object", "T-1", "--log-limit", "2"], self.client("arch"))
+        row = self.store.object_row(1)
+        self.assertEqual((row["title"], row["files"]), ("From the shell", ["a.py", "b.py"]))
+        self.assertEqual([e["kind"] for e in self.store.object_log(1, 10)], ["message", "learned", "assign", "create"])
+        self.assertEqual(self.store.object_log(1, 10)[1]["body"], "learned a thing")
+
+    def test_gemini_is_granted_the_new_tools(self):
+        from almanac import gemini_host
+        for tool in ("mesh_objects", "mesh_object", "mesh_file", "mesh_log"):
+            self.assertIn(f"mcp(almanac-mesh_almanac-mesh/{tool})", gemini_host.MESH_GRANTS)
+
+
+from test_elastic import TASK, ElasticRig   # noqa: E402  (after the rigs above, which do not need it)
+
+
+class SpawnTaskTests(ElasticRig):
+    """Both spawn paths file the member's task as a T: unowned and queued first, the new session's and in progress
+    after a successful spawn, and no assignment message (the kickoff carries the task)."""
+
+    def test_mesh_spawn_files_a_t_owned_by_the_newcomer(self):
+        status, _, res = self.request(self.handler, "/api/mesh/spawn", token=web.agent_token(TOKEN, "arch", "sess-arch"),
+                                      method="POST", body={"task": TASK, "files": ["almanac/store.py"]})
+        self.assertEqual(status, 200, res)
+        row = self.store.object_row(1)
+        self.assertEqual((row["title"], row["body"], row["status"], row["owner_session"], row["squad_id"]),
+                         (TASK, TASK, "in progress", res["session_id"], "sq-1"))
+        self.assertEqual((row["created_by"], row["created_by_name"], row["files"]), ("sess-arch", "arch", ["almanac/store.py"]))
+        self.assertIn("## Your Initial Assignment (`T-1`)", self.argv[-1][-1])
+        self.assertEqual([e["kind"] for e in self.store.object_log(1, 10)], ["assign", "create"])
+        self.assertIsNone(self.store.object_log(1, 1)[0]["message_id"])
+        self.assertFalse([m for m in self.store.messages() if "assigned to you" in m["body"]], "no assignment message")
+
+    def test_a_failed_spawn_leaves_the_t_queued_and_unowned(self):
+        self.dies.add(1)
+        self.assertEqual(self.request(self.handler, "/api/mesh/spawn", token=web.agent_token(TOKEN, "arch", "sess-arch"),
+                                      method="POST", body={"task": TASK})[0], 409)
+        row = self.store.object_row(1)
+        self.assertEqual((row["status"], row["owner_session"]), ("queued", None))
+
+    def test_a_squad_launch_files_one_t_per_member_with_a_task(self):
+        status, _, res = self.request(self.handler, "/api/squads", method="POST", body={
+            "name": "gamma", "cwd": str(self.ws), "brief": "b", "members": [
+                {"role_id": "architect-claude", "agent_name": "lead", "workspace_mode": "shared",
+                 "task": "Plan it.\nSecond line."},
+                {"role_id": "implementer-claude", "agent_name": "doer", "workspace_mode": "shared"}]})
+        self.assertEqual(status, 200, res)
+        squad = res["squad"]["id"]
+        rows = self.store.objects(squad_id=squad)
+        self.assertEqual(len(rows), 1, "a member with only the mission gets no T")
+        lead = next(a for a in res["squad"]["agents"] if a["agent_name"] == "lead")
+        self.assertEqual((rows[0]["title"], rows[0]["status"], rows[0]["owner_session"], rows[0]["created_by_name"]),
+                         ("Plan it.", "in progress", lead["session_id"], "operator"))
+        self.assertIn(f"## Your Initial Assignment (`T-{rows[0]['id']}`)", self.argv[0][-1])
+        self.assertIn("mesh_file(kind=", self.argv[0][self.argv[0].index("--append-system-prompt") + 1])
