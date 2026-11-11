@@ -5,15 +5,25 @@ the same primitive: an addressable record that agents hold a reference to, look 
 
 ## 1. Status (2026-11-11)
 
-**No work object exists yet.** The plans for tasks-as-objects and an Almanac Engram were sent for planning on
-2026-11-10 and did not land. Nothing for them is on this machine, on origin (`main` and `cross-model-mesh`), or in
-the mesh journal, and `~/.claude/plans/` holds nothing related. Almanac stores what it observes (session, call,
-turn, usage) and what it coordinates (message, flag, squad, role). It does not store work.
+**Built in the 2026-11-11 build** (one branch, `almanac/alpha-squad-563100/impl-claude-recover`):
+
+- **Stage 0, identity:** agent tokens carry the session (`77237ea`).
+- **Stage 1, tasks as objects:** `objects` and `object_log` (schema v10), the routes and four tools, `mesh_send(re=)`,
+  assignment by filing with an owner, both spawn paths file a T, the charter protocol (`b01fb6a`, `1c3cf90`,
+  review fixes `bdb1ac4`), and the PLAN view in MESH (<PLAN_SHA>).
+- **Stall recovery:** a squad agent idle on an API error is sent `continue` and then escalated to the operator
+  (`cad410e`, `75e2a8b`, `8db6917`); Gemini turn failures are marked the same way.
+- **Orchestrator role** and restart (<ORCH_SHA>).
+- **Markdown in messages** (<MD_SHA>).
+- **Gemini usage** stored per turn instead of agy's running totals (`3aa2fa9`).
+
+Notes (stage 3) and findings (stage 2) are not built. The inventory below is the state **before** this build, kept
+because it is why the design looks the way it does.
 
 ### Object inventory
 
-How close each concept is to an object an agent can hold a reference to. Paths are under `almanac/` as of
-b3bbabb.
+How close each concept was to an object an agent can hold a reference to, before this build. Paths are under
+`almanac/` as of b3bbabb.
 
 | Concept | Stored | Id | Agent receives the id | Agent can look it up | Agent can append | Lifecycle |
 |---|---|---|---|---|---|---|
@@ -55,11 +65,11 @@ they change, and counters five ways a memory dies. Here is where each piece land
 |---|---|
 | `journal/` (append-only, what happened) | `object_log` entries on a task: learned, dead end, next. Engram's Did / Touched / Commits lines are derived in stage 4, not written |
 | `tasks.md` (Now / Next / Later / Done) | task objects `T`, with statuses (queued, in progress, in review, accepted, blocked) |
-| `gotchas.md` (dated bullets with file refs) | note `N`, kind gotcha, anchored to files |
-| `decisions/` ADRs (never edited, superseded by a new ADR) | note, kind decision; never edited, superseded through `parent_id`. The operator's are directives |
-| atlas cards (what the code is, sha-stamped, ≤60 lines) | note, kind card. The last kind to build. Like Engram's "judgment, not inventory" rule, it holds judgment, never a list `grep` could produce |
-| dead ends (`dead` / `parked`, first-class in the journal) | a log entry on the task; it becomes a note once verified, so it outlives the squad |
-| `MEMORY.md` (always loaded, 120-line cap) | the kickoff brief, built per agent and task instead of one static file (about 40 lines) |
+| `gotchas.md` (dated bullets with file refs) | published note, kind `gotcha`, anchored to a symbol or file |
+| `decisions/` ADRs (never edited, superseded by a new ADR) | published note, kind `decision`, which includes an accepted squad plan; never edited, `superseded_by` the next. The operator's are kind `directive` |
+| atlas cards (what the code is, sha-stamped, ≤60 lines) | **cut.** Orientation lives in the task body. This doc's own inventory went false within a day; cards would too |
+| dead ends (`dead` / `parked`, first-class in the journal) | a log entry on the task (a claim); promoted, it becomes a published `dead-end` note (`parked` unless tied to a symbol), so it outlives the squad |
+| `MEMORY.md` (always loaded, 120-line cap) | the brief on kickoff and on every assignment: directives plus at most five fresh notes inline, 240 characters each; everything else is pulled |
 | bug-sweep module: `sweeps/` ledger | findings `F`, stage 2 |
 | bug-sweep module: `bug-classes.md` (taxonomy and hunt heuristics) | a note kind, not a finding: it describes a class, not one instance. Later than stage 3 |
 | `architecture.md` (Live vs Target diagrams) | not mapped; cut from v1 |
@@ -68,41 +78,43 @@ they change, and counters five ways a memory dies. Here is where each piece land
 | Engram death mode | Counter here |
 |---|---|
 | 1. Write-nothing | Handing in a slice *is* the log entry (`mesh_log` with the status change; the hub notifies the creator). The librarian sweeps at squad end. A task in progress whose owner session ended with no entry is flagged |
-| 2. Stale-confident | The door stamps the sha. Freshness is computed on read, `pending` covers unmerged branches, and commits since verification are shown |
+| 2. Stale-confident | Each note carries its symbol's body hash (`symbol_sha`), checked on read; a changed body drops it from the brief at once |
 | 3. Bloat | Body caps refused at the door, the brief's line and character caps, ranking; everything else is pulled |
 | 4. Write-only | The brief is in every kickoff, for both providers, with no hook; the tools serve pull |
 | 5. Fragmentation | One ref per fact; corrections supersede; a message links with `re=` instead of restating |
-| 6. Spread of a wrong note (only a shared base has this) | A claim versus verified by a different role class; claims stay in their squad; directives only from an operator route; notes wrapped as data. Engram has a write-path poisoning guard, but its one writer limits the spread |
+| 6. Spread of a wrong note (only a shared base has this) | A claim is only a task log entry; publishing is a door-checked promotion by a reviewer or the operator, never the author; directives only from an operator route; notes wrapped as data. Engram has a write-path poisoning guard, but its one writer limits the spread |
 
-**What Almanac adds that file-based Engram cannot.** It has one writer. Engram's CONCEPTS.md entry
-"hub-and-spoke memory reconciliation" asks for a hub, a librarian and a pending overlay for unmerged code. Here
-the hub is Almanac's store, the librarian is D12, and the overlay is D8's `pending`. CONCEPTS.md argues for a git
-remote over a bespoke server, on the grounds that a server either syncs dumbly (last write wins) or is smart,
-and then the intelligence belongs in the reconciler. That holds here: the store never merges text, because each
-object has one owner and an append-only log, and judgment stays with the librarian and the verifier. Beyond that,
-attribution is stamped by the server rather than self-reported, verification crosses providers, and Gemini gets
-the same read path.
+**What Almanac adds, and what it keeps from Engram.** Published knowledge is plain markdown under
+`docs/knowledge/`, written only by Almanac's door, and the files are the record: they travel by git and any
+session can grep them, as in Engram. The database only indexes them and is rebuildable from a clone. Engram's
+CONCEPTS.md entry "hub-and-spoke memory reconciliation" asks for a hub and a librarian, and argues for a git remote
+over a bespoke server; that holds here, since git carries the record and the store never merges text. What Almanac
+adds is the gate: a claim stays in its task's log until a reviewer or the operator promotes it, with the symbol
+checked on disk, and attribution is stamped by the server rather than self-reported. Gemini gets the same read
+path.
 
-**What it gives up.** Plain files in git that any session can grep and that travel with a clone, which D10's
-export only partly restores. Also Engram's post-compaction reminder: a kickoff brief arrives once, so a long-lived
-agent that compacts does not get it again (item 13's respawn with handoff is the answer). And content-addressed
-freshness: Engram's manifest counts a revert to verified content as current again, while D8's ancestry and
-file-diff check marks it `drifted`.
+**What it gives up.** In-flight work (tasks, logs, unpromoted candidates) and metrics stay on the machine that ran
+the squad. Engram's post-compaction reminder: a brief arrives on kickoff and assignment only, so a long-lived agent
+that compacts does not get it again (item 13's respawn with handoff is the answer). And precision on non-Python
+files: freshness there is a whole-file hash.
 
 **Trust order, side by side.** Engram: code > fresh atlas and decisions > journal, with user directives
 (`(per user, date)`) outranking inference. Almanac: code > directive > verified and fresh > claim. The directive is
 Engram's user directive, given a route only the operator can call.
 
-## 2. Design v2
+## 2. Design
 
-v1 was reviewed by rev-gemini, and the architect ruled on each finding. The decisions below are v2.
+Work objects are design v2 (v1 was reviewed by rev-gemini and ruled on by the architect). Notes are design
+**v3**: the agreed items of the Engram debate (`docs/engram-debate-2026-11-11.md`), rewritten in place below.
 
 **D1 One primitive, its own log.** A new `objects` table and a separate `object_log` table, with an optional
 `message_id` when an entry came in through `mesh_send`. A ref is a kind letter plus the row id: `T-12` task,
 `F-13` finding, `N-14` note.
 
-**D2 Scope.** Tasks and findings belong to a squad. Notes belong to a project (the main checkout root, so every
-worktree shares one set) and outlive squads.
+**D2 Scope and two stores.** Tasks, findings and their logs belong to a squad and live in the database,
+machine-local. Published notes belong to the project: files under `docs/knowledge/<kind>/<slug>-<hash6>.md`,
+written only by the door. The files are the record; the database indexes them at ingest and can be rebuilt from a
+clone. A note's id travels with it: `N-<hash6>`, kept in `data` beside the local `objects.id`.
 
 **D3 Columns.** `objects`: `id, kind, project, squad_id, title, body, status, owner_session, parent_id` (task →
 the task it is part of, so a squad's tasks form a tree; finding → task; note → the note it supersedes), `files` (repo-relative paths or globs, canonicalized to forward slashes relative to
@@ -135,53 +147,73 @@ stage 4. It needs three things that do not exist yet:
 - **One in-progress task per session**, so a call or a turn belongs to exactly one task. Gemini usage is written
   after the whole `agy` turn ends (gemini_host.py), so attribution by time is approximate for Gemini.
 
-**D6 Read path.** Both kickoff builders add a brief. It holds your task ref and its log tail (a respawn with the
-same ref is item 13's handoff), and the squad's open tasks as one-liners. From stage 3 it also holds up to N
-notes that match the task's `files`, ranked exact file > glob > project scope, with project-scope notes held to
-at most 2 slots. Each note carries a freshness marker. Notes are wrapped in the brief as data, not instructions.
-The cap is about 40 lines **and** a character budget: Claude's kickoff is one argv item (spawner.py:545) and
-shares Windows' 32,767-character command line with the charter. Everything else is pulled with the tools. This
-works for Gemini and needs no hook.
+**D6 Read path.** Both kickoff builders, and every assignment, add a brief: your task ref and its log tail (a respawn
+with the same ref is item 13's handoff), the squad's open tasks as one-liners, the directives, and at most **five**
+fresh notes inline, 240 characters each. Notes are ranked by a symbol named in the task text, then project scope
+(at most one). Drifted and contested notes are never pushed. Notes are wrapped in the brief as data, not
+instructions. Each spawn and assignment logs its `briefed_refs`. Everything else is pulled through the hub with
+`mesh_objects` / `mesh_object` (a worktree lacks files written after its snapshot), and sessions outside Almanac
+read the files. This works for Gemini and needs no hook. The cap is also a character budget: Claude's kickoff is
+one argv item (spawner.py:545) and shares Windows' 32,767-character command line with the charter.
 
-**D7 Trust.** A note is born a `claim`. The door stamps it with session, role, provider, model, sha and branch;
-the client sends none of them. `verified` requires a verifier of a different role class than the author: the
-reviewer role or the operator. The provider is recorded and shown. Anyone may log a contest, which makes the note
-`contested`. A note ends as `superseded` or `retracted`. Operator notes are born `directive`, and directives are
-minted only on an `/api/operator/*` route, never on `/api/mesh/*`, so the token-file fallback in `mcp_mesh` cannot
-mint one. Trust order: code > directive > verified and fresh > claim. A brief carries directives and verified
-notes, plus claims from the reader's own squad only. A dead end leads the brief only once verified.
+**D7 Trust.** A claim is a task log entry (`learned`, `dead`, `parked`), and nothing more. Publishing is
+**promotion**: a door-checked act by a reviewer or the operator, never the entry's author, from a log entry or
+direct input. The door checks the symbol **on disk in the main checkout** (not at `HEAD`: integration by
+`git apply` leaves agent work uncommitted there), refuses a symbol that does not exist there (branch-only work
+stays in the squad's `object_log`, so no `pending` state is needed), stamps `symbol_sha` or `scope: project`, and
+writes the file. Published states: `verified`, `directive`, `contested`, plus `superseded_by`. Contesting drops a
+note from briefs and keeps its file until it is verified again or retracted; retraction deletes the file.
+Directives are minted only on an `/api/operator/*` route. Cross-model verification is **recorded, not required**,
+and not advertised until measured: a missing runner (spawner.py:411-417) must not deadlock promotion. Trust order:
+code > directive > verified and fresh > claim.
 
-**D8 Freshness.** Computed on read (brief build, `mesh_object`), never on the 2-second poll. A note is `fresh`
-when its sha is an ancestor of the main checkout's HEAD (`git merge-base --is-ancestor`) and
-`git diff --name-only <sha>..HEAD` names none of its files. If that diff names any of them, the note is `drifted`
-with those files named. If the sha is not an ancestor, the note is `pending on <branch>`, visible only to its
-squad. HEAD always means the checkout's HEAD, never a branch name: the checkout is on `cross-model-mesh`, and
-local `main` is stale. The git work is one `git diff --name-only` per distinct sha, cached by (sha, HEAD), with
-globs matched by `fnmatch`. Beside `fresh`, a note shows how many commits have landed since it was verified, to
-cover drift outside its files.
-**Verifying re-stamps.** Worktree work is integrated with `git apply` (ROADMAP §12), so an agent's commits never
-become ancestors of HEAD. A note signed on a branch therefore stays `pending` until someone verifies it. The door
-stamps the verifier's own HEAD as the note's sha, so a reviewer on the main checkout verifying after integration
-is what lifts `pending`. No separate mechanism.
+**D8 Freshness.** A note's freshness is its symbol's body hash, computed on read, never on the 2-second poll. For
+Python the symbol is a `def` or `class` found with the stdlib `ast` and hashed over its span; any other file is
+hashed whole. Edits elsewhere in a hub file such as `store.py` leave a Python note `fresh`; a changed body makes it
+`drifted`, which drops it from the brief at once (it stays pullable, marked). Said plainly: **a note on `app.js` or
+any non-Python file drifts on every edit to that file.** A revert to the verified content is fresh again.
 
 **D9 Budgets and anchoring.** A note body is capped, and the door refuses an oversized one with "trim". A note
 needs at least one file, or an explicit project scope. Corrections supersede; they do not append contradictions.
 
-**D10 Portability, stage 4, on the operator's action only.** Verified and directive notes can be exported to
-markdown in the repo. Only Almanac writes the files, each carries its sha, and an export runs only when no
-worktree in the squad is live, because writing into the checkout would break `git apply --3way` for any
-integration still pending. Knowledge then travels by git to another machine and is readable by sessions not
-launched from Almanac. Tasks, findings and logs stay in the database.
+**D10 Portability: write-through at promotion.** The file is written when a note is promoted, not at squad end
+(squad end is not an event in the code, and an interrupted machine never fires it). A second machine has every
+committed note after `git pull`; it loses in-flight tasks and logs, unpromoted candidates, metrics, and any file
+not yet committed. Almanac does not commit: the UI shows the uncommitted count. Worktree integration excludes
+`:(exclude)docs/knowledge`. Writing these files does not block `git apply --3way`: it refuses only when a file the
+patch touches is dirty (tested in the debate, git 2.52), so v2's "no live worktree" restriction is lifted.
 
 **D11 Prerequisite.** Agent tokens carry the session id (ROADMAP "identity at the door is its handle"). Attribution
 of log entries depends on it.
 
 **D12 Later.** A librarian at squad end: one fresh agent proposes consolidated notes from the squad's task logs.
 
-**Cut from Engram for v1:** metrics events and the scorecard, architecture diagrams, manifests, the status line,
-monthly digests, wikilinks (refs replace them), skills and hooks.
+**Cut from Engram:** atlas cards, metrics events and the scorecard (measurement is D6's `briefed_refs` and the
+debate's violated-note rate), architecture diagrams, manifests, the status line, monthly digests, wikilinks (refs
+replace them), skills and hooks.
 
-### Changed after review
+### Changed after the debate (notes v3)
+
+- **Files are the record.** Published notes are markdown under `docs/knowledge/`; the database indexes them. v2 kept
+  notes in the database and exported some.
+- **Publish at promotion**, not at squad end or on an export action (D10).
+- **`N-<hash6>` ids** that travel with the file, beside the local `objects.id`.
+- **No atlas cards.** Kinds are `directive`, `decision`, `gotcha`, `dead-end`.
+- **A claim is a task log entry**, not a note state; the note states are `verified`, `directive`, `contested`.
+- **Promotion is door-checked, by a reviewer or the operator, never the author**, against the symbol on disk in the
+  main checkout (engram-fable's footnote, accepted over the memo's `HEAD`).
+- **Freshness is the symbol body hash** (Python by `ast`, other files whole-file), replacing git ancestry,
+  `pending`, and "verifying re-stamps".
+- **Cross-model verification is recorded, not required.** "Verification crosses providers" is withdrawn.
+- **Briefs carry directives plus at most five notes**, and log `briefed_refs`.
+- **Seed** from the code-anchored bullets of ROADMAP "Left open" and the recorded decisions.
+- **Still disputed** (write path in the first commit, ranking below symbol match, whether anyone promotes, the
+  value of a cross-provider verifier, whether the brief helps, trust of a file on machine two): see the table and
+  experiments in `docs/engram-debate-2026-11-11.md`. Architect's ruling on the first: seed files and the read path
+  first, promotion as the next commit, with the memo's experiment (learned/dead/parked entries vs hand-written notes
+  after one squad) deciding its urgency.
+
+### Changed after review (work objects v2)
 
 - **D1 overturned.** v1 logged into `messages` with an `object_id`, because attribution, journaling and the stream
   UI already exist there. But `messages` feeds topology nodes, flag closing, `mesh_wait` wakeups, the operator
@@ -191,16 +223,12 @@ monthly digests, wikilinks (refs replace them), skills and hooks.
   fan-out became one notice to the creator on a status change.
 - **D5 moved to stage 4.** Edit paths are not recorded, the worktree base is not stored, and one session can hold
   two tasks or one turn can span two. Gemini usage also lags a whole turn.
-- **D7 "a different session" replaced.** A second session of the same role proves nothing, so the verifier must
-  hold a different role class. The door stamps every sha; clients never send one. Directives come only from an
-  operator route.
-- **D8 kept ancestry and dropped the content-diff idea.** Comparing content alone would call an unmerged
-  branch's note on an untouched file `fresh`, leaking it across squads. It would also call integrated notes
-  `drifted` once HEAD moves. Instead of a separate re-stamp step at integration, verification re-stamps.
+- **D7 "a different session" replaced** by a different role class (later superseded by v3's promotion).
+- **D8 kept ancestry** over a content diff (later superseded by v3's symbol hash).
 - **D6 ranking added.** Wildcard and project-scope notes would starve file-specific ones. Tasks had no files to
   match against, so `files` was added.
-- **D10 restricted.** An export dirties the checkout and breaks `apply --3way`, so it runs only on the operator's
-  action with no live worktree.
+- **D10 restricted** to the operator's action with no live worktree (lifted by v3: tested, untouched files do not
+  block `apply --3way`).
 - **Kept as v1:** stage 1 is tasks only. The review proposed bringing the notes brief forward; the architect
   rejected that, because the operator's ask is a reference an agent can look up and log to.
 
@@ -226,13 +254,18 @@ Where the work attaches in today's code:
 
 ## 4. Stages
 
-| Stage | What | Size |
+| Stage | What | State |
 |---|---|---|
-| 0 | Identity: agent tokens carry the session id. `web.agent_token` is called at spawner.py:422, before the session id is minted at :445, so reorder those first | S |
-| 1 | The plan view: tasks only, as a tree per squad with owners. `objects`, `object_log`, the routes and four tools, `mesh_send(re=)`, assignment by filing with an owner, the status-change notice, both spawn paths file a T, the charter protocol, and PLAN at the top of MESH. Spec below | M |
-| 2 | Findings as a kind with verdicts (item 14) | S–M |
-| 3 | Notes, trust states, freshness, the brief's notes section | M |
-| 4 | Derived stats (`calls.path`, `base_sha`, one in-progress task per session), export, librarian, respawn with handoff (item 13) | M |
+| 0 | Identity: agent tokens carry the session id | **built** (`77237ea`) |
+| 1 | The plan view: tasks as a tree per squad with owners, `objects`, `object_log`, routes and tools, `mesh_send(re=)`, assignment, both spawn paths file a T, the charter protocol, PLAN in MESH. Spec below | **built** (`b01fb6a`, `1c3cf90`, `bdb1ac4`, <PLAN_SHA>) |
+| 2 | Findings as a kind with verdicts (item 14). See below | not built |
+| 3 | Notes (v3): seed files and the read path first (loader in ingest, `symbol_sha` on read, the brief with `briefed_refs`, a knowledge strip); promotion as the next commit, its urgency set by the debate's experiment. Notes may come before findings | not built |
+| 4 | Derived stats (`calls.path` read from `file_path`, `Path` or `path`; `base_sha`; one in-progress task per session), librarian, respawn with handoff (item 13) | not built |
+
+**Stage 2's acceptance test (the operator's):** one query returns, per reviewer session and per model, findings by
+severity and verdict, with tokens and worked minutes. **Its first dataset:** this squad's 44 findings by rev-gemini
+(16 bug, 16 risk, 10 nit, 2 other; 43 accepted, 1 rejected), filed from the journal. Prerequisite: Gemini usage
+must be per turn, or tokens per finding are summed running totals; slice U (`3aa2fa9`) fixed that.
 
 Carried over from the earlier ROADMAP text of items 9 and 14:
 
