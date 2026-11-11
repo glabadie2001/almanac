@@ -306,7 +306,7 @@ class MeshDoorAndMcpTests(Fixture):
         self.assertEqual(
             tool_names,
             ["mesh_roster", "mesh_context_stream", "mesh_contact_stream", "mesh_send", "mesh_spawn", "mesh_wait",
-             "mesh_objects", "mesh_object", "mesh_file", "mesh_log", "mesh_restart"],
+             "mesh_objects", "mesh_object", "mesh_file", "mesh_log", "mesh_respawn", "mesh_restart"],
         )
 
         # Call mesh_send via JSON-RPC tools/call

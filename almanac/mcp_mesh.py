@@ -14,6 +14,7 @@ CLI mode (usable from any agent shell or script):
     python -m almanac.mcp_mesh --cli object <ref> [--log-limit 20]
     python -m almanac.mcp_mesh --cli file <title> [--body <text>] [--files <path> ...] [--owner <name>] [--parent <ref>]
     python -m almanac.mcp_mesh --cli log <ref> [<body...>] [--kind <k>] [--status <s>] [--owner <name>]
+    python -m almanac.mcp_mesh --cli respawn <ref> [--model <m>] [--effort <e>]
     python -m almanac.mcp_mesh --cli restart
 """
 from __future__ import annotations
@@ -290,6 +291,27 @@ MCP_TOOLS = [
         },
     },
     {
+        "name": "mesh_respawn",
+        "description": (
+            "Respawn a task's owner, if your role may add members: its session ends and a fresh one starts with the same "
+            "handle, role and worktree (uncommitted files included), whose kickoff is the task and its whole log. Use it "
+            "when the owner's context has grown too large, or when it stalled and `continue` did not get it going. It "
+            "uses no spawn slot. Not on yourself, nor on a backlog task. If the fresh session cannot start, the task "
+            "keeps its old owner and you are told."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "The task, e.g. 'T-12'."},
+                "model": {"type": "string", "description": "Optional: another of the role's models (mesh_roster); "
+                                                           "by default the owner's own."},
+                "effort": {"type": "string", "description": "Optional: another of the role's efforts; by default the "
+                                                            "owner's own."},
+            },
+            "required": ["ref"],
+        },
+    },
+    {
         "name": "mesh_restart",
         "description": (
             "Restart Almanac, if your role may: only after a merge that changed Python code, never with a failing "
@@ -477,6 +499,12 @@ class MeshClient:
         if name == "mesh_log":
             payload = {k: args[k] for k in ("ref", "body", "kind", "status", "owner") if args.get(k)}
             return self._api("/api/mesh/object/log", method="POST", body=payload)
+        if name == "mesh_respawn":
+            ref = str(args.get("ref") or "").strip()
+            if not ref:
+                raise ValueError("ref is required")
+            payload = dict(ref=ref, **{k: str(args[k]) for k in ("model", "effort") if args.get(k)})
+            return self._api("/api/mesh/object/respawn", method="POST", body=payload, timeout=120.0)
         if name == "mesh_spawn":
             task = str(args.get("task") or "").strip()
             if not task:
@@ -603,6 +631,11 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
     p_spawn.add_argument("--effort")
     p_spawn.add_argument("--why")
 
+    p_respawn = sp.add_parser("respawn")
+    p_respawn.add_argument("ref")
+    p_respawn.add_argument("--model")
+    p_respawn.add_argument("--effort")
+
     p_objs = sp.add_parser("objects")
     for flag in ("--status", "--owner", "--q", "--kind", "--squad"):
         p_objs.add_argument(flag)
@@ -654,6 +687,8 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
     elif ns.cmd == "spawn":
         res = client.call_tool("mesh_spawn", {"task": " ".join(ns.task), "name": ns.name, "role": ns.role,
                                               "files": ns.files, "model": ns.model, "effort": ns.effort, "why": ns.why})
+    elif ns.cmd == "respawn":
+        res = client.call_tool("mesh_respawn", {"ref": ns.ref, "model": ns.model, "effort": ns.effort})
     elif ns.cmd == "send":
         res = client.call_tool(
             "mesh_send",

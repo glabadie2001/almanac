@@ -2330,6 +2330,41 @@ function closeTask() {
   paintPlan(); paintBacklog();
 }
 
+// [RESPAWN] ends the owner's session and starts a fresh one on the task (POST /api/mesh/object/respawn): the first
+// click arms it, a second within 5 s respawns
+const respawnState = { ref: null, armed: false, at: 0, busy: false, msg: "", bad: false };
+function respawnButton(o) {
+  const armed = respawnState.ref === o.ref && respawnState.armed;
+  const btn = el("button", { type: "button", cls: `btn ${armed ? "confirm" : "hi"}`, disabled: respawnState.busy,
+    text: armed ? "[RESPAWN? click again]" : "[RESPAWN]",
+    title: `end ${o.owner_name}'s session and start a fresh one on ${o.ref}, in the same worktree, from the task's log` });
+  btn.addEventListener("click", (e) => { e.stopPropagation(); respawnOwner(o); });
+  return el("span", {}, " ", btn);
+}
+async function respawnOwner(o) {
+  if (respawnState.busy) return;
+  if (!(respawnState.ref === o.ref && respawnState.armed)) {
+    Object.assign(respawnState, { ref: o.ref, armed: true, at: Date.now(), bad: false,
+      msg: `ends ${o.owner_name}'s session; click again within 5 s` });
+    loadTask(o.ref);
+    setTimeout(() => {
+      if (respawnState.ref === o.ref && respawnState.armed && Date.now() - respawnState.at >= 5000) {
+        Object.assign(respawnState, { armed: false, msg: "not respawned" });
+        if (meshState.selTask === o.ref) loadTask(o.ref);
+      }
+    }, 5100);
+    return;
+  }
+  Object.assign(respawnState, { armed: false, busy: true, msg: `respawning ${o.owner_name}…` });
+  loadTask(o.ref);
+  let r;
+  try { r = await post("/api/mesh/object/respawn", { ref: o.ref }); } catch (err) { r = { error: err.message }; }
+  Object.assign(respawnState, { busy: false, bad: !r.ok,
+    msg: r.ok ? `${r.agent_name} respawned (session ${String(r.session_id).slice(0, 8)})` : `not respawned: ${r.error}` });
+  if (meshState.selTask === o.ref) loadTask(o.ref);
+  setTimeout(() => { loadFleet(); loadMesh(); }, 900);
+}
+
 async function loadTask(ref) {
   let doc;
   try {
@@ -2345,11 +2380,13 @@ async function loadTask(ref) {
     el("span", { cls: "title", text: `${o.ref} ${o.title}` }), " ", statusPill(o.status), " ", ownerChip(o),
     el("span", { cls: "dim", text: ` · filed by ${o.created_by_name} ${age(o.created_ts)} ago${o.parent ? ` · part of ${o.parent}` : ""}` }),
     o.children?.total ? el("span", { cls: "dim", text: ` · accepted ${o.children.accepted}/${o.children.total}` }) : null,
+    o.squad_id && o.owner_name && o.status !== "accepted" ? respawnButton(o) : null,
+    respawnState.ref === o.ref && respawnState.msg ? el("span", { cls: respawnState.bad ? "red" : "dim", text: ` ${respawnState.msg}` }) : null,
   ].filter((n) => n !== null));
   const logHead = (l) => `${clock(l.ts)} ${l.agent_name} [${l.kind}]`
     + `${!l.status_to ? "" : l.kind === "create" ? ` as ${l.status_to}` : ` ${l.status_from || "–"} → ${l.status_to}`}`
     + `${l.owner_to ? ` owner → ${l.owner_to}` : ""}`;
-  const logCls = (k) => (k === "dead" ? "error" : k === "message" ? "peer_out" : k === "status" || k === "assign" || k === "dispatch" ? "tool" : "claude");
+  const logCls = (k) => (k === "dead" ? "error" : k === "message" ? "peer_out" : k === "status" || k === "assign" || k === "dispatch" || k === "respawn" ? "tool" : "claude");
   // a refresh (every objects_rev change re-runs this for the open task) keeps the reader's place, measured from the
   // bottom because new log entries arrive at the top; only a newly opened task, or a reader at the top, starts at the top
   const feed = $("mesh-ctx-feed"), fromBottom = feed.scrollTop ? feed.scrollHeight - feed.scrollTop : 0;
