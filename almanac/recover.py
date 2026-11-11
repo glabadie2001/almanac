@@ -5,7 +5,9 @@ Run from the door's ingest loop (`Service.loop`), so it is checked every LIVE_IN
 the delays below are minimums. Only sessions with a `spawned_agents` row in an active squad are touched, whatever
 their role: anything else may be the operator's own terminal. Nothing here depends on another agent being alive;
 the operator always hears an escalation, the agent that added the stalled one (`spawned_by`) only if it is live and
-not stalled itself.
+not stalled itself. An escalation names the agent's open tasks and the step beyond `continue`: a respawn on the task
+(door.respawn_task), which recover never does by itself. A respawn keeps the handle, so the fresh session working
+closes the escalation like the old one recovering would.
 
 Every message here is journaled as a notice (`answers=False`) with transport `system`: a `continue` from
 `almanac-hub` (an operator name) would otherwise count as the operator answering the agent's open question or
@@ -104,7 +106,8 @@ class Recover:
         st["escalated"] = True
         name, squad = sp["agent_name"], sp["squad_id"]
         text = (f"{PREFIX}{name} (squad {squad}) stopped on an API error and is idle: {stall.get('error')}: "
-                f"{(stall.get('text') or '')[:200]}. Auto-continue tries: {st['tries']}. {reason}; it needs a hand.")
+                f"{(stall.get('text') or '')[:200]}. Auto-continue tries: {st['tries']}. {reason}; it needs a hand."
+                + _respawn_hint(service, sp))
         told = []
         boss = sp.get("spawned_by")
         if boss:
@@ -118,6 +121,19 @@ class Recover:
         service.store.log_action("escalate", row["pid"], dict(session_id=row.get("session_id"), name=name), bool(told),
                                  f"{reason}; told {', '.join(told) or 'nobody'}", HUB)
         return dict(action="escalate", agent=name, told=told)
+
+
+def _respawn_hint(service, sp: dict) -> str:
+    """The step beyond `continue`, when the stalled agent owns an open task: respawn it there, from the task's log."""
+    from almanac.store import TASK_STATUSES
+    open_ = [s for s in TASK_STATUSES if s != "accepted"]
+    owned = [o for o in service.store.objects(squad_id=sp["squad_id"], kind="task", statuses=open_)
+             if o["owner_session"] == sp["session_id"]]
+    if not owned:
+        return ""
+    refs = ", ".join(f"T-{o['id']}" for o in owned)
+    return (f" It owns {refs}: respawn it there from the task's log with mesh_respawn(\"T-{owned[0]['id']}\") "
+            "or the [RESPAWN] button on the task in PLAN.")
 
 
 def _open_escalations(service) -> dict[tuple[str, str], list[tuple[int, float]]]:

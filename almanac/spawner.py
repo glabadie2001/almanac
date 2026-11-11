@@ -133,6 +133,7 @@ def build_mesh_charter(
     allowed_commands: list[str] | None = None,
     add_dirs: list[str] | None = None,
     may_restart: bool = False,
+    may_respawn: bool = False,
 ) -> str:
     """System charter giving every Claude and Gemini agent shared stream awareness and uds-messaging etiquette."""
     # no --state in the CLI line: with it, a CLI that lacks a token falls back to the door's master token file.
@@ -167,7 +168,7 @@ def build_mesh_charter(
         "\"retry when ...\") and what comes next (`kind=\"next\"`). Reply about a task with `mesh_send(..., re=\"T-12\")`. "
         "Work for later, outside this squad's mission, goes in the project backlog with `mesh_file(backlog=true, ...)` "
         "(`mesh_objects(backlog=true)` lists it); the operator dispatches a squad on it.",
-        f"6. **Shell CLI Fallback**: You can also run `\"{python_exe}\" -P -m almanac.mcp_mesh --self {agent_name} --cli <roster|context|contacts|send|wait|spawn|objects|object|file|log|restart> ...` (with `PYTHONPATH=\"{REPO_ROOT}\"`; your own token and Almanac's address come from the environment).",
+        f"6. **Shell CLI Fallback**: You can also run `\"{python_exe}\" -P -m almanac.mcp_mesh --self {agent_name} --cli <roster|context|contacts|send|wait|spawn|respawn|objects|object|file|log|restart> ...` (with `PYTHONPATH=\"{REPO_ROOT}\"`; your own token and Almanac's address come from the environment).",
         "7. **Operator**: `mesh_send(to=\"operator\", ...)` reaches the human running this squad; use it for decisions only they can make and for the final report; `needs=\"blocking\"` raises an alert on their screen, so use it only when the squad cannot proceed."
         if may_page_operator else
         "7. **Operator**: your role does not page the operator; route through a teammate whose role does. You may always answer a message the operator sends you.",
@@ -185,6 +186,11 @@ def build_mesh_charter(
             "multi-file work in existing idioms; Opus for work that fails subtly (concurrency, migrations, auth, the spawn "
             "path). Raise effort before raising the model."
         )
+    if may_respawn:
+        lines.append("8a. **Respawn an owner**: `mesh_respawn(ref)` (CLI `respawn <ref>`) ends a task owner's session and "
+                     "starts a fresh one with the same handle, role and worktree, whose kickoff is the task and its log. "
+                     "Use it when an owner's context has grown too large, or when a stalled owner did not recover after "
+                     "`continue`; `model` / `effort` change its tier within what the role allows. Never on yourself.")
     if may_restart:
         lines.append("9. **Restart Almanac**: `mesh_restart()` (CLI `restart`) only after a merge that changed Python code, "
                      "and never with a failing suite; static files need no restart. Almanac refuses if its preflight "
@@ -512,6 +518,7 @@ def _spawn_agent(
         allowed_commands=(role or {}).get("allowed_commands") or [],
         add_dirs=add_dirs,
         may_restart=bool((role or {}).get("may_restart")),
+        may_respawn=bool(squad_id and (role or {}).get("may_spawn")),
     )
     charter_file = spawn_dir / "charter.md"
     charter_file.write_text(charter, encoding="utf-8")
@@ -939,6 +946,20 @@ def free_handle(service, squad: dict, role: dict) -> str:
     return f"{base}-{n}"
 
 
+def squad_roster(service, squad: dict) -> list[dict]:
+    """The charter's "Initial Squad Roster": each handle of the squad once, as its newest spawn row has it."""
+    newest: dict[str, dict] = {}
+    for a in squad.get("agents", []):
+        newest[a["agent_name"]] = a                      # agents come oldest first: the newest row per handle wins
+    out = []
+    for a in newest.values():
+        r = service.store.role(a["role_id"]) if a.get("role_id") else None
+        out.append(dict(agent_name=a["agent_name"], provider=a["provider"], role_id=a.get("role_id"),
+                        role_title=r["title"] if r else (a.get("role_id") or a["provider"]),
+                        charter=r["system_prompt"] if r else ""))
+    return out
+
+
 def join_squad(
     service,
     *,
@@ -978,15 +999,7 @@ def join_squad(
                              "that agent's. Give another name or leave it out")
     else:
         name = free_handle(service, squad, role)
-    newest: dict[str, dict] = {}
-    for a in squad.get("agents", []):
-        newest[a["agent_name"]] = a                      # agents come oldest first: the newest row per handle wins
-    teammates = []
-    for a in newest.values():
-        r = service.store.role(a["role_id"]) if a.get("role_id") else None
-        teammates.append(dict(agent_name=a["agent_name"], provider=a["provider"], role_id=a.get("role_id"),
-                              role_title=r["title"] if r else (a.get("role_id") or a["provider"]),
-                              charter=r["system_prompt"] if r else ""))
+    teammates = squad_roster(service, squad)
     who = spawned_by or "operator"
     # whom the newcomer reports to must be someone it may reach: the agent that added it, else the operator only if
     # its role may page the operator, else the live squadmates whose role may (a join notice gives no reply pass)

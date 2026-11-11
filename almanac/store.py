@@ -1446,7 +1446,9 @@ class Store:
         with self.lock:
             rows = self.db.execute(
                 "select id, name, cwd, brief, created_ts, status, spawn_role, coalesce(spawn_limit, 0), "
-                "(select count(*) from spawned_agents a where a.squad_id = squads.id and a.spawned_by is not null) "
+                # members, not sessions: a respawn (door.respawn_task) reuses its handle and takes no slot
+                "(select count(distinct a.agent_name) from spawned_agents a where a.squad_id = squads.id "
+                "and a.spawned_by is not null) "
                 f"from squads {where}order by created_ts desc limit ?",
                 (*params, max(1, min(200, int(limit)))),
             ).fetchall()

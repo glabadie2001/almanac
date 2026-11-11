@@ -27,6 +27,9 @@ GET  /api/squads             list multi-agent squads (POST launches one; `spawn_
                              architect add members later)
 POST /api/squad              {id, spawn_role?, spawn_limit?}: what agents may add to a running squad (operator only)
 POST /api/squad/member       {squad_id, role_id, agent_name?, task?, model?, ...}: the operator adds a member (no limit)
+POST /api/mesh/object/respawn {ref, model?, effort?}: end a task owner's session and start a fresh one of the same
+                             handle and worktree on that task, its log as the kickoff (the operator, or a squadmate
+                             whose role may spawn; never on itself)
 POST /api/mesh/spawn         {task, name?, role?}: an agent whose role may_spawn adds one member of the squad's
                              spawn_role (or of `role` when spawn_role is `*`), within spawn_limit (403 or 400 with
                              the reason otherwise)
@@ -1663,6 +1666,135 @@ def dispatch_task(service, ref, *, almanac_url: str, token: str) -> dict:
     return res
 
 
+KICKOFF_MAX = 20_000     # characters: a Claude kickoff rides on the command line (32k on Windows, with the charter)
+
+
+def respawn_kickoff(row: dict, log: list[dict], squad: dict, name: str) -> str:
+    """A respawned owner's first prompt: the mission, its task, the task's log oldest first, and what to do. When the
+    log will not fit KICKOFF_MAX, its oldest entries are left out and the prompt says how to read them."""
+    ref = ref_of(row)
+    head = [f"## Squad Mission ({squad['name']})\n{squad['brief'].strip()}"] if (squad.get("brief") or "").strip() else []
+    head.append(f"## Your task (`{ref}`): {row['title']}\n{row['body'] or '(no body)'}\n\n"
+                f"Files: {', '.join(row['files']) or '(none named)'}")
+    tail = (f"You are a fresh session of `{name}`, started on {ref} in place of the previous one (its context had grown "
+            "too large, or it stalled). Carry on from the log: `git status` and `git log` in your worktree show what is "
+            f"already done. Hand in as usual: mesh_log(ref=\"{ref}\", status=\"in review\", body=<files touched, the "
+            "test command and its result, what is left>).")
+    entries = []
+    for e in log:                                         # oldest first
+        line = f"- {time.strftime('%Y-%m-%d %H:%M', time.localtime(e['ts']))} {e['agent_name']} [{e['kind']}]"
+        if e.get("status_to"):
+            line += f" {e.get('status_from') or '–'} → {e['status_to']}"
+        if e.get("owner_to"):
+            line += f" owner → {e['owner_to']}"
+        if e.get("body"):
+            line += "\n  " + e["body"].strip().replace("\n", "\n  ")
+        entries.append(line)
+    room = KICKOFF_MAX - len("\n\n".join(head + [tail])) - 200
+    kept = []
+    for line in reversed(entries):                        # the newest entries are the ones that say where it stands
+        if len(line) + 1 > room:
+            break
+        kept.insert(0, line)
+        room -= len(line) + 1
+    dropped = len(entries) - len(kept)
+    note = (f"({dropped} older entries left out; mesh_object(\"{ref}\", log_limit=500) reads them all)\n"
+            if dropped else "")
+    return "\n\n".join(head + [f"## Its log, oldest first\n{note}" + ("\n".join(kept) or "(empty)"), tail])
+
+
+def respawn_task(service, agent, caller, body: dict, *, almanac_url: str, token: str) -> dict:
+    """POST /api/mesh/object/respawn {ref, model?, effort?}: end a task owner's session and start a fresh one with the
+    same handle, role, squad and worktree (as it stands, uncommitted files included), whose kickoff is the task and its
+    log. The operator may respawn anyone; an agent of the task's squad whose role may spawn, anyone but itself.
+    Everything that can be checked is checked before the kill. A fresh session that does not start leaves the task
+    with its old owner; one whose predecessor was already ended says so on the task. The caller holds spawn_lock."""
+    from almanac import config, spawner
+    row = load_object(service, agent, caller, body.get("ref") or "")
+    ref = ref_of(row)
+    if not row["squad_id"]:
+        raise ValueError(f"{ref} is in the backlog: it has no owner to respawn")
+    if not row["owner_session"]:
+        raise ValueError(f"{ref} has no owner to respawn")
+    old = service.store.spawn_by_session(row["owner_session"])
+    if old is None or old["squad_id"] != row["squad_id"]:
+        raise ValueError(f"{ref}'s owner was not spawned into squad {row['squad_id']}: there is nothing to respawn it as")
+    name = old["agent_name"]
+    if agent:
+        mine = service.store.role((caller or {}).get("role_id") or "") if (caller or {}).get("role_id") else None
+        if not mine or not mine.get("may_spawn"):
+            raise _refused(403, f"role {(caller or {}).get('role_id') or '(none)'} may not respawn squad members")
+        if name == agent:
+            raise _refused(403, "an agent may not respawn itself: ask your lead or the operator")
+    squad = service.store.squad(row["squad_id"])
+    if not squad or squad.get("status") != "active":
+        raise _refused(409, f"squad {row['squad_id']} is {(squad or {}).get('status') or 'gone'}")
+    role = service.store.role(old["role_id"]) if old.get("role_id") else None
+    if role is None:
+        raise _refused(409, f"{name}'s role {old.get('role_id')!r} no longer exists")
+    model, effort = old["model"], old["effort"]
+    if body.get("model") or body.get("effort"):
+        picks = elastic_choice(role, dict(model=body.get("model") or model, effort=body.get("effort") or effort))
+        model, effort = picks.get("model") or model, picks.get("effort") or effort
+    runner = service.runners().get(old["provider"]) or {}
+    if not runner.get("ok") or runner.get("reason") or (old["provider"] == "claude" and config.is_shim(service.claude)):
+        raise _refused(409, runner.get("reason") or f"{old['provider']} runner not found or not launchable: "
+                                                     f"{runner.get('path') or '(none)'}")
+    wmode = "shared"
+    if old["worktree_path"]:
+        wt = Path(old["worktree_path"])
+        expected = Path(service.state).resolve() / "worktrees" / row["squad_id"] / name
+        if not (wt / ".git").exists() or wt.resolve() != expected:
+            raise _refused(409, f"{name}'s worktree {wt} is gone or not where Almanac keeps it; a respawn never makes "
+                                "a new one. Reassign the task instead")
+        wmode = "worktree"
+    log = list(reversed(service.store.object_log(row["id"], 100_000)))
+    kickoff = respawn_kickoff(row, log, squad, name)
+    sid = old["session_id"]
+    pid = _live_sessions(service).get(sid)
+    proc = None
+    if pid is not None:
+        if service.fleet is None:
+            raise _refused(503, f"{name} is running and process scanning is off: Almanac cannot end it")
+        proc = next((p for p in service.fleet_now().get("processes", []) if p["pid"] == pid), None)
+        if proc is None:
+            raise _refused(409, f"{name}'s process {pid} is not in the fleet scan yet; try again in a moment")
+    context = (service.store.chat(sid) or {}).get("context")
+    who = log_identity(agent, caller)
+    # ---- nothing above changed anything; from here the old session ends
+    if proc is not None:
+        ok, message, _ = service.fleet.kill(proc["pid"], proc["created"])
+        if not ok:
+            raise _refused(409, f"could not end {name} (pid {proc['pid']}): {message}; nothing was changed")
+        service.launched.pop(sid, None)
+        with service.fleet_lock:
+            service.fleet.last["at"] = 0
+    try:
+        res = spawner.spawn_agent(
+            service, almanac_url=almanac_url, token=token, cwd=squad["cwd"], agent_name=name, role_id=role["id"],
+            provider=old["provider"], model=model or "", effort=effort or "", workspace_mode=wmode,
+            initial_prompt=kickoff, channels=old["channels"], squad_id=squad["id"], squad_name=squad["name"],
+            teammates=spawner.squad_roster(service, squad), spawned_by=old["spawned_by"])
+    except (RuntimeError, OSError, ValueError) as exc:
+        res = dict(ok=False, error=str(exc))
+    if not res.get("ok"):
+        error = res.get("error") or "the fresh session did not start"
+        if proc is not None:      # the state to avoid: say it where the lead and the operator look
+            service.store.log_object(row["id"], who=who, kind="respawn", body=(
+                f"respawn failed: {name} (session {sid}) was ended, and the fresh session did not start: {error}. "
+                f"{ref} still names the ended session: respawn again, or reassign it."))
+        return dict(ok=False, ref=ref, agent_name=name, ended=proc is not None, error=error)
+    entry = service.store.log_object(
+        row["id"], who=who, kind="respawn", owner_session=res["session_id"], owner_name=name,
+        body=(f"{who['agent_name']} respawned {name}: session {sid} → {res['session_id']}"
+              + (f" on {model or 'the default model'} at {effort or 'the default effort'}"
+                 if body.get("model") or body.get("effort") else "")
+              + (f"; the old session's context was {context:,} tokens" if context else "")
+              + ("" if proc is not None else "; the old session was not running")))
+    return dict(res, ref=ref, old_session=sid, ended=proc is not None, context=context or None,
+                entry=log_doc(entry), object=object_docs(service, [service.store.object_row(row["id"])], body=True)[0])
+
+
 def make_handler(service, token, *, hosts=()):
     from almanac import web
 
@@ -1891,6 +2023,19 @@ def make_handler(service, token, *, hosts=()):
             if method == "POST" and path == "/api/mesh/object/log":
                 return self._send(200, log_to_object(service, self.agent, service.caller(self.agent, self.agent_session),
                                                      self._body()))
+            if method == "POST" and path == "/api/mesh/object/respawn":
+                body = self._body()
+                port = getattr(self.server, "server_port", 8812)
+                with service.spawn_lock:          # one respawn at a time: a double click ends one session, not two
+                    res = respawn_task(service, self.agent, service.caller(self.agent, self.agent_session), body,
+                                       almanac_url=f"http://127.0.0.1:{port}", token=token)
+                service.store.log_action(
+                    "respawn", res.get("pid") or 0, dict(session_id=res.get("session_id"), name=res.get("agent_name")),
+                    bool(res.get("ok")),
+                    f"{res['agent_name']} respawned on {res['ref']} (session {res['old_session'][:8]} → "
+                    f"{res['session_id'][:8]})" if res.get("ok") else f"respawn {res.get('ref')}: {res.get('error')}",
+                    self._who())
+                return self._send(200 if res.get("ok") else 409, res)
             if method == "POST" and path == "/api/mesh/spawn":
                 # elastic squads: an agent adds one member of the role the operator chose, within the operator's limit;
                 # everything but the task and the name comes from that role, never from the agent's body
