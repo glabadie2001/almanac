@@ -1359,7 +1359,8 @@ class Store:
         models, efforts = _choices(doc, "models", lambda m: split_model_effort(provider, m)[0]), \
             _choices(doc, "efforts", lambda e: split_model_effort(provider, None, e)[1])
         # absent or null keeps the stored policy (a new role: none); anything else must be one of the three forms
-        policy = normalize_context_policy(doc["context_policy"]) if doc.get("context_policy") is not None             else (old or {}).get("context_policy") or "none"
+        policy = doc.get("context_policy")
+        policy = normalize_context_policy(policy) if policy is not None else (old or {}).get("context_policy") or "none"
         boot = doc.get("may_restart")
         boot = None if boot is None else int(boot is True or str(boot).strip().lower() in ("1", "true", "yes", "on"))
         cmds = doc.get("allowed_commands")              # a list, or one command per line; absent keeps what it was
@@ -1762,7 +1763,7 @@ def normalize_context_policy(value) -> str:
     """A role's `context_policy` in its stored form: none, fresh-per-task, or compact-at-<N> with N whole tokens
     (`compact-at-300k` is read as 300000). Anything else is refused."""
     text = str(value if value is not None else "").strip().lower()
-    m = re.fullmatch(r"compact-at-(\d{1,9})(k?)", text)
+    m = re.fullmatch(r"compact-at-([0-9]{1,9})(k?)", text)
     if text in ("none", "fresh-per-task"):
         return text
     if m and int(m[1]) > 0:

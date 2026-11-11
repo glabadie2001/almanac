@@ -48,7 +48,7 @@ class ContextPolicyTests(Fixture):
         s = self.store_at()
         base = s.role("reviewer-claude")
         for bad in ("", "always", "fresh", "compact", "compact-at-", "compact-at-0", "compact-at-0k", "compact-at-3.5k",
-                    "compact-at--5", "compact-at-300m", "compact-at-300 k", 5):
+                    "compact-at--5", "compact-at-300m", "compact-at-300 k", 5, "compact-at-" + chr(0x663) + chr(0x660) + chr(0x660)):     # Arabic-Indic digits
             with self.assertRaises(ValueError, msg=repr(bad)) as ctx:
                 s.upsert_role(dict(base, context_policy=bad))
             for form in ("none", "fresh-per-task", "compact-at-"):
