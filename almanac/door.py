@@ -705,21 +705,34 @@ class Service:
             )
         return None
 
+    def caller(self, name: str | None, session: str | None = None) -> dict | None:
+        """The spawn row of the agent calling the door: by the session its token carries, else (an old two-part
+        token, or a session not recorded yet) the newest row for its handle. Handles are reused across squads, so
+        only the session tells two live `arch-claude`s apart."""
+        if not name:
+            return None
+        row = self.store.spawn_by_session(session) if session else None
+        return row if row and row["agent_name"] == name else self.store.spawn_of(name)
+
     def mesh_send(
         self,
         *,
         to: str,
         text: str,
         from_name: str = "operator",
+        from_session: str | None = None,
         channel: str | None = None,
         squad_id: str | None = None,
         needs: str | None = None,
         write_fn=None,
         exclude=(),
+        answers: bool = True,
     ) -> dict:
         """Deliver a message over Claude's `uds-messaging` protocol (with broadcast fan-out and SQLite journaling).
         `needs` ('reply' or 'blocking') flags it as wanting an answer: the delivered text opens with a marker line,
-        the journal keeps the sender's words and the flag, and the flag stays open until the recipient answers."""
+        the journal keeps the sender's words and the flag, and the flag stays open until the recipient answers.
+        `from_session`: the sender's session when the door knows it (two squads may share a handle). `answers`:
+        False for the hub's own messages about work objects, which must not close anyone's open flag."""
         from almanac import uds
         from almanac.store import NEEDS
         target = str(to or "").strip()
@@ -739,9 +752,10 @@ class Service:
 
         # Lookup sender metadata if sender is a known peer
         all_peers = self.mesh_peers()
-        sender_peer = next((p for p in all_peers if p["name"] == sender or p.get("session_id") == sender), None)
-        # a sender that is not a live session is still known by its newest spawn record
-        known = sender_peer or self.store.spawn_of(sender) or {}
+        sender_peer = (next((p for p in all_peers if from_session and p.get("session_id") == from_session), None)
+                       or next((p for p in all_peers if p["name"] == sender or p.get("session_id") == sender), None))
+        # a sender that is not a live session is still known by its spawn record
+        known = sender_peer or self.caller(sender, from_session) or {}
         eff_squad = squad_id or known.get("squad_id")
         if sender == "operator" and target in ("@squad", "#squad") and not eff_squad:
             live = {p["squad_id"] for p in all_peers if p.get("squad_id")}
@@ -758,6 +772,7 @@ class Service:
                 body=body,
                 transport="hub",
                 needs=needs,
+                answers=answers,
             )
             return dict(ok=True, delivered=["operator"], failed=[], message=entry)
 
@@ -809,14 +824,14 @@ class Service:
                 body=body,
                 transport="uds-broadcast",
                 needs=needs,
+                answers=answers,
             )
             return dict(ok=True, delivered=delivered, failed=failed, message=entry)
 
-        # Direct peer target: resolve in Fleet first, then directly in ~/.claude/sessions
-        recipient = next(
-            (p for p in all_peers if p["name"] == target or p.get("session_id") == target or str(p["pid"]) == target),
-            None,
-        )
+        # Direct peer target: resolve in Fleet first, then directly in ~/.claude/sessions. A handle two squads share
+        # means the sender's squad's member.
+        matches = [p for p in all_peers if p["name"] == target or p.get("session_id") == target or str(p["pid"]) == target]
+        recipient = next((p for p in matches if eff_squad and p.get("squad_id") == eff_squad), None) or next(iter(matches), None)
         if recipient is not None and self.fleet is not None:
             ok, detail_msg, _ = self.fleet.send(
                 recipient["pid"],
@@ -841,6 +856,7 @@ class Service:
                 body=body,
                 transport="uds" if recipient.get("has_uds") else "console",
                 needs=needs,
+                answers=answers,
             )
             return dict(ok=True, delivered=[recipient["name"]], transport=entry["transport"], message=entry)
 
@@ -871,10 +887,12 @@ class Service:
             body=body,
             transport="uds",
             needs=needs,
+            answers=answers,
         )
         return dict(ok=True, delivered=[res["target_name"]], transport="uds", message=entry)
 
-    def may_spawn(self, agent_name: str, role_id: str | None = None) -> tuple[bool, str, dict | None, dict | None, int]:
+    def may_spawn(self, agent_name: str, role_id: str | None = None, session: str | None = None
+                  ) -> tuple[bool, str, dict | None, dict | None, int]:
         """(ok, reason, squad, role to add, http status): may this agent add a member to its squad through
         mesh_spawn? Its newest spawn row must name a squad that is active; its role must have may_spawn; the squad's
         spawn_role must resolve: a fixed role (an agent naming another is refused) or `*`, where the agent must name
@@ -883,7 +901,7 @@ class Service:
         across this check and the spawn, so two calls cannot both take the last slot.
         Advisory, like agent tokens: an agent runs as this user and could reach the door another way."""
         from almanac.store import ANY_ROLE
-        spawn = self.store.spawn_of(agent_name)
+        spawn = self.caller(agent_name, session)
         if not spawn or not spawn.get("squad_id"):
             return False, f"{agent_name} is not in a squad", None, None, 403
         squad = self.store.squad(spawn["squad_id"])
@@ -921,13 +939,13 @@ class Service:
                 squad, target, 403
         return True, f"{used}/{limit} used", squad, target, 200
 
-    def may_page_operator(self, agent_name: str) -> tuple[bool, str]:
+    def may_page_operator(self, agent_name: str, session: str | None = None) -> tuple[bool, str]:
         """(allowed, hint): may this agent address the operator? Yes when its newest spawn has no role (or the role
         is gone), when its role has `may_page_operator`, or when the newest direct message between it and the
         operator came from the operator: answering is not paging, and it buys one reply per operator message.
         Advisory only: the hub's named pipe does not check senders, and an agent can read the door's secret."""
         from almanac.store import OPERATOR_NAMES
-        spawn = self.store.spawn_of(agent_name)
+        spawn = self.caller(agent_name, session)
         role = self.store.role(spawn["role_id"]) if spawn and spawn.get("role_id") else None
         if role is None or role.get("may_page_operator"):
             return True, ""
@@ -1150,6 +1168,272 @@ def _pid(body):
     return pid, created
 
 
+# ---------------------------------------------------------------------------------------- work objects (stage 1)
+TITLE_MAX, BODY_MAX, FILES_MAX = 120, 8000, 50
+LOG_KINDS = ("note", "learned", "dead", "parked", "next")       # what an agent may write; create/status/assign/message
+                                                                 # are the hub's own
+LOG_FIELDS = ("id", "ts", "agent_name", "role_id", "provider", "kind", "body", "status_from", "status_to", "owner_to",
+              "message_id")
+
+
+def _refused(status, message):
+    from almanac import web
+    return web.Refused(status, message)
+
+
+def ref_of(row: dict) -> str:
+    from almanac.store import OBJECT_KINDS
+    letter = next(k for k, v in OBJECT_KINDS.items() if v == row["kind"])
+    return f"{letter}-{row['id']}"
+
+
+def parse_ref(ref) -> tuple[int, str | None]:
+    """(id, kind or None): `T-12`, `t-12`, `12` or 12."""
+    from almanac.store import OBJECT_KINDS
+    m = re.fullmatch(r"(?:([A-Za-z])-)?(\d+)", str(ref).strip())
+    if not m or (m.group(1) and m.group(1).upper() not in OBJECT_KINDS):
+        raise ValueError(f"{ref!r} is not a ref: send T-12 or 12")
+    return int(m.group(2)), OBJECT_KINDS.get((m.group(1) or "").upper())
+
+
+def object_squad(service, agent: str | None, caller: dict | None, asked: str | None) -> str:
+    """The squad a request acts in. An agent: its own (the one its session was spawned into); naming another is 403.
+    The operator: the one named, or the only live squad."""
+    asked = str(asked or "").strip() or None
+    if agent:
+        own = (caller or {}).get("squad_id")
+        if not own:
+            raise _refused(403, f"{agent} is not in a squad")
+        if asked and asked != own:
+            raise _refused(403, f"squad {asked} is not yours")
+        return own
+    if asked:
+        if service.store.squad(asked) is None:
+            raise _refused(404, f"no squad {asked}")
+        return asked
+    live = {p["squad_id"] for p in service.mesh_peers() if p.get("squad_id")}
+    if len(live) == 1:
+        return live.pop()
+    raise ValueError("squad is required: there is not exactly one live squad")
+
+
+def load_object(service, agent, caller, ref, *, bad_ref=404) -> dict:
+    """The object `ref` names. 404 when there is none (`bad_ref`: the status for that, 400 for `mesh_send(re=)`);
+    403 when it belongs to another squad than the calling agent's."""
+    oid, kind = parse_ref(ref)
+    row = service.store.object_row(oid)
+    if row is None or (kind and row["kind"] != kind):
+        raise _refused(bad_ref, f"no object {ref}")
+    if agent and row["squad_id"] != (caller or {}).get("squad_id"):
+        raise _refused(403 if bad_ref == 404 else bad_ref, f"{ref} belongs to another squad")
+    return row
+
+
+def log_identity(agent, caller) -> dict:
+    """Who a log row is by: the agent's session, handle, role and provider, or the operator."""
+    if not agent:
+        return dict(agent_name="operator")
+    c = caller or {}
+    return dict(session=c.get("session_id"), agent_name=agent, role_id=c.get("role_id"), provider=c.get("provider"))
+
+
+def object_docs(service, rows: list[dict], *, body: bool = False) -> list[dict]:
+    """The API shape of `rows`: names, the owner's state from the live roster, child counts and the last log line."""
+    states = {p.get("session_id"): ("busy" if p.get("status") == "busy" else "idle")
+              for p in service.mesh_peers() if p.get("session_id")}
+    names = {}
+    for r in rows:
+        sid = r["owner_session"]
+        if sid and sid not in names:
+            names[sid] = (service.store.spawn_by_session(sid) or {}).get("agent_name")
+    stats = service.store.object_stats([r["id"] for r in rows])
+    out = []
+    for r in rows:
+        st, sid = stats[r["id"]], r["owner_session"]
+        last = st["last_log"]
+        doc = dict(ref=ref_of(r), id=r["id"], kind=r["kind"], title=r["title"], status=r["status"],
+                   squad_id=r["squad_id"], parent=f"T-{r['parent_id']}" if r["parent_id"] else None,
+                   owner_name=names.get(sid), owner_session=sid,
+                   owner_state=(states.get(sid, "ended") if sid else None), files=r["files"],
+                   created_by_name=r["created_by_name"], created_ts=r["created_ts"], updated_ts=r["updated_ts"],
+                   children=dict(total=st["children"][0], accepted=st["children"][1]), log_count=st["log_count"],
+                   last_log=last and dict(ts=last["ts"], agent_name=last["agent_name"], kind=last["kind"],
+                                          body=last["body"][:200], status_to=last["status_to"]))
+        if body:
+            doc["body"] = r["body"]
+        out.append(doc)
+    return out
+
+
+def log_doc(entry: dict) -> dict:
+    return {k: entry[k] for k in LOG_FIELDS}
+
+
+def tree_order(rows: list[dict]) -> list[dict]:
+    """Parents before their children, siblings by id. A row whose parent is not in `rows` is a root here."""
+    ids = {r["id"] for r in rows}
+    kids: dict = {}
+    for r in rows:                       # rows come by id, so each sibling list is already in order
+        kids.setdefault(r["parent_id"] if r["parent_id"] in ids else None, []).append(r)
+    out, stack = [], list(reversed(kids.get(None, [])))
+    while stack:
+        r = stack.pop()
+        out.append(r)
+        stack.extend(reversed(kids.get(r["id"], [])))
+    return out
+
+
+def list_objects(service, agent, caller, query: dict) -> dict:
+    from almanac.store import TASK_STATUSES
+    squad = object_squad(service, agent, caller, query.get("squad"))
+    statuses = [x.strip() for x in (query.get("status") or "").split(",") if x.strip()]
+    bad = [x for x in statuses if x not in TASK_STATUSES]
+    if bad:
+        raise ValueError(f"status {bad[0]!r}: one of {', '.join(TASK_STATUSES)}")
+    limit = max(1, min(500, int(query.get("limit", "200"))))
+    rows = service.store.objects(squad_id=squad, kind=query.get("kind") or None, statuses=statuses,
+                                 owner=(query.get("owner") or "").strip() or None, q=query.get("q") or None)
+    return dict(objects=object_docs(service, tree_order(rows)[:limit]), rev=service.store.objects_rev())
+
+
+def _text(body: dict, key: str) -> str:
+    value = body.get(key)
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"{key} must be text")
+    value = (value or "").strip()
+    if len(value) > BODY_MAX:
+        raise ValueError(f"{key} is {len(value)} characters; trim it to {BODY_MAX}")
+    return value
+
+
+def _files(raw, project: str) -> list[str]:
+    """Repo-relative paths or globs with forward slashes, from a list or one per line."""
+    items = raw.splitlines() if isinstance(raw, str) else raw if isinstance(raw, list) else None
+    if items is None:
+        raise ValueError("files: a list of repo-relative paths, or one per line")
+    out = []
+    for item in items:
+        f = str(item).strip().replace("\\", "/")
+        if not f:
+            continue
+        if f.startswith("/") or re.match(r"[A-Za-z]:/", f):
+            root = project.replace("\\", "/").rstrip("/") + "/"
+            if not project or not f.lower().startswith(root.lower()):
+                raise ValueError(f"files are repo-relative: {f}")
+            f = f[len(root):]
+        while f.startswith("./"):
+            f = f[2:]
+        if f and f not in out:
+            out.append(f)
+    if len(out) > FILES_MAX:
+        raise ValueError(f"{len(out)} files; at most {FILES_MAX}")
+    return out
+
+
+def _owner(service, squad: str, handle) -> dict:
+    """The newest spawn of `handle` in `squad`: a live or ended member."""
+    handle = str(handle or "").strip()
+    found = service.store.spawned(squad_id=squad, agent_name=handle, limit=1) if handle else []
+    if not found:
+        raise ValueError(f"owner {handle!r}: no member of squad {squad} by that name")
+    return found[0]
+
+
+def _status(value) -> str:
+    from almanac.store import TASK_STATUSES
+    if value not in TASK_STATUSES:
+        raise ValueError(f"status {value!r}: one of {', '.join(TASK_STATUSES)}")
+    return value
+
+
+def _hub_tell(service, *, to_name, to_session, text, agent, caller, squad) -> tuple[bool, int]:
+    """Send a work-object message as the caller and journal it; a recipient that has ended still gets the journal
+    row, undelivered. It never closes an open flag. (delivered, message id)"""
+    from_name, from_session = agent or "operator", (caller or {}).get("session_id") if agent else None
+    try:
+        res = service.mesh_send(to=to_session or to_name, text=text, from_name=from_name, from_session=from_session,
+                                squad_id=squad, answers=False)
+    except (ValueError, OSError) as exc:
+        res = dict(ok=False, error=str(exc))
+    if res.get("ok"):
+        return bool(res.get("delivered")), res["message"]["id"]
+    entry = service.store.record_message(from_name=from_name, from_session=from_session, to_name=to_name,
+                                         to_session=to_session, squad_id=squad, body=text, transport="undelivered",
+                                         answers=False)
+    return False, entry["id"]
+
+
+def _assign(service, row: dict, owner: dict, agent, caller) -> tuple[bool, int]:
+    ref = ref_of(row)
+    files = ", ".join(row["files"]) or "(none named)"
+    text = (f"[{ref} assigned to you] {row['title']}\n\n{row['body']}\n\nFiles: {files}\n"
+            f"Hand in with mesh_log(ref=\"{ref}\", status=\"in review\")")
+    return _hub_tell(service, to_name=owner["agent_name"], to_session=owner["session_id"], text=text, agent=agent,
+                     caller=caller, squad=row["squad_id"])
+
+
+def file_object(service, agent, caller, body: dict) -> dict:
+    """POST /api/mesh/object: file a task; with an owner, that is its assignment."""
+    kind = str(body.get("kind") or "task").strip()
+    if kind != "task":
+        raise ValueError(f"kind {kind}: not yet")
+    squad = object_squad(service, agent, caller, body.get("squad"))
+    title = _text(body, "title")
+    if not 1 <= len(title) <= TITLE_MAX:
+        raise ValueError(f"title is required, 1 to {TITLE_MAX} characters")
+    text = _text(body, "body")
+    project = (service.store.squad(squad) or {}).get("cwd") or ""
+    files = _files(body.get("files") or [], project)
+    parent_id = None
+    if body.get("parent"):
+        parent_id, _ = parse_ref(body["parent"])
+        parent = service.store.object_row(parent_id)
+        if parent is None or parent["kind"] != "task" or parent["squad_id"] != squad:
+            raise ValueError(f"parent {body['parent']}: no task of squad {squad}")
+    owner = _owner(service, squad, body["owner"]) if body.get("owner") else None
+    status = _status(body["status"]) if body.get("status") else ("in progress" if owner else "queued")
+    who = log_identity(agent, caller)
+    row = service.store.create_object(
+        kind=kind, project=project, squad_id=squad, title=title, body=text, status=status,
+        owner_session=owner and owner["session_id"], parent_id=parent_id, files=files,
+        created_by=who.get("session"), created_by_name=who["agent_name"], who=who)
+    delivered = None
+    if owner:
+        delivered, mid = _assign(service, row, owner, agent, caller)
+        service.store.log_object(row["id"], who=who, kind="assign", owner_name=owner["agent_name"], message_id=mid)
+    return dict(object=object_docs(service, [row], body=True)[0], delivered=delivered)
+
+
+def log_to_object(service, agent, caller, body: dict) -> dict:
+    """POST /api/mesh/object/log: append to a task's log, optionally changing its status or owner. A changed owner
+    gets the assignment message; a changed status sends its creator one notice."""
+    row = load_object(service, agent, caller, body.get("ref") or "")
+    kind = str(body.get("kind") or "note").strip()
+    if kind not in LOG_KINDS:
+        raise ValueError(f"kind {kind!r}: one of {', '.join(LOG_KINDS)}")
+    text = _text(body, "body")
+    status = _status(body["status"]) if body.get("status") else None
+    status = status if status != row["status"] else None
+    owner = _owner(service, row["squad_id"], body["owner"]) if body.get("owner") else None
+    owner = owner if owner and owner["session_id"] != row["owner_session"] else None
+    if not (text or status or owner):
+        raise ValueError("body is required unless status or owner changes")
+    who = log_identity(agent, caller)
+    delivered = mid = None
+    if owner:
+        delivered, mid = _assign(service, dict(row, owner_session=owner["session_id"]), owner, agent, caller)
+    entry = service.store.log_object(
+        row["id"], who=who, kind="assign" if owner else "status" if status else kind, body=text, status=status,
+        owner_session=owner and owner["session_id"], owner_name=owner and owner["agent_name"], message_id=mid)
+    by_creator = (row["created_by"] == who.get("session")) if row["created_by"] else row["created_by_name"] == who["agent_name"]
+    if status and not by_creator:
+        notice = f"[{ref_of(row)} {row['status']} → {status} by {who['agent_name']}] {row['title']}"
+        _hub_tell(service, to_name=row["created_by_name"], to_session=row["created_by"],
+                  text=notice + (f"\n\n{text}" if text else ""), agent=agent, caller=caller, squad=row["squad_id"])
+    return dict(object=object_docs(service, [service.store.object_row(row["id"])], body=True)[0],
+                entry=log_doc(entry), delivered=delivered)
+
+
 def make_handler(service, token, *, hosts=()):
     from almanac import web
 
@@ -1161,6 +1445,15 @@ def make_handler(service, token, *, hosts=()):
 
         def _who(self):
             return self.agent or "operator"
+
+        def _squad_q(self, query) -> tuple[str | None, bool]:
+            """(squad, unscoped) for a read: the one asked for; for an agent that names none, its own squad, plus
+            what was posted in no squad (the operator's @all). Same-handle agents of two squads stay apart."""
+            asked = query.get("squad") or None
+            if asked or not self.agent:
+                return asked, False
+            own = (service.caller(self.agent, self.agent_session) or {}).get("squad_id")
+            return own, bool(own)
 
         def _dispatch(self):
             url = urlsplit(self.path)
@@ -1242,20 +1535,31 @@ def make_handler(service, token, *, hosts=()):
                 if path == "/api/squads":
                     return self._send(200, dict(squads=service.store.squads(int(query.get("limit", "50")))))
                 if path == "/api/mesh":
-                    squad_q = query.get("squad") or None
+                    squad_q, unscoped = self._squad_q(query)
                     msg_limit = max(0, min(300, int(query.get("limit", "80"))))
                     return self._send(
                         200,
                         dict(
                             peers=service.mesh_peers(squad_id=squad_q),
-                            messages=service.store.messages(squad_id=squad_q, limit=msg_limit) if msg_limit > 0 else [],
+                            messages=service.store.messages(squad_id=squad_q, limit=msg_limit, unscoped=unscoped)
+                            if msg_limit > 0 else [],
                             latest_id=service.store.latest_message_id(),
                             squads=service.store.squads(limit=20),
                             roles=service.store.roles(),
                             hub_pipe=service.hub_peer.pipe_path if service.hub_peer else None,
                             open=service.store.open_needs(squad_id=squad_q),
+                            objects_rev=service.store.objects_rev(),
                         ),
                     )
+                if path == "/api/mesh/objects":
+                    caller = service.caller(self.agent, self.agent_session)
+                    return self._send(200, list_objects(service, self.agent, caller, query))
+                if path == "/api/mesh/object":
+                    caller = service.caller(self.agent, self.agent_session)
+                    row = load_object(service, self.agent, caller, query.get("ref") or "")
+                    lim = max(1, min(500, int(query.get("log_limit", "20"))))
+                    return self._send(200, dict(object=object_docs(service, [row], body=True)[0],
+                                                log=[log_doc(e) for e in service.store.object_log(row["id"], lim)]))
                 if path == "/api/health":
                     return self._send(200, service.health())
                 if path == "/api/worktime":
@@ -1270,10 +1574,12 @@ def make_handler(service, token, *, hosts=()):
                     graph = mesh_graph(service, query.get("squad") or None)
                     return self._send(200 if graph is not None else 404, graph if graph is not None else {"error": "no such squad"})
                 if path == "/api/mesh/messages":
+                    squad_q, unscoped = self._squad_q(query)
                     msgs = service.store.messages(
                         peer=query.get("peer") or None,
                         channel=query.get("channel") or None,
-                        squad_id=query.get("squad") or None,
+                        squad_id=squad_q,
+                        unscoped=unscoped,
                         since_id=int(query.get("since_id", "0")),
                         limit=int(query.get("limit", "100")),
                     )
@@ -1281,10 +1587,12 @@ def make_handler(service, token, *, hosts=()):
                 if path == "/api/mesh/wait":
                     since_id = int(query.get("since_id", "0"))
                     timeout_s = max(0.0, min(300.0, float(query.get("timeout", "30"))))
+                    squad_q, unscoped = self._squad_q(query)
                     msgs = service.store.wait_messages(
                         peer=query.get("peer") or None,
                         channel=query.get("channel") or None,
-                        squad_id=query.get("squad") or None,
+                        squad_id=squad_q,
+                        unscoped=unscoped,
                         since_id=since_id,
                         timeout=timeout_s,
                         stop_event=service.stop,
@@ -1298,6 +1606,10 @@ def make_handler(service, token, *, hosts=()):
                     if not peer:
                         raise ValueError("peer query parameter is required")
                     kinds = [k.strip() for k in query.get("kinds", "").split(",") if k.strip()]
+                    own, _ = self._squad_q({})
+                    if own:                      # an agent's handle means its own squad's member first
+                        mate = service.store.spawned(squad_id=own, agent_name=peer, limit=1)
+                        peer = mate[0]["session_id"] if mate else peer
                     found = service.mesh_context(peer, int(query.get("limit", "30")), kinds or None)
                     if found is None:
                         return self._send(404, {"error": f"no live or archived session found for peer {peer!r}"})
@@ -1320,18 +1632,34 @@ def make_handler(service, token, *, hosts=()):
                 if self.agent and target == "@all":
                     raise ValueError("@all is the operator's: an agent posts to a peer, @squad or a #channel")
                 if self.agent and target in ("operator", "almanac-hub", "hub"):
-                    allowed, hint = service.may_page_operator(self.agent)
+                    allowed, hint = service.may_page_operator(self.agent, self.agent_session)
                     if not allowed:
                         return self._send(403, dict(ok=False, error=hint))
+                caller = service.caller(self.agent, self.agent_session)
+                task = None
+                if body.get("re"):                       # checked before anything is sent
+                    task = load_object(service, self.agent, caller, body["re"], bad_ref=400)
                 res = service.mesh_send(
                     to=target,
                     text=body.get("text") or body.get("message") or "",
                     from_name=self.agent or body.get("from_name") or "operator",   # an agent speaks only as itself
+                    from_session=(caller or {}).get("session_id") if self.agent else None,
                     channel=body.get("channel"),
-                    squad_id=None if self.agent else body.get("squad_id"),   # an agent's squad is its own
+                    # an agent's squad is its own: the one its session was spawned into
+                    squad_id=(caller or {}).get("squad_id") if self.agent else body.get("squad_id"),
                     needs=body.get("needs"),
                 )
+                if task and res.get("ok"):
+                    msg = res["message"]
+                    service.store.log_object(task["id"], who=log_identity(self.agent, caller), kind="message",
+                                             body=msg["body"][:200], message_id=msg["id"])
                 return self._send(200 if res.get("ok") else 409, res)
+            if method == "POST" and path == "/api/mesh/object":
+                return self._send(200, file_object(service, self.agent, service.caller(self.agent, self.agent_session),
+                                                   self._body()))
+            if method == "POST" and path == "/api/mesh/object/log":
+                return self._send(200, log_to_object(service, self.agent, service.caller(self.agent, self.agent_session),
+                                                     self._body()))
             if method == "POST" and path == "/api/mesh/spawn":
                 # elastic squads: an agent adds one member of the role the operator chose, within the operator's limit;
                 # everything but the task and the name comes from that role, never from the agent's body
@@ -1344,7 +1672,8 @@ def make_handler(service, token, *, hosts=()):
                 overrides = {}
                 with service.spawn_lock:
                     if self.agent:
-                        ok, reason, squad, role, code = service.may_spawn(self.agent, body.get("role") or body.get("role_id"))
+                        ok, reason, squad, role, code = service.may_spawn(self.agent, body.get("role") or body.get("role_id"),
+                                                                          self.agent_session)
                         if not ok:
                             service.store.log_action("spawn", 0, dict(name=body.get("name")), False,
                                                      f"mesh_spawn refused: {reason}", self._who())
@@ -1566,6 +1895,8 @@ def make_handler(service, token, *, hosts=()):
         def _handle(self):
             try:
                 self._dispatch()
+            except web.Refused as exc:
+                self._send(exc.status, {"error": str(exc)})
             except (ValueError, KeyError, TypeError) as exc:
                 self._send(400, {"error": str(exc) if isinstance(exc, ValueError) and str(exc) else "Invalid request"})
             except Exception as exc:

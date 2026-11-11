@@ -73,6 +73,7 @@ def agent_token(token: str, name: str, session: str | None = None) -> str:
     door's secret, so nothing is stored."""
     # ponytail: stops accidents, not an adversary: an agent runs as this user and can read <state>/token itself.
     # Upgrade path: run agents under another account, or keep the secret out of their reach.
+    assert "." not in name + (session or ""), "agent names and sessions never contain a dot"
     if session:
         return f"agent.{name}.{session}.{_sign(token, f'agent:{name}:{session}')}"
     return f"agent.{name}.{_sign(token, 'agent:' + name)}"
