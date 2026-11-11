@@ -56,7 +56,16 @@ class CharterTokenTests(Fixture):
         self.assertNotIn(str(state.resolve()), charter)
         cli_line = charter.split("Shell CLI Fallback", 1)[1].split("\n", 1)[0]
         self.assertNotIn("token", cli_line.replace("your own token", ""), "no token file is named")
-        self.assertIn("-P -m almanac.mcp_mesh --self a1 --cli <roster|context|contacts|send|wait|spawn|respawn|objects|object|file|log|amend|restart>", charter)
+        self.assertIn("-P -m almanac.mcp_mesh --self a1 --cli <roster|context|contacts|send|spawn|respawn|objects|object|file|log|amend|restart>", charter)
+
+    def test_no_charter_or_rules_text_offers_mesh_wait(self):
+        for provider in ("claude", "gemini"):
+            charter = spawner.build_mesh_charter(agent_name="a1", provider=provider, role_title="r", role_prompt="p", almanac_url="u")
+            self.assertNotIn("mesh_wait", charter.replace(str(spawner.REPO_ROOT), ""))   # a checkout path may hold the word
+            self.assertIn("end your turn", charter)
+        bundle = spawner.stage_agy_mesh_bundle(self.root / "b2", agent_name="g1", almanac_url="u", token="t", squad_id="sq")
+        for f in bundle.rglob("AGENTS.md"):
+            self.assertNotIn("mesh_wait", f.read_text(encoding="utf-8"))
 
 
 class WorktreeTests(Fixture):
@@ -170,7 +179,7 @@ class GeminiMeshGrantTests(Fixture):
     def test_agy_is_granted_only_the_mesh_tools_and_never_skips_permissions(self):
         allow = json.loads(gemini_host.MESH_GRANTS)["permissions"]["allow"]
         self.assertEqual(allow, [f"mcp(almanac-mesh_almanac-mesh/{t})" for t in
-                                 ("mesh_roster", "mesh_context_stream", "mesh_contact_stream", "mesh_send", "mesh_spawn", "mesh_wait",
+                                 ("mesh_roster", "mesh_context_stream", "mesh_contact_stream", "mesh_send", "mesh_spawn",
                               "mesh_objects", "mesh_object", "mesh_file", "mesh_log", "mesh_amend", "mesh_respawn", "mesh_restart")])
         host = gemini_host.GeminiHost(name="g", cwd=str(self.root), transcript_path=self.root / "t.jsonl",
                                       sessions_dir=self.root / "s", agy_bin="agy", permission_mode="auto",

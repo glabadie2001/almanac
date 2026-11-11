@@ -74,7 +74,7 @@ shows its last two segments, `⑂` marking a worktree.
 - **Peer Context Streams**: Every agent (via MCP `mesh_context_stream`) and the operator can read the live normalized
   transcript stream (prompts, replies, tool calls, errors, peer messages) of any Claude or Gemini peer.
 - **Contact Stream**: Real-time feed of all `<cross-session-message>` traffic across peers, `@squad`, `@all`, and
-  `#channel` topics, indexed into SQLite (`messages`) with long-poll wakeup (`/api/mesh/wait` / `mesh_wait`).
+  `#channel` topics, indexed into SQLite (`messages`) with long-poll wakeup (`/api/mesh/wait`, `--cli wait`: the operator's, not an agent tool).
 - **Roles & Squads**: Reusable role definitions (`architect-claude`, `architect-gemini`, `implementer-claude`,
   `implementer-gemini`, `reviewer-claude`, `reviewer-gemini`, plus custom roles via **[ROLES ⚙]**) bundle provider,
   model, effort, workspace isolation (`shared` or `git worktree`), and system prompts, automatically wiring each

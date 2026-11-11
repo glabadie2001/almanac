@@ -191,30 +191,6 @@ MCP_TOOLS = [
         },
     },
     {
-        "name": "mesh_wait",
-        "description": (
-            "Wait until a new cross-session message arrives for this agent (or on an optional channel) "
-            "and return the newly arrived messages immediately."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "timeout_seconds": {
-                    "type": "number",
-                    "description": "Maximum seconds to wait before returning (default: 120, max: 300).",
-                },
-                "channel": {
-                    "type": "string",
-                    "description": "Optional channel filter.",
-                },
-                "since_id": {
-                    "type": "integer",
-                    "description": "Optional message cursor ID; defaults to this session's last seen message ID.",
-                },
-            },
-        },
-    },
-    {
         "name": "mesh_objects",
         "description": (
             "List your squad's tasks (the plan) in tree order: parents before their parts. Each row has its ref "
@@ -559,7 +535,7 @@ class MeshClient:
                 payload["files"] = args["files"]
             payload.update({k: str(args[k]) for k in ("model", "effort", "why") if args.get(k)})
             return self._api("/api/mesh/spawn", method="POST", body=payload, timeout=120.0)
-        if name == "mesh_wait":
+        if name == "mesh_wait":     # CLI-only (`--cli wait`, operator scripts), not in MCP_TOOLS: an idle agent is woken by its messages
             timeout_s = max(1.0, min(300.0, float(args.get("timeout_seconds") or 120.0)))
             since = int(args["since_id"]) if args.get("since_id") is not None else self._ensure_cursor()
             params = {"peer": self.self_name, "since_id": since, "timeout": timeout_s}
