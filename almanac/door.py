@@ -1666,12 +1666,10 @@ def dispatch_task(service, ref, *, almanac_url: str, token: str) -> dict:
     return res
 
 
-KICKOFF_MAX = 20_000     # characters: a Claude kickoff rides on the command line (32k on Windows, with the charter)
-
-
-def respawn_kickoff(row: dict, log: list[dict], squad: dict, name: str) -> str:
-    """A respawned owner's first prompt: the mission, its task, the task's log oldest first, and what to do. When the
-    log will not fit KICKOFF_MAX, its oldest entries are left out and the prompt says how to read them."""
+def respawn_kickoff(row: dict, log: list[dict], squad: dict, name: str, room: int) -> str:
+    """A respawned owner's first prompt: the mission, its task, the task's log oldest first, and what to do, in at most
+    `room` characters when it can (spawner.fit_prompt gives the room a Claude command line has left). The oldest log
+    entries go first, and the prompt says how to read them; the task itself is never cut."""
     ref = ref_of(row)
     head = [f"## Squad Mission ({squad['name']})\n{squad['brief'].strip()}"] if (squad.get("brief") or "").strip() else []
     head.append(f"## Your task (`{ref}`): {row['title']}\n{row['body'] or '(no body)'}\n\n"
@@ -1690,7 +1688,7 @@ def respawn_kickoff(row: dict, log: list[dict], squad: dict, name: str) -> str:
         if e.get("body"):
             line += "\n  " + e["body"].strip().replace("\n", "\n  ")
         entries.append(line)
-    room = KICKOFF_MAX - len("\n\n".join(head + [tail])) - 200
+    room -= len("\n\n".join(head + [tail])) + 200         # 200: the log heading and the note below
     kept = []
     for line in reversed(entries):                        # the newest entries are the ones that say where it stands
         if len(line) + 1 > room:
@@ -1706,16 +1704,21 @@ def respawn_kickoff(row: dict, log: list[dict], squad: dict, name: str) -> str:
 def respawn_task(service, agent, caller, body: dict, *, almanac_url: str, token: str) -> dict:
     """POST /api/mesh/object/respawn {ref, model?, effort?}: end a task owner's session and start a fresh one with the
     same handle, role, squad and worktree (as it stands, uncommitted files included), whose kickoff is the task and its
-    log. The operator may respawn anyone; an agent of the task's squad whose role may spawn, anyone but itself.
-    Everything that can be checked is checked before the kill. A fresh session that does not start leaves the task
-    with its old owner; one whose predecessor was already ended says so on the task. The caller holds spawn_lock."""
-    from almanac import config, spawner
+    log. The operator may respawn anyone; an agent of the task's squad whose role may spawn, anyone but itself; never
+    on an accepted task. Everything is checked before the old session ends, which happens in spawn_agent's
+    `before_launch`, once the command line (and the kickoff cut to fit it) is built. A fresh session that does not
+    start leaves the task with its old owner, and says on the task when the old one was ended. The caller holds
+    spawn_lock."""
+    from almanac import config, spawner, web
     row = load_object(service, agent, caller, body.get("ref") or "")
     ref = ref_of(row)
     if not row["squad_id"]:
         raise ValueError(f"{ref} is in the backlog: it has no owner to respawn")
     if not row["owner_session"]:
         raise ValueError(f"{ref} has no owner to respawn")
+    if row["status"] == "accepted":
+        raise _refused(409, f"{ref} is accepted: there is nothing left to carry on. Set it back to in progress first "
+                            "if it needs more work")
     old = service.store.spawn_by_session(row["owner_session"])
     if old is None or old["squad_id"] != row["squad_id"]:
         raise ValueError(f"{ref}'s owner was not spawned into squad {row['squad_id']}: there is nothing to respawn it as")
@@ -1749,8 +1752,10 @@ def respawn_task(service, agent, caller, body: dict, *, almanac_url: str, token:
                                 "a new one. Reassign the task instead")
         wmode = "worktree"
     log = list(reversed(service.store.object_log(row["id"], 100_000)))
-    kickoff = respawn_kickoff(row, log, squad, name)
     sid = old["session_id"]
+    if service.fleet is not None:
+        with service.fleet_lock:
+            service.fleet.last["at"] = 0              # a fresh scan: an owner that just exited is not "live"
     pid = _live_sessions(service).get(sid)
     proc = None
     if pid is not None:
@@ -1759,39 +1764,48 @@ def respawn_task(service, agent, caller, body: dict, *, almanac_url: str, token:
         proc = next((p for p in service.fleet_now().get("processes", []) if p["pid"] == pid), None)
         if proc is None:
             raise _refused(409, f"{name}'s process {pid} is not in the fleet scan yet; try again in a moment")
-    context = (service.store.chat(sid) or {}).get("context")
+    context = (proc or {}).get("context") or (service.store.chat(sid) or {}).get("context")
     who = log_identity(agent, caller)
-    # ---- nothing above changed anything; from here the old session ends
-    if proc is not None:
-        ok, message, _ = service.fleet.kill(proc["pid"], proc["created"])
-        if not ok:
+    ended = dict(now=False)
+
+    def end_old():
+        """spawn_agent's last step before it starts the fresh session: nothing was changed until here."""
+        if proc is None:
+            return
+        ok, message, found = service.fleet.kill(proc["pid"], proc["created"])
+        if not ok and found is not None:              # still there and would not end: stop, nothing changed
             raise _refused(409, f"could not end {name} (pid {proc['pid']}): {message}; nothing was changed")
+        ended["now"] = ok                             # not ok and not found: it had already exited, go on
         service.launched.pop(sid, None)
         with service.fleet_lock:
             service.fleet.last["at"] = 0
+
     try:
         res = spawner.spawn_agent(
             service, almanac_url=almanac_url, token=token, cwd=squad["cwd"], agent_name=name, role_id=role["id"],
             provider=old["provider"], model=model or "", effort=effort or "", workspace_mode=wmode,
-            initial_prompt=kickoff, channels=old["channels"], squad_id=squad["id"], squad_name=squad["name"],
-            teammates=spawner.squad_roster(service, squad), spawned_by=old["spawned_by"])
+            initial_prompt=lambda room: respawn_kickoff(row, log, squad, name, room), channels=old["channels"],
+            squad_id=squad["id"], squad_name=squad["name"], spawned_by=old["spawned_by"], before_launch=end_old,
+            teammates=[t for t in spawner.squad_roster(service, squad) if t["agent_name"] != name])
+    except web.Refused:
+        raise
     except (RuntimeError, OSError, ValueError) as exc:
         res = dict(ok=False, error=str(exc))
     if not res.get("ok"):
         error = res.get("error") or "the fresh session did not start"
-        if proc is not None:      # the state to avoid: say it where the lead and the operator look
+        if ended["now"]:          # the state to avoid: say it where the lead and the operator look
             service.store.log_object(row["id"], who=who, kind="respawn", body=(
                 f"respawn failed: {name} (session {sid}) was ended, and the fresh session did not start: {error}. "
                 f"{ref} still names the ended session: respawn again, or reassign it."))
-        return dict(ok=False, ref=ref, agent_name=name, ended=proc is not None, error=error)
+        return dict(ok=False, ref=ref, agent_name=name, ended=ended["now"], error=error)
     entry = service.store.log_object(
         row["id"], who=who, kind="respawn", owner_session=res["session_id"], owner_name=name,
         body=(f"{who['agent_name']} respawned {name}: session {sid} → {res['session_id']}"
               + (f" on {model or 'the default model'} at {effort or 'the default effort'}"
                  if body.get("model") or body.get("effort") else "")
               + (f"; the old session's context was {context:,} tokens" if context else "")
-              + ("" if proc is not None else "; the old session was not running")))
-    return dict(res, ref=ref, old_session=sid, ended=proc is not None, context=context or None,
+              + ("" if ended["now"] else "; the old session was not running")))
+    return dict(res, ref=ref, old_session=sid, ended=ended["now"], context=context or None,
                 entry=log_doc(entry), object=object_docs(service, [service.store.object_row(row["id"])], body=True)[0])
 
 

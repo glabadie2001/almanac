@@ -2340,7 +2340,7 @@ async function loadTask(ref) {
     el("span", { cls: "title", text: `${o.ref} ${o.title}` }), " ", statusPill(o.status), " ", ownerChip(o),
     el("span", { cls: "dim", text: ` · filed by ${o.created_by_name} ${age(o.created_ts)} ago${o.parent ? ` · part of ${o.parent}` : ""}` }),
     o.children?.total ? el("span", { cls: "dim", text: ` · accepted ${o.children.accepted}/${o.children.total}` }) : null,
-    o.squad_id && o.owner_name ? respawnButton(o) : null,
+    o.squad_id && o.owner_name && o.status !== "accepted" ? respawnButton(o) : null,
     respawnState.ref === o.ref && respawnState.msg ? el("span", { cls: respawnState.bad ? "red" : "dim", text: ` ${respawnState.msg}` }) : null,
   ].filter((n) => n !== null));
   const logHead = (l) => `${clock(l.ts)} ${l.agent_name} [${l.kind}]`

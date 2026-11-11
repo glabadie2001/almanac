@@ -154,11 +154,77 @@ class RespawnTests(RespawnRig):
 
     def test_the_kickoff_keeps_the_newest_entries_when_the_log_is_long(self):
         log = [dict(ts=T0 + i, agent_name="impl", kind="note", body=f"entry {i} " + "x" * 500) for i in range(100)]
-        text = door.respawn_kickoff(self.task, log, self.store.squad("sq-1"), "impl")
-        self.assertLessEqual(len(text), door.KICKOFF_MAX)
+        text = door.respawn_kickoff(self.task, log, self.store.squad("sq-1"), "impl", 20_000)
+        self.assertLessEqual(len(text), 20_000)
         self.assertIn("entry 99 ", text)
         self.assertNotIn("entry 0 ", text)
         self.assertIn("older entries left out", text)
+
+    def test_an_accepted_task_is_not_respawned(self):
+        self.store.log_object(self.task["id"], who=dict(agent_name="arch"), kind="status", status="accepted")
+        status, _, res = self.respawn()
+        self.assertEqual(status, 409)
+        self.assertIn("accepted", res["error"])
+        self.assertEqual((self.killed, self.argv), ([], []))
+
+    def test_an_owner_that_exited_inside_the_scan_cache_is_replaced(self):
+        def gone(pid, created):                   # what fleet.kill says when its fresh scan no longer finds it
+            self.killed.append(pid)
+            return False, f"pid {pid} is gone or is now a different process; refresh", None
+
+        self.fleet.kill.side_effect = gone
+        status, _, res = self.respawn()
+        self.assertEqual(status, 200, res)
+        self.assertFalse(res["ended"])
+        self.assertEqual(self.owner(), res["session_id"])
+        self.assertIn("was not running", self.store.object_log(self.task["id"], 1)[0]["body"])
+
+    def test_a_kill_that_fails_on_a_live_owner_changes_nothing(self):
+        self.fleet.kill.side_effect = lambda pid, created: (False, "Access is denied.", {"pid": pid})
+        status, _, res = self.respawn()
+        self.assertEqual(status, 409)
+        self.assertIn("nothing was changed", res["error"])
+        self.assertEqual((self.argv, self.owner()), ([], "sess-impl"))
+        self.assertNotEqual(self.store.object_log(self.task["id"], 1)[0]["kind"], "respawn")
+
+    def test_its_own_handle_is_not_in_its_roster(self):
+        status, _, res = self.respawn()
+        self.assertEqual(status, 200, res)
+        argv = self.argv[-1]
+        charter = argv[argv.index("--append-system-prompt") + 1]
+        self.assertIn("**`arch`**", charter)
+        self.assertNotIn("**`impl`**", charter)
+
+
+class CommandLineTests(RespawnRig):
+    """R1: the kickoff is cut to what the charter and arguments leave of a Windows command line, before the kill."""
+
+    def long_charter(self, n):
+        self.store.upsert_role(dict(self.store.role("implementer-claude"), system_prompt="Implement. " + "y" * n))
+        for i in range(60):
+            self.store.log_object(self.task["id"], who=dict(agent_name="impl"), kind="note",
+                                  body=f"entry {i} " + 'say "quoted" ' * 40)
+
+    def test_a_long_charter_leaves_less_room_and_the_oldest_entries_go(self):
+        self.long_charter(20_000)
+        status, _, res = self.respawn()
+        self.assertEqual(status, 200, res)
+        argv = self.argv[-1]
+        self.assertLessEqual(len(subprocess.list2cmdline(argv)), spawner.CMDLINE_MAX)
+        kickoff = argv[-1]
+        self.assertIn("entry 59 ", kickoff)
+        self.assertNotIn("entry 0 ", kickoff)
+        self.assertIn("older entries left out", kickoff)
+        self.assertIn("Make it work.", kickoff, "the task itself is never cut")
+
+    def test_no_room_even_for_the_task_is_refused_before_the_kill(self):
+        self.long_charter(31_900)
+        status, _, res = self.respawn()
+        self.assertEqual(status, 409)
+        self.assertIn("does not fit on the command line", res["error"])
+        self.assertFalse(res["ended"])
+        self.assertEqual((self.killed, self.argv, self.owner()), ([], [], "sess-impl"))
+        self.assertNotEqual(self.store.object_log(self.task["id"], 1)[0]["kind"], "respawn")
 
 
 class WorktreeTests(RespawnRig):

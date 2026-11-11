@@ -400,6 +400,30 @@ def write_claude_mcp_config(
     return target_path
 
 
+CMDLINE_MAX = 32_000          # characters: CreateProcessW takes 32,767, and a Claude kickoff rides on the command line
+PROMPT_UNBOUNDED = 1_000_000  # the room a prompt has when it goes through a pipe or a file instead
+
+
+def fit_prompt(argv: list[str], prompt) -> str:
+    """The kickoff for a Claude command line: `prompt` as is, or, when it is a function of the room left, cut until
+    the quoted command line fits CMDLINE_MAX. ValueError when it cannot fit, before anything is started."""
+    used = len(subprocess.list2cmdline(argv)) + 1
+    if not callable(prompt):
+        text = (prompt or "").strip()
+        if text and used + len(subprocess.list2cmdline([text])) > CMDLINE_MAX:
+            raise ValueError(f"the kickoff ({len(text)} characters) does not fit on the command line with the charter")
+        return text
+    room = CMDLINE_MAX - used
+    for _ in range(6):                    # quoting can grow the text: shrink the room by the overshoot and try again
+        text = (prompt(room) or "").strip()
+        over = used + len(subprocess.list2cmdline([text])) - CMDLINE_MAX
+        if over <= 0:
+            return text
+        room -= over
+    raise ValueError(f"the kickoff does not fit on the command line: the charter and arguments take {used} of "
+                     f"{CMDLINE_MAX} characters")
+
+
 def spawn_agent(service, **kwargs) -> dict:
     """Spawn one Claude or Gemini agent (see `_spawn_agent`). The session id is minted here, before the agent's token
     (which carries it), and is in `service.spawning` until the spawn returns or raises: the door waits for a session
@@ -438,9 +462,13 @@ def _spawn_agent(
     watch: float = 0.6,
     python_exe: str = sys.executable,
     spawned_by: str | None = None,
+    before_launch=None,
 ) -> dict:
     """Spawn one Claude or Gemini agent, register it in Almanac, and return its launch metadata. `spawned_by`: the
-    agent that added it to a running squad (None: the operator)."""
+    agent that added it to a running squad (None: the operator). `initial_prompt` may be a function of the room left
+    (characters) returning the prompt, so it can be cut to fit a Claude command line. `before_launch`: called once
+    everything is checked and the command line is built, just before the process starts (a respawn ends the old
+    session there); what it raises stops the spawn."""
     if service.state is None:
         raise ValueError("Almanac state directory is required to spawn agents")
     role = service.store.role(role_id) if role_id else None
@@ -572,7 +600,10 @@ def _spawn_agent(
         argv += ["--debug-file", str(debug_log)]
         if headless:
             argv += ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]
-            out_fh = (spawn_dir / "claude-stream.jsonl").open("a", encoding="utf-8")
+            initial_prompt = initial_prompt(PROMPT_UNBOUNDED) if callable(initial_prompt) else initial_prompt
+            if before_launch:
+                before_launch()
+            out_fh =(spawn_dir / "claude-stream.jsonl").open("a", encoding="utf-8")
             err_fh = (spawn_dir / "claude-stderr.log").open("a", encoding="utf-8")
             try:
                 proc = subprocess.Popen(
@@ -603,8 +634,11 @@ def _spawn_agent(
                 except OSError:
                     pass
         else:
-            if initial_prompt and initial_prompt.strip():
-                argv.append(initial_prompt.strip())
+            prompt = fit_prompt(argv, initial_prompt)
+            if prompt:
+                argv.append(prompt)
+            if before_launch:
+                before_launch()
             proc = subprocess.Popen(
                 argv,
                 cwd=str(run_cwd),
@@ -665,6 +699,7 @@ def _spawn_agent(
             argv += ["--channel", ch]
         for cmd in (role or {}).get("allowed_commands") or []:
             argv += ["--allow-command", cmd]
+        initial_prompt = initial_prompt(PROMPT_UNBOUNDED) if callable(initial_prompt) else initial_prompt
         if initial_prompt and initial_prompt.strip():
             init_file = spawn_dir / "initial_prompt.md"
             init_file.write_text(initial_prompt.strip(), encoding="utf-8")
@@ -673,6 +708,8 @@ def _spawn_agent(
         argv += ["--log-file", str(log_file)]
         if headless:
             argv.append("--headless")
+        if before_launch:
+            before_launch()
         proc = subprocess.Popen(
             argv,
             cwd=str(REPO_ROOT),
