@@ -164,6 +164,8 @@ MCP_TOOLS = [
                     "description": ("The role id to add. Required when the squad's spawn_role is '*' (any role; ids in mesh_roster's "
                                     "roles); when the squad allows one role, leave it out or name that role."),
                 },
+                "files": {"type": "array", "items": {"type": "string"},
+                          "description": "Repo-relative paths or globs the new member's task may touch (filed on its T)."},
             },
             "required": ["task"],
         },
@@ -241,7 +243,7 @@ MCP_TOOLS = [
                 "status": {"type": "string", "enum": ["queued", "in progress", "in review", "accepted", "blocked"],
                            "description": "Default: in progress with an owner, queued without."},
             },
-            "required": ["kind", "title", "body"],
+            "required": ["title"],
         },
     },
     {
@@ -413,6 +415,8 @@ class MeshClient:
                 payload["name"] = str(args["name"])
             if args.get("role"):
                 payload["role"] = str(args["role"])
+            if args.get("files"):
+                payload["files"] = args["files"]
             return self._api("/api/mesh/spawn", method="POST", body=payload, timeout=120.0)
         if name == "mesh_wait":
             timeout_s = max(1.0, min(300.0, float(args.get("timeout_seconds") or 120.0)))
@@ -522,6 +526,7 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
     p_spawn.add_argument("task", nargs="+")
     p_spawn.add_argument("--name")
     p_spawn.add_argument("--role")
+    p_spawn.add_argument("--files", nargs="*")
 
     p_objs = sp.add_parser("objects")
     for flag in ("--status", "--owner", "--q", "--kind", "--squad"):
@@ -565,7 +570,8 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
             {"peer": ns.peer, "channel": ns.channel, "squad_id": ns.squad_id, "since_id": ns.since_id, "limit": ns.limit},
         )
     elif ns.cmd == "spawn":
-        res = client.call_tool("mesh_spawn", {"task": " ".join(ns.task), "name": ns.name, "role": ns.role})
+        res = client.call_tool("mesh_spawn", {"task": " ".join(ns.task), "name": ns.name, "role": ns.role,
+                                              "files": ns.files})
     elif ns.cmd == "send":
         res = client.call_tool(
             "mesh_send",

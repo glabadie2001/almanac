@@ -327,7 +327,8 @@ def stage_agy_mesh_bundle(
     }
     rules_md = (
         "---\nname: almanac-mesh\ndescription: Cross-model peer context/contact streams and uds-messaging.\n---\n\n"
-        "Use `mesh_roster`, `mesh_context_stream`, `mesh_contact_stream`, `mesh_send`, and `mesh_wait` "
+        "Use `mesh_roster`, `mesh_context_stream`, `mesh_contact_stream`, `mesh_send`, and `mesh_wait`, and for tasks "
+        "(refs like `T-12`) `mesh_objects`, `mesh_object`, `mesh_file` and `mesh_log` "
         "(via `call_mcp_tool` with `ServerName=\"almanac-mesh_almanac-mesh\"` or `python -m almanac.mcp_mesh --cli`) "
         "to inspect Claude and Gemini teammates' live streams and coordinate over `uds-messaging`.\n"
     )
@@ -426,6 +427,8 @@ def spawn_agent(
                         error=f"Gemini runner not found; looked in: {'; '.join(runner['searched'])}; "
                               "set \"gemini\" in config.json")
     session_id = str(uuid.uuid4())              # minted before the token, which carries it
+    # until its row is recorded the door waits for this session rather than refusing it (door.Service.caller)
+    service.__dict__.setdefault("spawning", set()).add(session_id)
     token = web.agent_token(token, eff_name, session_id)    # the agent's own bearer: names it, opens /api/mesh only
 
     repo_dir = Path(cwd).expanduser().resolve()
@@ -641,6 +644,7 @@ def spawn_agent(
         code = proc.poll()
         if code is not None:
             reason = resume.last_error(log_file) if log_file.exists() else f"process exited at once (code {code})"
+            service.spawning.discard(session_id)
             return dict(ok=False, pid=proc.pid, agent_name=eff_name, session_id=session_id, provider=eff_provider, error=reason)
         time.sleep(0.05)
 
@@ -659,6 +663,7 @@ def spawn_agent(
         channels=eff_channels,
         spawned_by=spawned_by,
     )
+    service.spawning.discard(session_id)
     with service.fleet_lock:
         if service.fleet:
             service.fleet.last["at"] = 0
@@ -696,8 +701,6 @@ def launch_squad(
 
     squad_slug = slugify_name(name or "squad", fallback="squad")[:24]
     squad_id = f"{squad_slug}-{secrets.token_hex(3)}"
-    squad_doc = service.store.create_squad(squad_id, name or squad_slug, str(repo_dir), brief or "",
-                                           spawn_role=spawn_role, spawn_limit=spawn_limit)
 
     # Pre-assign deterministic unique names so every agent gets the complete teammate roster at launch
     prepared: list[dict] = []
@@ -724,6 +727,11 @@ def launch_squad(
                 charter=spec.get("system_prompt") or (role["system_prompt"] if role else ""),
             )
         )
+        # a member's task and files are checked here, before the squad exists or anyone runs: a refusal halfway
+        # through the launch would leave the members already started orphaned
+        prepared[-1]["files"] = _task_files(prepared[-1]["task"], spec.get("files"), str(repo_dir))
+    squad_doc = service.store.create_squad(squad_id, name or squad_slug, str(repo_dir), brief or "",
+                                           spawn_role=spawn_role, spawn_limit=spawn_limit)
 
     roster_preview = [
         dict(
@@ -740,7 +748,7 @@ def launch_squad(
     launched_agents: list[dict] = []
     for p in prepared:
         spec = p["spec"]
-        task_row = file_spawn_task(service, squad_id, p["task"], spec.get("files"))
+        task_row = file_spawn_task(service, squad_id, p["task"], p["files"])
         kickoff_parts = []
         if brief and brief.strip():
             kickoff_parts.append(f"## Squad Mission ({name or squad_slug})\n{brief.strip()}")
@@ -805,16 +813,33 @@ def file_spawn_task(service, squad_id: str, task: str, files=None, *, by: str | 
                     by_session: str | None = None) -> dict | None:
     """A spawn's task as a T, filed before the spawn (the session is minted inside it), unowned and queued, so a spawn
     that fails leaves it honestly unassigned. Title: the task's first line, cut at 120. None without a task."""
-    from almanac.door import TITLE_MAX, _files
+    from almanac.door import TITLE_MAX
     task = str(task or "").strip()
     if not task or not hasattr(service.store, "create_object"):
         return None
     project = (service.store.squad(squad_id) or {}).get("cwd") or ""
-    who = dict(session=by_session, agent_name=by or "operator")
+    files = _task_files(task, files, project)
+    who = _spawner_identity(service, by, by_session)
     return service.store.create_object(
         kind="task", project=project, squad_id=squad_id, title=task.splitlines()[0].strip()[:TITLE_MAX], body=task,
-        status="queued", owner_session=None, parent_id=None, files=_files(files or [], project),
+        status="queued", owner_session=None, parent_id=None, files=files,
         created_by=by_session, created_by_name=who["agent_name"], who=who)
+
+
+def _task_files(task: str, files, project: str) -> list[str]:
+    """A spawn task's files, checked as the object routes check them, and its length within a T's body cap."""
+    from almanac.door import BODY_MAX, _files
+    if len(task) > BODY_MAX:
+        raise ValueError(f"task is {len(task)} characters; trim it to {BODY_MAX}")
+    return _files(files or [], project)
+
+
+def _spawner_identity(service, by: str | None, by_session: str | None) -> dict:
+    """Who a spawn path's log rows are by: the agent that called mesh_spawn (by its session), or the operator."""
+    if not by:
+        return dict(agent_name="operator")
+    row = (service.store.spawn_by_session(by_session) if by_session else None) or {}
+    return dict(session=by_session, agent_name=by, role_id=row.get("role_id"), provider=row.get("provider"))
 
 
 def own_spawn_task(service, task_row: dict | None, res: dict, *, by: str | None = None,
@@ -822,7 +847,7 @@ def own_spawn_task(service, task_row: dict | None, res: dict, *, by: str | None 
     """After a successful spawn its T belongs to the new session and is in progress. No assignment message: the
     kickoff already carries the task, and a second prompt right after it would restart the newcomer's turn."""
     if task_row and res.get("ok") and res.get("session_id"):
-        service.store.log_object(task_row["id"], who=dict(session=by_session, agent_name=by or "operator"),
+        service.store.log_object(task_row["id"], who=_spawner_identity(service, by, by_session),
                                  kind="assign", status="in progress", owner_session=res["session_id"],
                                  owner_name=res.get("agent_name"))
 

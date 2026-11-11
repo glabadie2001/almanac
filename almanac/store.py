@@ -318,6 +318,9 @@ class Store:
         # v8: exact shell command lines a role's runner may run (agy's allow rules; informational for Claude)
         if "allowed_commands" not in {r[1] for r in self.db.execute("pragma table_info(roles)")}:
             self.db.execute("alter table roles add column allowed_commands text default '[]'")
+        # v10: a notice (an assignment, a status notice, the hub's own messages) answers nothing and grants nothing
+        if "notice" not in {r[1] for r in self.db.execute("pragma table_info(messages)")}:
+            self.db.execute("alter table messages add column notice integer default 0")
         # v9: folders outside its workspace a Gemini role's runner may read (agy `--add-dir`)
         if "add_dirs" not in {r[1] for r in self.db.execute("pragma table_info(roles)")}:
             self.db.execute("alter table roles add column add_dirs text default '[]'")
@@ -928,8 +931,9 @@ class Store:
         needs: str | None = None,
         answers: bool = True,
     ) -> dict:
-        """`answers`: False for a message the hub sends about work (an assignment, a status notice), which must
-        not close anyone's open flag."""
+        """`answers`: False for a message the hub sends about work (an assignment, a status notice). It must not
+        close anyone's open flag, now or when a late question is journaled after it, nor count as a reply to the
+        operator; the row is stored as a notice (`notice = 1`) so later checks skip it too."""
         needs = needs or None
         if needs not in NEEDS:
             raise ValueError("needs must be 'reply', 'blocking' or empty")
@@ -938,10 +942,10 @@ class Store:
         with self.lock:
             cur = self.db.execute(
                 "insert or ignore into messages "
-                "(msg_id, ts, from_name, from_session, from_provider, to_name, to_session, to_provider, channel, squad_id, body, transport, needs) "
-                "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(msg_id, ts, from_name, from_session, from_provider, to_name, to_session, to_provider, channel, squad_id, body, transport, needs, "
+                "notice) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (mid, stamp, from_name, from_session, from_provider, to_name, to_session, to_provider, channel, squad_id,
-                 body, transport, needs),
+                 body, transport, needs, int(not answers)),
             )
             if cur.rowcount:
                 row_id = cur.lastrowid
@@ -1011,7 +1015,8 @@ class Store:
             repliers = OPERATOR_NAMES if to in OPERATOR_NAMES else (to,)
             who, who_params = f"from_name in ({','.join('?' * len(repliers))})", list(repliers)
         row = self.db.execute(
-            f"select id, ts from messages where id != ? and ts >= ? and to_name in ({','.join('?' * len(askers))}) "
+            f"select id, ts from messages where id != ? and ts >= ? and not coalesce(notice, 0) "
+            f"and to_name in ({','.join('?' * len(askers))}) "
             f"and {who} and (squad_id is null or ? is null or squad_id = ?) order by ts asc, id asc limit 1",
             (row_id, ts, *askers, *who_params, squad_id, squad_id)).fetchone()
         if row is None:
@@ -1108,7 +1113,9 @@ class Store:
             marks = ",".join("?" * len(OPERATOR_NAMES))
             # what the operator broadcast (launch notices, joins, @squad / #channel posts) stays in the contact stream:
             # it is no conversation, and a reply there would broadcast again
-            clauses = ["id > ?", f"(to_name in ({marks}) or (from_name in ({marks}) and substr(to_name, 1, 1) not in ('@', '#')))"]
+            # a notice the hub wrote (from almanac-hub) is not the operator's own outgoing mail
+            clauses = ["id > ?", f"(to_name in ({marks}) or (from_name in ({marks}) and substr(to_name, 1, 1) not in ('@', '#') "
+                                 "and not (coalesce(notice, 0) and from_name = 'almanac-hub')))"]
             params: list = [max(0, int(since_id)), *OPERATOR_NAMES, *OPERATOR_NAMES]
             if squad_id:
                 clauses.append("squad_id = ?")
@@ -1140,7 +1147,7 @@ class Store:
             row = self.db.execute(
                 f"select {MESSAGE_COLUMNS} from messages where ((from_name in ({marks}) and to_name = ?) "
                 f"or (from_name = ? and to_name in ({marks}))) and (squad_id is null or ? is null or squad_id = ?) "
-                "order by id desc limit 1",
+                "and not coalesce(notice, 0) order by id desc limit 1",
                 (*OPERATOR_NAMES, agent, agent, *OPERATOR_NAMES, squad_id, squad_id)).fetchone()
         return _message(row) if row else None
 

@@ -84,6 +84,9 @@ def _discover_claude_bin_models(claude_bin_str: str | None) -> list[str]:
         return []
 
 
+SPAWN_ROW_WAIT = 5.0          # seconds the door waits for a just-launched agent's spawn row (spawner's watch is < 1 s)
+
+
 class Service:
     """The store, the fleet scanner, the uds-messaging hub, and the background ingest loop."""
 
@@ -706,13 +709,20 @@ class Service:
         return None
 
     def caller(self, name: str | None, session: str | None = None) -> dict | None:
-        """The spawn row of the agent calling the door: by the session its token carries, else (an old two-part
-        token, or a session not recorded yet) the newest row for its handle. Handles are reused across squads, so
-        only the session tells two live `arch-claude`s apart."""
+        """The spawn row of the agent calling the door: by the session its token carries, or for an old two-part
+        token by its handle (the newest row). Handles are reused across squads, so a token with a session never falls
+        back to the handle: that could bind it to another squad's agent of the same name. None: no such spawn."""
         if not name:
             return None
-        row = self.store.spawn_by_session(session) if session else None
-        return row if row and row["agent_name"] == name else self.store.spawn_of(name)
+        if session is None:
+            return self.store.spawn_of(name)
+        row = self.store.spawn_by_session(session)
+        # a spawn's row is written after its launch watch: a session still being spawned is waited for, briefly
+        deadline = time.monotonic() + SPAWN_ROW_WAIT
+        while row is None and session in getattr(self, "spawning", ()) and time.monotonic() < deadline:
+            time.sleep(0.05)
+            row = self.store.spawn_by_session(session)
+        return row if row and row["agent_name"] == name else None
 
     def mesh_send(
         self,
@@ -1239,7 +1249,7 @@ def log_identity(agent, caller) -> dict:
 
 def object_docs(service, rows: list[dict], *, body: bool = False) -> list[dict]:
     """The API shape of `rows`: names, the owner's state from the live roster, child counts and the last log line."""
-    states = {p.get("session_id"): ("busy" if p.get("status") == "busy" else "idle")
+    states = {p.get("session_id"): ("idle" if p.get("status") in (None, "idle") else "busy")
               for p in service.mesh_peers() if p.get("session_id")}
     names = {}
     for r in rows:
@@ -1313,7 +1323,9 @@ def _files(raw, project: str) -> list[str]:
         raise ValueError("files: a list of repo-relative paths, or one per line")
     out = []
     for item in items:
-        f = str(item).strip().replace("\\", "/")
+        if not isinstance(item, str):
+            raise ValueError("files: each one is a path")
+        f = item.strip().replace("\\", "/")
         if not f:
             continue
         if f.startswith("/") or re.match(r"[A-Za-z]:/", f):
@@ -1323,6 +1335,8 @@ def _files(raw, project: str) -> list[str]:
             f = f[len(root):]
         while f.startswith("./"):
             f = f[2:]
+        if ".." in f.split("/") or f.startswith("/") or re.match(r"[A-Za-z]:", f):
+            raise ValueError(f"files are inside the repo: {item}")
         if f and f not in out:
             out.append(f)
     if len(out) > FILES_MAX:

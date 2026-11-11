@@ -343,6 +343,7 @@ class SpawnTaskTests(ElasticRig):
         self.assertIn("## Your Initial Assignment (`T-1`)", self.argv[-1][-1])
         self.assertEqual([e["kind"] for e in self.store.object_log(1, 10)], ["assign", "create"])
         self.assertIsNone(self.store.object_log(1, 1)[0]["message_id"])
+        self.assertEqual(self.store.object_log(1, 1)[0]["role_id"], "architect-claude", "the spawning agent's role")
         self.assertFalse([m for m in self.store.messages() if "assigned to you" in m["body"]], "no assignment message")
 
     def test_a_failed_spawn_leaves_the_t_queued_and_unowned(self):
@@ -367,3 +368,79 @@ class SpawnTaskTests(ElasticRig):
                          ("Plan it.", "in progress", lead["session_id"], "operator"))
         self.assertIn(f"## Your Initial Assignment (`T-{rows[0]['id']}`)", self.argv[0][-1])
         self.assertIn("mesh_file(kind=", self.argv[0][self.argv[0].index("--append-system-prompt") + 1])
+
+
+class ReviewFixTests(ObjectRig):
+    """rev-gemini's review of b01fb6a..1c3cf90: B1 to B7."""
+
+    def test_a_late_question_stays_open_after_a_notice(self):                       # B1
+        self.file(self.tok("arch"), owner="impl")                                  # arch -> impl notice, now
+        question = self.store.record_message(from_name="impl", to_name="arch", body="which table?", needs="blocking",
+                                             ts=self.store.message(1)["ts"] - 10, squad_id="sq-1", transport="uds-transcript")
+        self.assertIsNone(self.store.message(question["id"])["answered_ts"], "an assignment is no answer, even later")
+
+    def test_a_status_notice_does_not_spend_the_reply_pass(self):                   # B4
+        self.store.record_spawn(agent_name="impl", session_id="sess-impl", squad_id="sq-1", role_id="implementer-claude",
+                                provider="claude", model=None, effort=None, cwd=str(self.root), worktree_path=None, pid=0)
+        self.file(owner="impl")                                                    # the operator created T-1
+        self.send(TOKEN, to="impl", text="how is it going?")
+        self.assertTrue(self.service.may_page_operator("impl", "sess-impl")[0])
+        self.log(self.tok("impl"), ref="T-1", status="in review")                  # impl -> operator, a notice
+        self.assertTrue(self.service.may_page_operator("impl", "sess-impl")[0], "the pass is still there")
+        self.assertEqual(self.send(self.tok("impl"), to="operator", text="in review")[0], 200)
+        self.assertFalse(self.service.may_page_operator("impl", "sess-impl")[0], "a real reply spends it")
+
+    def test_mesh_spawn_carries_files(self):                                        # B2
+        from almanac import mcp_mesh
+        seen = []
+        client = mcp_mesh.MeshClient(url="http://x", token="t", self_name="arch",
+                                     api_fn=lambda path, method="GET", body=None, timeout=30: seen.append(body) or {})
+        mcp_mesh._run_cli(["spawn", "build", "it", "--files", "a.py", "b/*.py"], client)
+        self.assertEqual(seen[-1]["files"], ["a.py", "b/*.py"])
+        spawn = next(t for t in mcp_mesh.MCP_TOOLS if t["name"] == "mesh_spawn")
+        self.assertIn("files", spawn["inputSchema"]["properties"])
+
+    def test_a_token_with_a_session_never_falls_back_to_the_handle(self):           # B5
+        stranger = web.agent_token(TOKEN, "arch", "sess-unrecorded")
+        self.assertEqual(self.file(stranger)[0], 403)
+        self.assertIsNone(self.service.caller("arch", "sess-impl"), "a session of another handle")
+        self.assertEqual(self.service.caller("arch", None)["session_id"], "sess-arch", "an old token: by handle")
+
+    def test_a_session_being_spawned_is_waited_for(self):                           # B5
+        import threading
+        self.service.spawning = {"sess-new"}
+
+        def record():
+            self.store.record_spawn(agent_name="new", session_id="sess-new", squad_id="sq-1", role_id=None,
+                                    provider="claude", model=None, effort=None, cwd=str(self.root), worktree_path=None, pid=0)
+        timer = threading.Timer(0.2, record)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        self.assertEqual(self.service.caller("new", "sess-new")["squad_id"], "sq-1")
+
+    def test_files_are_strings_inside_the_repo(self):                               # B6
+        for files in (["../x.py"], ["a/../../b.py"], [None], [3], ["/abs.py"], [f"{self.root}/../x.py"]):
+            self.assertEqual(self.file(files=files)[0], 400, files)
+
+    def test_the_operator_inbox_does_not_list_the_hubs_notices_as_its_own(self):
+        self.store.record_message(from_name="almanac-hub", to_name="impl", body="continue", answers=False, squad_id="sq-1")
+        self.store.record_message(from_name="operator", to_name="impl", body="hello", squad_id="sq-1")
+        self.assertEqual([m["body"] for m in self.store.operator_inbox()["messages"]], ["hello"])
+
+    def test_mesh_file_needs_only_a_title(self):                                    # B7
+        from almanac import mcp_mesh
+        tool = next(t for t in mcp_mesh.MCP_TOOLS if t["name"] == "mesh_file")
+        self.assertEqual(tool["inputSchema"]["required"], ["title"])
+
+
+class LaunchValidationTests(ElasticRig):
+    def test_a_bad_member_refuses_the_launch_before_anyone_starts(self):            # B3
+        for bad in (dict(files=["../outside.py"]), dict(task="x" * 8001)):
+            status, _, res = self.request(self.handler, "/api/squads", method="POST", body={
+                "name": "delta", "cwd": str(self.ws), "brief": "b", "members": [
+                    {"role_id": "architect-claude", "agent_name": "lead", "workspace_mode": "shared", "task": "Plan it."},
+                    dict({"role_id": "implementer-claude", "agent_name": "doer", "workspace_mode": "shared",
+                          "task": "Build it."}, **bad)]})
+            self.assertEqual(status, 400, res)
+        self.assertEqual(self.argv, [], "nobody was started")
+        self.assertFalse([s for s in self.store.squads() if s["name"] == "delta"], "no squad row")
