@@ -170,6 +170,9 @@ MCP_TOOLS = [
                 },
                 "files": {"type": "array", "items": {"type": "string"},
                           "description": "Repo-relative paths or globs the new member's task may touch (filed on its T)."},
+                "model": {"type": "string", "description": "One of the role's `models` (mesh_roster); default: the role's model."},
+                "effort": {"type": "string", "description": "One of the role's `efforts`; default: the role's effort."},
+                "why": {"type": "string", "description": "One line: why this model and effort fit the slice."},
             },
             "required": ["task"],
         },
@@ -386,7 +389,8 @@ class MeshClient:
                 "peers": doc.get("peers") or [],
                 "squads": doc.get("squads") or [],
                 "open": doc.get("open") or [],
-                "roles": [dict(id=r.get("id"), title=r.get("title"), provider=r.get("provider")) for r in doc.get("roles") or []],
+                "roles": [{k: r.get(k) for k in ("id", "title", "provider", "model", "effort", "models", "efforts")}
+                          for r in doc.get("roles") or []],
                 "hub_pipe": doc.get("hub_pipe"),
             }
         if name == "mesh_context_stream":
@@ -462,6 +466,7 @@ class MeshClient:
                 payload["role"] = str(args["role"])
             if args.get("files"):
                 payload["files"] = args["files"]
+            payload.update({k: str(args[k]) for k in ("model", "effort", "why") if args.get(k)})
             return self._api("/api/mesh/spawn", method="POST", body=payload, timeout=120.0)
         if name == "mesh_wait":
             timeout_s = max(1.0, min(300.0, float(args.get("timeout_seconds") or 120.0)))
@@ -572,6 +577,9 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
     p_spawn.add_argument("--name")
     p_spawn.add_argument("--role")
     p_spawn.add_argument("--files", nargs="*")
+    p_spawn.add_argument("--model")
+    p_spawn.add_argument("--effort")
+    p_spawn.add_argument("--why")
 
     p_objs = sp.add_parser("objects")
     for flag in ("--status", "--owner", "--q", "--kind", "--squad"):
@@ -618,7 +626,7 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
         )
     elif ns.cmd == "spawn":
         res = client.call_tool("mesh_spawn", {"task": " ".join(ns.task), "name": ns.name, "role": ns.role,
-                                              "files": ns.files})
+                                              "files": ns.files, "model": ns.model, "effort": ns.effort, "why": ns.why})
     elif ns.cmd == "send":
         res = client.call_tool(
             "mesh_send",

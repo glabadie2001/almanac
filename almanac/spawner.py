@@ -175,7 +175,11 @@ def build_mesh_charter(
         lines.append(
             f"8. **Grow the squad**: {what} to this squad, up to {grow['limit']} in total "
             "(the operator sets it; `mesh_roster` shows what is left). Use it for slices that can run in parallel on separate "
-            "files; give each a named slice and its files; you stay responsible for integrating their branches."
+            "files; give each a named slice and its files; you stay responsible for integrating their branches. Pick the cheapest model that fits the slice and "
+            "say why (`mesh_spawn(..., model=, effort=, why=)`, from the role's `models` / `efforts` in `mesh_roster`): "
+            "Haiku for mechanical work that fails loudly (renames, moves, rote edits); Sonnet for well-specified "
+            "multi-file work in existing idioms; Opus for work that fails subtly (concurrency, migrations, auth, the spawn "
+            "path). Raise effort before raising the model."
         )
     if may_restart:
         lines.append("9. **Restart Almanac**: `mesh_restart()` (CLI `restart`) only after a merge that changed Python code, "
@@ -825,7 +829,7 @@ def launch_squad(
 
 
 def file_spawn_task(service, squad_id: str, task: str, files=None, *, by: str | None = None,
-                    by_session: str | None = None) -> dict | None:
+                    by_session: str | None = None, data: dict | None = None) -> dict | None:
     """A spawn's task as a T, filed before the spawn (the session is minted inside it), unowned and queued, so a spawn
     that fails leaves it honestly unassigned. Title: the task's first line, cut at 120. None without a task."""
     from almanac.door import TITLE_MAX
@@ -838,7 +842,7 @@ def file_spawn_task(service, squad_id: str, task: str, files=None, *, by: str | 
     return service.store.create_object(
         kind="task", project=project, squad_id=squad_id, title=task.splitlines()[0].strip()[:TITLE_MAX], body=task,
         status="queued", owner_session=None, parent_id=None, files=files,
-        created_by=by_session, created_by_name=who["agent_name"], who=who)
+        created_by=by_session, created_by_name=who["agent_name"], who=who, data=data)
 
 
 def _task_files(task: str, files, project: str) -> list[str]:
@@ -873,7 +877,7 @@ def _ref(task_row: dict | None, fallback: str) -> str:
 
 # ---------------------------------------------------------------------- elastic squads: adding a member to a running squad
 
-ROLE_SHORT = {"architect": "arch", "implementer": "impl", "reviewer": "rev"}
+ROLE_SHORT = {"architect": "arch", "implementer": "impl", "reviewer": "rev", "orchestrator": "orch"}
 
 
 def _grow_line(service, role: dict | None, squad_id: str | None) -> dict | None:
@@ -915,6 +919,7 @@ def join_squad(
     spawned_by: str | None = None,
     spawned_by_session: str | None = None,
     files=None,
+    why: str | None = None,
     watch: float = 0.6,
     **operator_overrides,
 ) -> dict:
@@ -962,7 +967,11 @@ def join_squad(
         relays = sorted({p["name"] for p in service.mesh_peers(squad_id=squad_id) if p.get("agent_role") in pagers})
         report_to = (" or ".join(f"`{r}`" for r in relays) if relays
                      else "`#squad` (`mesh_send(to=\"#squad\")`), since nobody live in the squad may page the operator")
-    task_row = file_spawn_task(service, squad_id, task, files, by=spawned_by, by_session=spawned_by_session)
+    # the model and effort it runs on (a spawner's pick, else the role's), recorded so outcomes can be compared by tier
+    choice = dict(model=operator_overrides.get("model") or role.get("model") or None,
+                  effort=operator_overrides.get("effort") or role.get("effort") or None, why=why or None)
+    task_row = file_spawn_task(service, squad_id, task, files, by=spawned_by, by_session=spawned_by_session,
+                               data={k: v for k, v in choice.items() if v})
     kickoff = []
     if (squad.get("brief") or "").strip():
         kickoff.append(f"## Squad Mission ({squad['name']})\n{squad['brief'].strip()}")
@@ -995,11 +1004,14 @@ def join_squad(
         spawned_by=spawned_by,
     )
     own_spawn_task(service, task_row, res, by=spawned_by, by_session=spawned_by_session)
+    res["choice"] = choice
     if res.get("ok"):
         try:
             # not to the newcomer: it would arrive as a second prompt right after its kickoff and restart its turn
             service.mesh_send(to="@squad", squad_id=squad_id, from_name=who,
-                              text=f"[{name} joined as {role['title']}, added by {who}] {task[:300]}",
+                              text=f"[{name} joined as {role['title']}, added by {who}, on "
+                                   f"{choice['model'] or 'the default model'} at {choice['effort'] or 'the default effort'}"
+                                   + (f": {why}" if why else "") + f"] {task[:300]}",
                               exclude={name, res.get("session_id")} - {None})
         except (ValueError, OSError):
             pass                                         # the spawn stands even if nobody could be told

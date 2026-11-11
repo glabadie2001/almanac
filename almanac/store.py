@@ -218,6 +218,9 @@ DEFAULT_ROLES = (
         permission_mode="auto",
         channels=["#squad", "#impl"],
         system_prompt=IMPLEMENTER,
+        # elastic: whoever adds one may also pick these per task, besides the defaults (new databases only)
+        models=["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"],
+        efforts=["low", "medium", "high"],
     ),
     dict(
         id="implementer-gemini",
@@ -344,6 +347,11 @@ class Store:
         # v10: a notice (an assignment, a status notice, the hub's own messages) answers nothing and grants nothing
         if "notice" not in {r[1] for r in self.db.execute("pragma table_info(messages)")}:
             self.db.execute("alter table messages add column notice integer default 0")
+        # v10: the models and efforts a spawner may pick for a role ([]: fixed at the role's model and effort)
+        have = {r[1] for r in self.db.execute("pragma table_info(roles)")}
+        for column in ("models", "efforts"):
+            if column not in have:
+                self.db.execute(f"alter table roles add column {column} text default '[]'")
         # v10: a role that may restart Almanac (POST /api/mesh/restart)
         if "may_restart" not in {r[1] for r in self.db.execute("pragma table_info(roles)")}:
             self.db.execute("alter table roles add column may_restart integer default 0")
@@ -412,11 +420,12 @@ class Store:
         self.db.execute(
             f"insert {'or ignore ' if ignore else ''}into roles (id, title, provider, model, effort, workspace_mode, "
             "permission_mode, system_prompt, channels, updated_ts, may_page_operator, may_spawn, allowed_commands, "
-            "may_restart) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "may_restart, models, efforts) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (r["id"], r["title"], r["provider"], r["model"], r["effort"], r["workspace_mode"],
              r["permission_mode"], r["system_prompt"], json.dumps(r["channels"]), time.time(),
              int(bool(r.get("may_page_operator"))), int(bool(r.get("may_spawn"))),
-             json.dumps(r.get("allowed_commands") or []), int(bool(r.get("may_restart")))),
+             json.dumps(r.get("allowed_commands") or []), int(bool(r.get("may_restart"))),
+             json.dumps(r.get("models") or []), json.dumps(r.get("efforts") or [])),
         )
 
     def _rekey_spawned(self):
@@ -1220,7 +1229,7 @@ class Store:
         with self.lock:
             rows = self.db.execute(
                 "select id, title, provider, model, effort, workspace_mode, permission_mode, system_prompt, channels, updated_ts, "
-                "may_page_operator, may_spawn, allowed_commands, add_dirs, may_restart from roles order by id"
+                "may_page_operator, may_spawn, allowed_commands, add_dirs, may_restart, models, efforts from roles order by id"
             ).fetchall()
         out = []
         for r in rows:
@@ -1245,6 +1254,8 @@ class Store:
                     allowed_commands=[str(c) for c in _json_list(r[12])],
                     add_dirs=[str(d) for d in _json_list(r[13])],
                     may_restart=bool(r[14]),
+                    models=[str(m) for m in _json_list(r[15])],
+                    efforts=[str(e) for e in _json_list(r[16])],
                 )
             )
         return out
@@ -1297,6 +1308,8 @@ class Store:
         page = None if page is None else int(page is True or str(page).strip().lower() in ("1", "true", "yes", "on"))
         grow = doc.get("may_spawn")
         grow = None if grow is None else int(grow is True or str(grow).strip().lower() in ("1", "true", "yes", "on"))
+        models, efforts = _choices(doc, "models", lambda m: split_model_effort(provider, m)[0]), \
+            _choices(doc, "efforts", lambda e: split_model_effort(provider, None, e)[1])
         boot = doc.get("may_restart")
         boot = None if boot is None else int(boot is True or str(boot).strip().lower() in ("1", "true", "yes", "on"))
         cmds = doc.get("allowed_commands")              # a list, or one command per line; absent keeps what it was
@@ -1318,16 +1331,16 @@ class Store:
         with self.lock:
             self.db.execute(
                 "insert into roles (id, title, provider, model, effort, workspace_mode, permission_mode, system_prompt, channels, "
-                "updated_ts, may_page_operator, may_spawn, allowed_commands, add_dirs, may_restart) "
-                "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "updated_ts, may_page_operator, may_spawn, allowed_commands, add_dirs, may_restart, models, efforts) "
+                "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "on conflict(id) do update set title=excluded.title, provider=excluded.provider, model=excluded.model, "
                 "effort=excluded.effort, workspace_mode=excluded.workspace_mode, permission_mode=excluded.permission_mode, "
                 "system_prompt=excluded.system_prompt, channels=excluded.channels, updated_ts=excluded.updated_ts, "
                 "may_page_operator=coalesce(?, roles.may_page_operator), may_spawn=coalesce(?, roles.may_spawn), "
                 "allowed_commands=coalesce(?, roles.allowed_commands), add_dirs=coalesce(?, roles.add_dirs), "
-                "may_restart=coalesce(?, roles.may_restart)",
+                "may_restart=coalesce(?, roles.may_restart), models=excluded.models, efforts=excluded.efforts",
                 (rid, title, provider, model, effort, wmode, pmode, prompt, json.dumps(channels), now, page or 0, grow or 0,
-                 cmds or "[]", dirs or "[]", boot or 0, page, grow, cmds, dirs, boot),
+                 cmds or "[]", dirs or "[]", boot or 0, json.dumps(models), json.dumps(efforts), page, grow, cmds, dirs, boot),
             )
             self.db.commit()
         return self.role(rid)
@@ -1561,16 +1574,17 @@ class Store:
     # ------------------------------------------------------------------ work objects (stage 1: tasks)
     def create_object(self, *, kind: str, project: str, squad_id: str | None, title: str, body: str, status: str,
                       owner_session: str | None, parent_id: int | None, files: list[str], created_by: str | None,
-                      created_by_name: str, who: dict, owner_name: str | None = None) -> dict:
+                      created_by_name: str, who: dict, owner_name: str | None = None,
+                      data: dict | None = None) -> dict:
         """Insert an object and its `create` log row in one transaction. `who`: the log row's session, agent_name,
         role_id, provider."""
         now = time.time()
         with self.lock:
             cur = self.db.execute(
                 "insert into objects (kind, project, squad_id, title, body, status, owner_session, parent_id, files, "
-                "created_by, created_by_name, created_ts, updated_ts) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "created_by, created_by_name, created_ts, updated_ts, data) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (kind, project, squad_id, title, body, status, owner_session, parent_id, json.dumps(files),
-                 created_by, created_by_name, now, now))
+                 created_by, created_by_name, now, now, json.dumps(data or {})))
             oid = cur.lastrowid
             self._insert_log(oid, now, who, "create", "", None, status, owner_name, None)
             self.db.commit()
@@ -1673,6 +1687,28 @@ class Store:
             a = self.db.execute(f"select {SPAWNED_COLUMNS} from spawned_agents where session_id = ?",
                                 (session_id,)).fetchone()
         return dict(zip(SPAWNED_COLUMNS.split(", "), a), channels=_json_list(a[11])) if a else None
+
+
+def _choices(doc: dict, key: str, norm) -> list[str]:
+    """A role's `models` / `efforts`: a list or one per line or comma, each normalized, invalid ones refused, deduped.
+    An update merges in the stored role first, so an absent key keeps what the role had."""
+    raw = doc.get(key) or []
+    if isinstance(raw, str):
+        raw = raw.replace(",", "\n").splitlines()
+    if not isinstance(raw, list):
+        raise ValueError(f"{key}: a list")
+    out = []
+    for item in (str(x).strip() for x in raw):
+        if not item:
+            continue
+        value = norm(item)
+        if not value:
+            raise ValueError(f"{key}: {item!r} is not one")
+        if value not in out:
+            out.append(value)
+    if len(out) > 12:
+        raise ValueError(f"{key}: at most 12")
+    return out
 
 
 def _object(r) -> dict:

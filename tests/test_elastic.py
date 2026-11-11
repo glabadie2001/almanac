@@ -77,8 +77,13 @@ class LimitTests(ElasticRig):
         self.assertEqual(self.used(), 1)
 
     def test_an_agent_cannot_choose_model_workspace_permissions_or_squad(self):
-        status, _, res = self.spawn(model="evil-model", permission_mode="bypass", workspace_mode="shared",
-                                    squad_id="sq-2", effort="max")
+        # slice X: a model or effort outside what the role allows is refused before anything starts
+        status, _, res = self.spawn(model="evil-model")
+        self.assertEqual(status, 400)
+        self.assertIn("allows", res["error"])
+        self.assertEqual((self.argv, self.used()), ([], 0))
+        self.assertEqual(self.spawn(effort="max")[0], 400)
+        status, _, res = self.spawn(permission_mode="bypass", workspace_mode="shared", squad_id="sq-2")
         self.assertEqual(status, 200)
         row = next(s for s in self.store.spawned() if s["agent_name"] == res["agent_name"])
         self.assertEqual((row["role_id"], row["squad_id"]), ("implementer-claude", "sq-1"))
@@ -128,7 +133,8 @@ class AnyRoleTests(ElasticRig):
         status, _, res = self.spawn(role="no-such-role")
         self.assertEqual(status, 400)
         self.assertIn("no role 'no-such-role'", res["error"])
-        status, _, res = self.spawn(role="reviewer-claude", model="evil-model", permission_mode="bypass")
+        self.assertEqual(self.spawn(role="reviewer-claude", model="evil-model")[0], 400, "slice X: outside the role")
+        status, _, res = self.spawn(role="reviewer-claude", permission_mode="bypass")
         self.assertEqual((status, res["role_id"], res["agent_name"]), (200, "reviewer-claude", "rev-claude"))
         row = next(s for s in self.store.spawned() if s["agent_name"] == "rev-claude")
         self.assertNotEqual(row["model"], "evil-model", "the model comes from the role, not the agent")
@@ -194,7 +200,7 @@ class JoinTests(ElasticRig):
                       f"branch `almanac/sq-1/{res['agent_name']}`"):
             self.assertIn(words, prompt)
         heard = [m["body"] for m in self.inbox["impl"]]
-        self.assertTrue(any(b.startswith("[impl-claude joined as Implementer (Claude), added by arch]") for b in heard), heard)
+        self.assertTrue(any(b.startswith("[impl-claude joined as Implementer (Claude), added by arch, on sonnet at high]") for b in heard), heard)
         self.assertFalse(self.inbox["other"], "another squad hears nothing")
 
     def test_only_a_role_that_may_spawn_in_a_squad_with_slots_gets_the_charter_line(self):

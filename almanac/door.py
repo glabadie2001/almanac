@@ -1224,6 +1224,34 @@ LOG_FIELDS = ("id", "ts", "agent_name", "role_id", "provider", "kind", "body", "
               "message_id")
 
 
+WHY_MAX = 200
+
+
+def _why(raw) -> str | None:
+    """A spawner's one-line reason for its model and effort: whitespace folded, capped."""
+    text = " ".join(str(raw or "").split())
+    return text[:WHY_MAX] or None
+
+
+def elastic_choice(role: dict, body: dict) -> dict:
+    """The model and effort an agent picked for a member of `role`, each checked against what the role allows: its own
+    default plus its `models` / `efforts` (additional choices). Absent: the role's default. 400 naming what is allowed."""
+    from almanac.spawner import split_model_effort
+    out = {}
+    for key, pick in (("model", lambda v: split_model_effort(role["provider"], v)[0]),
+                      ("effort", lambda v: split_model_effort(role["provider"], None, v)[1])):
+        raw = str(body.get(key) or "").strip()
+        if not raw:
+            continue
+        value = pick(raw) or raw
+        allowed = list(dict.fromkeys(([role[key]] if role.get(key) else []) + list(role.get(key + "s") or [])))
+        if value not in allowed:
+            raise ValueError(f"{key} {raw!r}: role {role['id']} allows "
+                             + (", ".join(allowed) if allowed else f"no {key} choice (it runs the runner's default)"))
+        out[key] = value
+    return out
+
+
 def _refused(status, message):
     from almanac import web
     return web.Refused(status, message)
@@ -1734,6 +1762,7 @@ def make_handler(service, token, *, hosts=()):
                             return self._send(code, dict(ok=False, error=reason))
                         squad_id, role_id, by = squad["id"], role["id"], self.agent
                         by_session = (service.caller(self.agent, self.agent_session) or {}).get("session_id")
+                        overrides = elastic_choice(role, body)     # model and effort from the role's allowed sets
                     else:
                         squad_id, role_id, by = body.get("squad_id"), body.get("role_id") or body.get("role"), None
                         by_session = None
@@ -1744,13 +1773,16 @@ def make_handler(service, token, *, hosts=()):
                         res = spawner.join_squad(service, almanac_url=f"http://127.0.0.1:{port}", token=token,
                                                  squad_id=squad_id, role_id=role_id, task=task, agent_name=body.get("name"),
                                                  spawned_by=by, spawned_by_session=by_session, files=body.get("files"),
-                                                 **overrides)
+                                                 why=_why(body.get("why")), **overrides)
                     except (RuntimeError, OSError) as exc:
                         res = dict(ok=False, agent_name=body.get("name"), role_id=role_id, error=str(exc))
+                choice = res.get("choice") or {}
                 service.store.log_action(
                     "spawn", res.get("pid") or 0, dict(session_id=res.get("session_id"), name=res.get("agent_name")),
                     bool(res.get("ok")),
-                    f"{res.get('agent_name')} joined {squad_id} as {role_id} (mesh_spawn)" if res.get("ok") else str(res.get("error")),
+                    (f"{res.get('agent_name')} joined {squad_id} as {role_id} (mesh_spawn) on "
+                     f"{choice.get('model') or 'the default model'} at {choice.get('effort') or 'the default effort'}"
+                     + (f": {choice['why']}" if choice.get("why") else "")) if res.get("ok") else str(res.get("error")),
                     self._who())
                 return self._send(200 if res.get("ok") else 409, res)
             if method == "POST" and path == "/api/squad":
