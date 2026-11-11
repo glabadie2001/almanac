@@ -126,10 +126,8 @@ now set it). Committing an inline model or effort edit disables the input, which
 
 ## 9. Task ledger and board — M
 
-Which agent is on which task. A small table (squad, title, owner, files, status: queued / in progress / in review /
-accepted / blocked) written by the architect through a mesh tool. The task passed to `mesh_spawn` becomes the new
-member's first entry; MESH gets a board by owner; heatmap stretches are labelled with their task. These should be
-the same records as item 10's tasks.
+Which agent is on which task: tasks as objects (`T-12`) that agents receive in their kickoff, look up and log
+to. Status, inventory and design: [docs/objects-and-knowledge.md](docs/objects-and-knowledge.md), stage 1.
 
 ## 10. Engram for Almanac — M to L
 
@@ -137,9 +135,9 @@ Decision recorded: native Engram (`D:\$Coding Projects\gskills-claude\engram`) w
 Its SessionStart hook is harmless per agent, but its CLAUDE.md import tells every agent to write `.claude/memory`,
 which contradicts the no-edit roles, gives a shared checkout several writers of one journal, and splits memory
 across worktrees; Gemini agents get nothing; the headless namer in `.almanac/namer-cwd` may pick up the hook
-(unverified). Design sketch: one writer (agents post journal entries through a mesh tool and Almanac writes them
-with agent and squad attribution); a role-aware brief put into the kickoff by the spawner instead of a hook;
-SHA-stamped atlas freshness and first-class dead ends kept from Engram; squad end (item 2) feeds the journal.
+(unverified). The Almanac-scoped replacement (notes as objects with one writer, trust states, freshness on read,
+a capped kickoff brief, markdown export) is drafted in [docs/objects-and-knowledge.md](docs/objects-and-knowledge.md),
+stages 3 and 4.
 
 ## 11. Native Claude and Gemini features where they fit — M
 
@@ -179,13 +177,8 @@ Transcripts are kept (`.almanac/archive/projects`, `.almanac/gemini/projects`) a
 so reviews can be read back. But a finding is prose in a message: no id, severity, verdict or link to its fix, and
 a review done under a non-reviewer role is not marked as one.
 
-Build:
-- reviewers file each finding as a record through a mesh tool (file:line, `bug` | `risk` | `nit`, confidence, has
-  a repro);
-- the architect records a verdict (`fix now` | `defer` | `reject`) with a reason;
-- the fix links back when it lands, and a re-run marks it verified;
-- joined with usage and worktime: tokens and minutes per accepted finding, acceptance rate by reviewer model, share
-  of nits, and how often a fix causes a regression.
+Design: findings are a kind of work object (`F-13`, parent a task) with verdicts; see
+[docs/objects-and-knowledge.md](docs/objects-and-knowledge.md), stage 2.
 
 First data point, this build's one review (impl-telemetry, Opus 5.5, read-only): 19 findings, 16 fixed with tests,
 3 documented and not fixed, 0 rejected. One finding (N1) was a regression introduced by fixing an earlier one. The
