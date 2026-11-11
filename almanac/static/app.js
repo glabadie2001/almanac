@@ -1724,8 +1724,8 @@ $("role-save").closest("form").addEventListener("submit", async (e) => {
       may_spawn: $("role-grow").checked,
       may_restart: $("role-restart").checked,          // a server without the flag ignores the key
       channels: $("role-channels").value.split(",").map((s) => s.trim()).filter(Boolean),
-      // what mesh_spawn may choose instead of the defaults; [] fixes the role at them. The door refuses a list that
-      // leaves out the role's own default, and that error shows in #role-msg. A server without the fields ignores them.
+      // what mesh_spawn may choose besides the defaults, which are always allowed; [] fixes the role at them. Any
+      // refusal from the door shows in #role-msg. A server without the fields ignores them.
       models: $("role-models").value.split(",").map((s) => s.trim()).filter(Boolean),
       efforts: $("role-efforts").value.split(",").map((s) => s.trim()).filter(Boolean),
       allowed_commands: $("role-commands").value,
