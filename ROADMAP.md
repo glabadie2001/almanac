@@ -38,9 +38,10 @@ live, and without a launcher.
 across a relaunch with `--conversation`); ingest stores each turn's own counts, and one re-read repaired history.
 rev-gemini's session read 19.3M input, 336M cache-read and 2.26M output; it is 1.08M, 20.3M and 134k.
 
-**Elastic model and effort.** A role may list other allowed models and efforts besides its default (the role
-form's "also allowed"); an agent adding a member through `mesh_spawn` may pick from the default plus those lists and
-gives a reason (`why`), and the choice is kept on the new member's task. The operator's own spawns keep their free
+**Elastic model and effort.** A role may allow more than one model and effort; the ROLES form picks them from
+two multi-select dropdowns, and the first ticked (by capability) is the role's default. An agent adding a member
+through `mesh_spawn` picks from that set and gives a reason (`why`); when the role offers more than one, it must name
+the model and effort. The choice is kept on the new member's task. The operator's own spawns keep their free
 overrides.
 
 **Backlog tasks and one-click dispatch** (the operator's ask). A task can be filed to the project's backlog with no
