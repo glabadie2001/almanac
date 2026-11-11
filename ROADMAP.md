@@ -27,6 +27,22 @@ that added it; an escalation closes itself when the agent works again and surviv
 spawned into an active squad are touched. `auto_continue` in `config.json` turns it off. Gemini turns that fail
 are marked the same way (`gemini_error`, `runner_exited`, `runner_error`).
 
+**A blocked agent ends its turn** (backlog task T-40; slice T-41, live check T-42). The charter's item 5 told every
+agent to call `mesh_wait(timeout_seconds=120)` when blocked. Each call is a step that re-reads the agent's context
+and usually returns nothing. T-10's squad journal holds 23 such calls from the lead (of 235 tool calls), 10 from
+three builders and 35 from the Gemini reviewer through `call_mcp_tool`. Item 5 now reads: end your turn; a message to
+you starts your next one. `mesh_wait` is out of `MCP_TOOLS`, so out of `tools/list` and agy's grants, and a call by
+name over MCP is refused with what to do instead; `--cli wait` and `/api/mesh/wait` stay for the operator's scripts.
+No host change was needed: an idle Claude session is woken by a message, and `GeminiHost` runs a turn for every
+message put on its queue. `recover.py` acts only on API errors, so an agent idle because it is blocked is left alone;
+an unanswered `needs=` flag is what shows it. Measured in T-40's own squad: no `mesh_wait` call from any of its four
+agents; the Gemini reviewer sat idle for 5m36s and its turn started 5 ms after the review request; a builder spawned
+after the restart had the new item 5 and no `mesh_wait` tool, and its next turn started 41 ms after the lead's reply. Not
+shown: fewer lead steps per task than T-10. This squad had one slice, so planning, merging and the suite dominate
+(54 tool calls when measured, against about 39 per slice for T-10's lead); what dropped is the wait calls, 23 to 0.
+Left: agents alive across the restart keep the old charter and tool list until respawned; T-36 is still open for
+messages that arrive during a long Gemini turn (one turn each afterwards).
+
 **Orchestrator role and a safe restart.** `orchestrator-claude` ships with `may_restart`; `mesh_restart` (and
 `POST /api/mesh/restart` for the operator) runs a preflight on a copy of the database, tells every live squad,
 and exits 75; `run.ps1`, `run.cmd` and `run.sh` start Almanac again. Refused while a headless Claude agent is
@@ -285,7 +301,8 @@ can be indexed after the fact with a model pass over the saved transcripts, less
   subscription is explicit. `#squad` is the exception: it means `@squad` (every member, subscribed or not), so
   with no squad selected it needs exactly one live squad, like `@squad`.
 - Worktime: time a tool sits on a permission prompt counts as work (the transcript cannot tell it from a slow
-  tool), and a Gemini agent that waits through `call_mcp_tool(ToolName="mesh_wait")` is not seen as waiting.
+  tool). `mesh_wait` is no longer an agent tool (T-40); in older journals a Gemini wait through
+  `call_mcp_tool(ToolName="mesh_wait")` is counted as work.
 - Never seen in a browser: the roster `✉N` badge, a real browser Notification, the elastic strip editor, the
   heatmap, the topology and the swimlane. Chrome automation refused the throwaway tabs; the data behind each is
   tested.
