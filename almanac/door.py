@@ -1443,7 +1443,11 @@ def _hub_tell(service, *, to_name, to_session, text, agent, caller, squad) -> tu
     return False, entry["id"]
 
 
-def _assign(service, row: dict, owner: dict, agent, caller) -> tuple[bool, int]:
+def _assign(service, row: dict, owner: dict, agent, caller) -> tuple[bool | None, int | None]:
+    """Send the owner its assignment message: (delivered, message id). An agent assigning a task to itself is told
+    nothing (None, None): the assign log row is still written by the caller."""
+    if agent and owner["session_id"] == (caller or {}).get("session_id"):
+        return None, None
     ref = ref_of(row)
     files = ", ".join(row["files"]) or "(none named)"
     text = (f"[{ref} assigned to you] {row['title']}\n\n{row['body']}\n\nFiles: {files}\n"

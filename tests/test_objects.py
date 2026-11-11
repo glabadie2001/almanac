@@ -188,6 +188,16 @@ class LogTests(ObjectRig):
         self.assertEqual((res["object"]["owner_name"], res["object"]["owner_session"]), ("arch", "sess-arch"))
         self.assertIn("[T-1 assigned to you]", json.dumps(self.inbox["arch"][0]))
 
+    def test_taking_a_task_yourself_sends_no_message(self):
+        status, _, res = self.file(self.tok("arch"), title="mine", owner="arch")
+        self.assertEqual((status, res["delivered"], res["object"]["owner_name"]), (200, None, "arch"))
+        status, _, res = self.log(self.tok("arch"), ref="T-1", owner="arch", body="taking it over")   # T-1 was impl's
+        self.assertEqual((status, res["entry"]["kind"], res["entry"]["owner_to"], res["entry"]["message_id"], res["delivered"]),
+                         (200, "assign", "arch", None, None))
+        self.assertEqual(self.heard(), set(), "nobody is told they assigned a task to themselves")
+        self.assertEqual([e["kind"] for e in self.store.object_log(2, 5)], ["assign", "create"], "the row is still written")
+        self.assertEqual(self.store.object_log(2, 1)[0]["message_id"], None)
+
     def test_an_ended_owner_gets_the_row_and_an_undelivered_message(self):
         self.store.record_spawn(agent_name="gone", session_id="sess-gone", squad_id="sq-1", role_id=None,
                                 provider="claude", model=None, effort=None, cwd=str(self.root), worktree_path=None, pid=0)
