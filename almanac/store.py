@@ -1008,7 +1008,7 @@ class Store:
         clauses = ["id > ?"]
         params: list = [max(0, int(since_id))]
         if peer:
-            clauses.append("(from_name = ? or to_name = ? or from_session = ? or to_session = ? or to_name in ('@all', '@squad'))")
+            clauses.append("(from_name = ? or to_name = ? or from_session = ? or to_session = ? or to_name in ('@all', '@squad', '#squad'))")
             params.extend([peer, peer, peer, peer])
         if channel:
             clauses.append("channel = ?")
@@ -1190,9 +1190,11 @@ class Store:
             raise ValueError("role id must be 1..63 lowercase letters, digits, '-' or '_'")
         old = self.role(rid)
         if old:
-            # an update keeps every field the doc leaves out (the role form sends no channels and no permission
-            # mode); a key that is present, empty or null, still sets it. add_dirs keeps by its own coalesce, so a
-            # folder deleted since is not re-validated by a save that does not touch it.
+            # an update keeps every field the doc leaves out (the role form once sent no channels and still sends
+            # no permission mode); a present key sets it, an empty one clears it. An explicit null keeps the stored
+            # value for may_page_operator, may_spawn, allowed_commands and add_dirs (their SQL coalesce) and clears
+            # the rest. add_dirs is not merged here, so a folder deleted since is not re-validated by a save that does
+            # not touch it.
             doc = {**{k: v for k, v in old.items() if k != "add_dirs"}, **doc}
         provider = str(doc.get("provider") or "claude").strip().lower()
         if provider not in ("claude", "gemini"):
@@ -1218,7 +1220,9 @@ class Store:
         raw_channels = doc.get("channels") or []
         if isinstance(raw_channels, str):
             raw_channels = [c.strip() for c in raw_channels.split(",") if c.strip()]
-        channels = [str(c).strip() for c in raw_channels if str(c).strip()][:20]
+        # `review` typed without its `#` would never match a `#review` post
+        channels = list(dict.fromkeys(c if c.startswith("#") else "#" + c
+                                      for c in (str(c).strip() for c in raw_channels) if c))[:20]
         # absent: an update keeps what the role had, a new role may not page the operator
         page = doc.get("may_page_operator")
         page = None if page is None else int(page is True or str(page).strip().lower() in ("1", "true", "yes", "on"))
@@ -1232,7 +1236,9 @@ class Store:
         if isinstance(dirs, str):
             dirs = dirs.splitlines()
         if dirs is not None:
-            dirs = [str(d).strip() for d in dirs if str(d).strip()][:20]
+            dirs = [d for d in (str(d).strip().strip('"').strip() for d in dirs) if d]   # Explorer's "Copy as path" quotes
+            if len(dirs) > 20:
+                raise ValueError(f"add_dirs takes at most 20 folders, not {len(dirs)}")
             bad = [d for d in dirs if not (Path(d).is_absolute() and Path(d).is_dir())]
             if bad:
                 raise ValueError("add_dirs must be absolute paths of existing folders; not: " + ", ".join(bad))

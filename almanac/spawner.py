@@ -433,6 +433,8 @@ def spawn_agent(
     eff_role_title = role["title"] if role else (role_id or f"{eff_provider.title()} Agent")
     eff_role_prompt = (system_prompt if system_prompt is not None else (role["system_prompt"] if role else "Collaborate with peers to complete the user's goal.")).strip()
     eff_channels = list(channels if channels is not None else (role["channels"] if role else ["#squad"]))
+    # a role's folders were checked when saved; one deleted since is left out of both the charter and agy's argv
+    add_dirs = [d for d in (role or {}).get("add_dirs") or [] if Path(d).is_dir()]
 
     worktree_path: Path | None = None
     run_cwd = repo_dir
@@ -461,7 +463,7 @@ def spawn_agent(
         may_page_operator=bool(role is None or role.get("may_page_operator")),   # role-less agents may page (door.may_page_operator)
         grow=_grow_line(service, role, squad_id),
         allowed_commands=(role or {}).get("allowed_commands") or [],
-        add_dirs=(role or {}).get("add_dirs") or [],
+        add_dirs=add_dirs,
     )
     charter_file = spawn_dir / "charter.md"
     charter_file.write_text(charter, encoding="utf-8")
@@ -594,7 +596,7 @@ def spawn_agent(
             "--add-dir",
             str(bundle_dir),
         ]
-        for folder in (role or {}).get("add_dirs") or []:
+        for folder in add_dirs:
             argv += ["--add-dir", folder]
         if eff_model:
             argv += ["--model", eff_model]
