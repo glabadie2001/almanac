@@ -235,26 +235,23 @@
             </select>
           </div>
           <div class="field">
-            <label for="role-model">default model</label>
-            <input id="role-model" name="model" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="fable / opus-5-5 / gemini-4-carbon-high">
+            <span class="field-lbl" id="role-models-lbl">models (tick every one the role may use)</span>
+            <details class="multi" id="role-models">
+              <summary aria-labelledby="role-models-lbl role-models-sum"><span id="role-models-sum">none ticked</span></summary>
+              <div class="multi-pop">
+                <div class="multi-list" id="role-models-list" role="group" aria-labelledby="role-models-lbl"></div>
+                <input id="role-models-add" class="inline-input" aria-label="add another model id" placeholder="+ another model id, Enter" autocorrect="off" autocapitalize="none" spellcheck="false">
+              </div>
+            </details>
           </div>
           <div class="field">
-            <label for="role-effort">effort</label>
-            <select id="role-effort" name="effort">
-              <option value="low">low</option>
-              <option value="medium">medium</option>
-              <option value="high" selected>high</option>
-              <option value="xhigh">xhigh</option>
-              <option value="max">max</option>
-            </select>
-          </div>
-          <div class="field">
-            <label for="role-models">also allowed models (comma-separated; empty = only the one above)</label>
-            <input id="role-models" name="models" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="opus-5-5, sonnet-5-5">
-          </div>
-          <div class="field">
-            <label for="role-efforts">also allowed efforts</label>
-            <input id="role-efforts" name="efforts" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="medium, high">
+            <span class="field-lbl" id="role-efforts-lbl">efforts</span>
+            <details class="multi" id="role-efforts">
+              <summary aria-labelledby="role-efforts-lbl role-efforts-sum"><span id="role-efforts-sum">none ticked</span></summary>
+              <div class="multi-pop">
+                <div class="multi-list" id="role-efforts-list" role="group" aria-labelledby="role-efforts-lbl"></div>
+              </div>
+            </details>
           </div>
           <div class="field">
             <label for="role-workspace">workspace</label>

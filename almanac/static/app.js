@@ -120,15 +120,8 @@ function effortBadge(e) {
 }
 // elastic roles: `models` / `efforts` list what mesh_spawn may choose besides the defaults (absent or [] = fixed)
 const elasticAlt = (list, own) => (Array.isArray(list) ? list.filter((x) => x !== own) : []);
-const elasticMore = (list, own) => {
-  const n = elasticAlt(list, own).length;
-  return n ? el("span", { cls: "dim", text: ` +${n}` }) : null;
-};
-function elasticTip(r) {                              // the whole allowed set: the default, always allowed, then the rest
-  const ma = elasticAlt(r.models, r.model), ea = elasticAlt(r.efforts, r.effort);
-  return ma.length || ea.length
-    ? [`models: ${[r.model || "default", ...ma].join(", ")}`, `efforts: ${[r.effort || "default", ...ea].join(", ")}`].join("\n") : null;
-}
+// a role may use its own model / effort and every other entry of its list, most capable first as saved
+const roleOptions = (list, own) => [own, ...elasticAlt(list, own)].filter(Boolean);
 const keyOf = (p) => `${p.pid}:${p.created}`;
 const active = (p) => !!p.status && p.status !== "idle" && p.status !== "ended";
 function togglePin(p) {
@@ -753,7 +746,8 @@ async function loadModels() {
       efforts: doc.efforts || structuredClone(DEFAULT_EFFORTS),
     };
     syncSpawnModelField();
-    syncEffortSelect($("role-effort"), $("role-provider").value || "claude", $("role-model").value, null);
+    refillRoleModels(multiTicked("role-models"));
+    refillRoleEfforts();
   } catch { /* non-fatal */ }
 }
 
@@ -777,16 +771,60 @@ attachModelPicker($("spawn-model"), {
 });
 $("spawn-model").addEventListener("input", syncSpawnModelField);
 
-attachModelPicker($("role-model"), {
-  getProvider: () => $("role-provider").value || "claude",
-  onPick: () => syncEffortSelect($("role-effort"), $("role-provider").value || "claude", $("role-model").value, null),
-});
-$("role-model").addEventListener("input", () => {
-  syncEffortSelect($("role-effort"), $("role-provider").value || "claude", $("role-model").value, null);
+// ROLES: models and efforts are each one multi-pick, a <details> of checkboxes. Saving stores every tick in
+// models / efforts and the most capable tick as model / effort, the fallback when nobody picks (a member launched
+// from the roster). A single tick saves an empty list, exactly as a fixed role was saved before.
+// ponytail: capability order is a heuristic (model family, then the higher version; an alias counts as the newest).
+// Serve a rank from /api/models if it ever picks the wrong default.
+const MODEL_FAMILIES = ["fable", "mythos", "opus", "carbon", "argon", "sonnet", "pro", "flash", "haiku", "gpt-oss"];
+function modelRank(m) {
+  const s = String(m).toLowerCase(), fam = MODEL_FAMILIES.findIndex((f) => s.includes(f));
+  const v = s.match(/(\d+)[.-](\d+)/);
+  return [fam < 0 ? MODEL_FAMILIES.length : fam, v ? -(Number(v[1]) + Number(v[2]) / 100) : -1e9];
+}
+const byCapability = (a, b) => { const x = modelRank(a), y = modelRank(b); return x[0] - y[0] || x[1] - y[1]; };
+const EFFORT_DESC = ["max", "xhigh", "high", "medium", "low"];
+const byEffort = (a, b) => (EFFORT_DESC.indexOf(a) + 1 || 99) - (EFFORT_DESC.indexOf(b) + 1 || 99);
+
+const multiTicked = (id) => [...$(`${id}-list`).querySelectorAll("input:checked")].map((i) => i.value);
+function paintMulti(id, fmt) {
+  const t = multiTicked(id);
+  $(`${id}-sum`).textContent = t.length ? t.map(fmt).join(", ") : "none ticked";
+}
+function fillMulti(id, options, ticked, fmt) {           // a ticked value outside the options stays, ticked
+  const keep = new Set(ticked);
+  $(`${id}-list`).replaceChildren(...[...new Set([...options, ...ticked])].map((v) => el("label", { cls: "chk" },
+    el("input", { type: "checkbox", value: v, checked: keep.has(v) }), ` ${fmt(v)}`)));
+  paintMulti(id, fmt);
+}
+const roleProv = () => $("role-provider").value || "claude";
+const refillRoleModels = (ticked) => fillMulti("role-models", modelsForProvider(roleProv()), ticked, String);
+function refillRoleEfforts(ticked = multiTicked("role-efforts")) {      // what the ticked models allow, highest first
+  const models = multiTicked("role-models");
+  const opts = [...new Set((models.length ? models : [""]).flatMap((m) => effortsForModel(roleProv(), m)))].sort(byEffort);
+  fillMulti("role-efforts", opts, ticked, fmtEffortLabel);
+}
+$("role-models-list").addEventListener("change", () => { paintMulti("role-models", String); refillRoleEfforts(); });
+$("role-efforts-list").addEventListener("change", () => paintMulti("role-efforts", fmtEffortLabel));
+$("role-models-add").addEventListener("keydown", (e) => {
+  if (e.key !== "Enter") return;
+  e.preventDefault();                                    // inside the role form: Enter adds, it does not save
+  const v = e.target.value.trim();
+  if (!v) return;
+  refillRoleModels([...multiTicked("role-models"), v]);
+  refillRoleEfforts();
+  e.target.value = "";
 });
 $("role-provider").addEventListener("change", () => {
-  syncEffortSelect($("role-effort"), $("role-provider").value || "claude", $("role-model").value, null);
+  const opts = modelsForProvider(roleProv());
+  refillRoleModels(multiTicked("role-models").filter((m) => opts.includes(m)));
+  refillRoleEfforts();
 });
+document.addEventListener("click", (e) => {             // a multi-pick closes on a click outside it
+  for (const d of document.querySelectorAll("details.multi[open]")) if (!d.contains(e.target)) d.open = false;
+});
+refillRoleModels([]);
+refillRoleEfforts(["high"]);
 
 async function loadRoles() {
   try {
@@ -835,16 +873,15 @@ function syncRoleControls() {
   const tbody = $("roles-table")?.querySelector("tbody");
   if (tbody) {
     tbody.replaceChildren(...state.roles.map((r) => {
-      const tip = elasticTip(r), badge = effortBadge(r.effort);
-      if (tip) badge.removeAttribute("title");          // the badge's own "effort: high" would hide the cell's list
       const tr = el("tr", {},
         el("td", {}, r.id, r.may_page_operator ? el("span", { cls: "amber", text: " ✉", title: "may page the operator" }) : null,
           r.may_spawn ? el("span", { cls: "cyan", text: " ⊕", title: "may add squad members" }) : null,
           r.may_restart ? el("span", { cls: "red", text: " ⟳", title: "may restart Almanac" }) : null),
         el("td", {}, providerBadge(r.provider)),
         el("td", { text: r.title }),
-        el("td", { cls: "model", title: tip }, fmtModel(r.model), elasticMore(r.models, r.model)),
-        el("td", { title: tip }, badge, elasticMore(r.efforts, r.effort)),
+        el("td", { cls: "model", text: roleOptions(r.models, r.model).map(fmtModel).join(", ") || "–" }),
+        el("td", {}, effortBadge(r.effort), elasticAlt(r.efforts, r.effort).length
+          ? el("span", { cls: "dim", text: `, ${elasticAlt(r.efforts, r.effort).map(fmtEffortLabel).join(", ")}` }) : null),
         el("td", { cls: "dim", text: r.workspace_mode || "shared" }),
       );
       tr.addEventListener("click", () => populateRoleForm(r));
@@ -1686,17 +1723,14 @@ function populateRoleForm(r) {
   $("role-id").value = r ? r.id : "";
   $("role-title").value = r ? r.title : "";
   $("role-provider").value = prov;
-  $("role-model").value = mod;
-  syncEffortSelect($("role-effort"), prov, mod, null);
-  if ([...$("role-effort").options].some((o) => o.value === eff)) $("role-effort").value = eff;
+  refillRoleModels([...new Set([mod, ...(r?.models || [])])].filter(Boolean));
+  refillRoleEfforts([...new Set([eff, ...(r?.efforts || [])])].filter(Boolean));
   $("role-workspace").value = r ? (r.workspace_mode || "shared") : "shared";
   $("role-prompt").value = r ? (r.system_prompt || "") : "";
   $("role-page").checked = !!r?.may_page_operator;
   $("role-grow").checked = !!r?.may_spawn;
   $("role-restart").checked = !!r?.may_restart;
   $("role-channels").value = (r?.channels || []).join(", ");
-  $("role-models").value = (r?.models || []).join(", ");
-  $("role-efforts").value = (r?.efforts || []).join(", ");
   $("role-commands").value = (r?.allowed_commands || []).join("\n");
   $("role-dirs").value = (r?.add_dirs || []).join("\n");
   $("role-msg").textContent = r ? `editing ${r.id}` : "";
@@ -1713,24 +1747,30 @@ $("role-new").addEventListener("click", () => populateRoleForm(null));
 $("role-save").closest("form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const btn = $("role-save"), msg = $("role-msg");
+  const models = multiTicked("role-models").sort(byCapability), efforts = multiTicked("role-efforts").sort(byEffort);
+  if (!models.length || !efforts.length) {
+    const which = models.length ? "role-efforts" : "role-models";
+    msg.textContent = `tick at least one ${models.length ? "effort" : "model"} to save`;
+    $(which).open = true;
+    return;
+  }
   btn.disabled = true;
   try {
     const r = await post("/api/roles", {
       id: $("role-id").value.trim(),
       title: $("role-title").value.trim(),
       provider: $("role-provider").value,
-      model: $("role-model").value.trim() || null,
-      effort: $("role-effort").value || null,
+      model: models[0],                                 // the most capable tick: used when nobody picks
+      effort: efforts[0],
       workspace_mode: $("role-workspace").value,
       system_prompt: $("role-prompt").value.trim(),
       may_page_operator: $("role-page").checked,
       may_spawn: $("role-grow").checked,
       may_restart: $("role-restart").checked,          // a server without the flag ignores the key
       channels: $("role-channels").value.split(",").map((s) => s.trim()).filter(Boolean),
-      // what mesh_spawn may choose besides the defaults, which are always allowed; [] fixes the role at them. Any
-      // refusal from the door shows in #role-msg. A server without the fields ignores them.
-      models: $("role-models").value.split(",").map((s) => s.trim()).filter(Boolean),
-      efforts: $("role-efforts").value.split(",").map((s) => s.trim()).filter(Boolean),
+      // every tick, most capable first; a single tick saves [] (the role is fixed at it, as before)
+      models: models.length > 1 ? models : [],
+      efforts: efforts.length > 1 ? efforts : [],
       allowed_commands: $("role-commands").value,
       add_dirs: $("role-dirs").value,
     });
