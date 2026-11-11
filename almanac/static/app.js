@@ -789,7 +789,7 @@ const byEffort = (a, b) => (EFFORT_DESC.indexOf(a) + 1 || 99) - (EFFORT_DESC.ind
 const multiTicked = (id) => [...$(`${id}-list`).querySelectorAll("input:checked")].map((i) => i.value);
 function paintMulti(id, fmt) {
   const t = multiTicked(id);
-  $(`${id}-sum`).textContent = t.length ? t.map(fmt).join(", ") : "none ticked";
+  $(`${id}-sum`).textContent = t.length ? t.map(fmt).join(", ") : "runner default";   // nothing ticked saves empty
 }
 function fillMulti(id, options, ticked, fmt) {           // a ticked value outside the options stays, ticked
   const keep = new Set(ticked);
@@ -1719,7 +1719,8 @@ $("fleet-kinds").addEventListener("click", (e) => {
 function populateRoleForm(r) {
   const prov = r ? (r.provider || "claude") : "claude";
   const mod = r ? (r.model || "") : "";
-  const eff = r ? ((r.effort === "med" ? "medium" : r.effort) || "high") : "high";
+  // a stored role shows its effort as stored (empty = runner default); a new role starts at high
+  const eff = r ? ((r.effort === "med" ? "medium" : r.effort) || "") : "high";
   $("role-id").value = r ? r.id : "";
   $("role-title").value = r ? r.title : "";
   $("role-provider").value = prov;
@@ -1748,20 +1749,14 @@ $("role-save").closest("form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const btn = $("role-save"), msg = $("role-msg");
   const models = multiTicked("role-models").sort(byCapability), efforts = multiTicked("role-efforts").sort(byEffort);
-  if (!models.length || !efforts.length) {
-    const which = models.length ? "role-efforts" : "role-models";
-    msg.textContent = `tick at least one ${models.length ? "effort" : "model"} to save`;
-    $(which).open = true;
-    return;
-  }
   btn.disabled = true;
   try {
     const r = await post("/api/roles", {
       id: $("role-id").value.trim(),
       title: $("role-title").value.trim(),
       provider: $("role-provider").value,
-      model: models[0],                                 // the most capable tick: used when nobody picks
-      effort: efforts[0],
+      model: models[0] || null,                         // the most capable tick, used when nobody picks; none = runner default
+      effort: efforts[0] || null,
       workspace_mode: $("role-workspace").value,
       system_prompt: $("role-prompt").value.trim(),
       may_page_operator: $("role-page").checked,
