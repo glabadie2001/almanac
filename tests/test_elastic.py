@@ -26,6 +26,9 @@ class ElasticRig(MeshRig):
         self.store.create_squad("sq-1", "alpha", str(self.ws), "Ship the roadmap.", spawn_role="implementer-claude",
                                 spawn_limit=2)
         self.store.create_squad("sq-2", "beta", str(self.ws), "Other work.", spawn_role="implementer-claude", spawn_limit=0)
+        # these tests are about limits, joins and handles: the implementer runs at one model and effort, so a spawner
+        # need not pick (T-16); the seeded choices are tested in test_elastic_choice
+        self.store.upsert_role(dict(self.store.role("implementer-claude"), models=[], efforts=[]))
         for name, squad, role in (("arch", "sq-1", "architect-claude"), ("impl", "sq-1", "implementer-claude"),
                                   ("other", "sq-2", "architect-claude")):
             self.store.record_spawn(agent_name=name, session_id=f"sess-{name}", squad_id=squad, role_id=role,
