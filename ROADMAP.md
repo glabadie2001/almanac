@@ -265,9 +265,6 @@ can be indexed after the fact with a model pass over the saved transcripts, less
   tree; its findings are fixed and covered by tests (`tests/test_review_fixes.py`, `test_fix8.py`, `test_fix9.py`).
   A Gemini review (rev-carbon, Gemini 4 Carbon, static only) ran on the final tree: nine groups of findings, mostly
   in the dashboard; fixed in FIX-10P / FIX-10U.
-- An agent's identity at the door is its handle, not its session: with two live squads that reuse a handle (the
-  default roster does), the sender's session and squad can bind to the other squad's agent (rev-carbon finding
-  6.2). Tokens should carry the session id.
 - A direct message with no squad id closes matching flags in any squad (rev-carbon finding 5.2). Accepted for now.
 - Gemini agents cannot run arbitrary shell commands on this account: `--mode auto` is refused and the default mode
   denies every shell command, so a role's `allowed_commands` (exact command lines, agy allow rules) is the only
@@ -275,7 +272,7 @@ can be indexed after the fact with a model pass over the saved transcripts, less
 - Headless `agy` denies `read_file` outside the workspace; a Gemini role's `add_dirs` passes `--add-dir` per
   folder, which makes each part of the agent's workspace (edits included, as its mode allows), not read-only.
   `read_file(<target>)` allow rules through `--settings` (beside the command rules) were not tried.
-- Gemini shell calls are recorded without their command: ingest reads `input.command` (store.py:525), but Gemini's
+- Gemini shell calls are recorded without their command: ingest reads `input.command` (store.py:614), but Gemini's
   `run_command` carries `CommandLine` (fleet.py:266), so `family`, `head` and the adoption scores are empty for
   them. Found by reading (rev-gemini), not reproduced on a transcript; not fixed.
 - An agent token can read any session's context stream (`/api/mesh/context?peer=<any session id>` falls back to
