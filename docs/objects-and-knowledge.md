@@ -10,11 +10,12 @@ the same primitive: an addressable record that agents hold a reference to, look 
 - **Stage 0, identity:** agent tokens carry the session (`77237ea`).
 - **Stage 1, tasks as objects:** `objects` and `object_log` (schema v10), the routes and four tools, `mesh_send(re=)`,
   assignment by filing with an owner, both spawn paths file a T, the charter protocol (`b01fb6a`, `1c3cf90`,
-  review fixes `bdb1ac4`), and the PLAN view in MESH (<PLAN_SHA>).
+  review fixes `bdb1ac4`), and the PLAN view in MESH (`0dab3b3`, `18a0e9d`, `fc84401`).
 - **Stall recovery:** a squad agent idle on an API error is sent `continue` and then escalated to the operator
-  (`cad410e`, `75e2a8b`, `8db6917`); Gemini turn failures are marked the same way.
-- **Orchestrator role** and restart (<ORCH_SHA>).
-- **Markdown in messages** (<MD_SHA>).
+  (`cad410e`, `75e2a8b`, `8db6917`; on the page `3ac7430`, `30cf681`); Gemini turn failures are marked the same
+  way.
+- **Orchestrator role** and restart (`107a75f`, `9bdba2e`).
+- **Markdown in messages** (`93f6437`, `8cdfcfb`).
 - **Gemini usage** stored per turn instead of agy's running totals (`3aa2fa9`).
 
 Notes (stage 3) and findings (stage 2) are not built. The inventory below is the state **before** this build, kept
@@ -257,7 +258,7 @@ Where the work attaches in today's code:
 | Stage | What | State |
 |---|---|---|
 | 0 | Identity: agent tokens carry the session id | **built** (`77237ea`) |
-| 1 | The plan view: tasks as a tree per squad with owners, `objects`, `object_log`, routes and tools, `mesh_send(re=)`, assignment, both spawn paths file a T, the charter protocol, PLAN in MESH. Spec below | **built** (`b01fb6a`, `1c3cf90`, `bdb1ac4`, <PLAN_SHA>) |
+| 1 | The plan view: tasks as a tree per squad with owners, `objects`, `object_log`, routes and tools, `mesh_send(re=)`, assignment, both spawn paths file a T, the charter protocol, PLAN in MESH. Spec below | **built** (`b01fb6a`, `1c3cf90`, `bdb1ac4`, `0dab3b3`, `18a0e9d`, `fc84401`) |
 | 2 | Findings as a kind with verdicts (item 14). See below | not built |
 | 3 | Notes (v3): seed files and the read path first (loader in ingest, `symbol_sha` on read, the brief with `briefed_refs`, a knowledge strip); promotion as the next commit, its urgency set by the debate's experiment. Notes may come before findings | not built |
 | 4 | Derived stats (`calls.path` read from `file_path`, `Path` or `path`; `base_sha`; one in-progress task per session), librarian, respawn with handoff (item 13) | not built |

@@ -1,10 +1,47 @@
 # Almanac roadmap
 
 Feature candidates from the alpha-squad review of 2026-11-10 (architect Claude, implementer Claude, reviewer
-Gemini), ranked, and what the alpha-squad build of the same evening shipped. Each open item names the code it would
+Gemini), ranked, and what the alpha-squad builds of 2026-11-10 and 2026-11-11 shipped. Each open item names the code it would
 build on, so it can be picked up cold.
 
 Effort: S = an afternoon, M = a few days, L = a week or more.
+
+## Shipped in the 2026-11-11 build
+
+Design and status: `docs/objects-and-knowledge.md`; the Engram debate: `docs/engram-debate-2026-11-11.md`.
+
+**9. Tasks as objects, and the plan view.** Stage 0: agent tokens carry the session, so a reused handle no longer
+binds to another squad's agent. Stage 1: schema v10 `objects` and `object_log`; tasks (`T-12`) form a tree per
+squad with an owner and a status (queued, in progress, in review, accepted, blocked); `mesh_file`, `mesh_log`,
+`mesh_object`, `mesh_objects` and their CLI verbs; `mesh_send(re=)` logs a message on a task; filing with an owner
+is the assignment, delivered as one message; a status change notifies the creator; both spawn paths file the new
+member's task and put its ref in the kickoff; the charter teaches the protocol. MESH opens with PLAN: the squad's
+mission, counts by status, the task tree with owner state, regrouped by owner on a toggle, a task's log on a
+click. Hub messages that report on work are **notices** (`messages.notice`): they close no flag and grant no
+reply pass.
+
+**Stalled agents recover.** A squad agent idle on an API error (`isApiErrorMessage`) is stalled: FLEET, GALLERY
+and MESH show it. On a transient error (`server_error`, `overloaded_error`, `timeout`) Almanac sends `continue`
+after 20, 60 and 180 seconds, then escalates once to the operator as a blocking inbox message and to the agent
+that added it; an escalation closes itself when the agent works again and survives a restart. Only agents Almanac
+spawned into an active squad are touched. `auto_continue` in `config.json` turns it off. Gemini turns that fail
+are marked the same way (`gemini_error`, `runner_exited`, `runner_error`).
+
+**Orchestrator role and a safe restart.** `orchestrator-claude` ships with `may_restart`; `mesh_restart` (and
+`POST /api/mesh/restart` for the operator) runs a preflight on a copy of the database, tells every live squad,
+and exits 75; `run.ps1`, `run.cmd` and `run.sh` start Almanac again. Refused while a headless Claude agent is
+live, and without a launcher.
+
+**Markdown in messages and chats**, rendered without ever dropping text; hostile input stays text.
+
+**Gemini usage per turn.** agy reports the conversation's running totals in every result (measured: they carry on
+across a relaunch with `--conversation`); ingest stores each turn's own counts, and one re-read repaired history.
+rev-gemini's session read 19.3M input, 336M cache-read and 2.26M output; it is 1.08M, 20.3M and 134k.
+
+**Also:** a Gemini role's `add_dirs` (extra workspace folders, `--add-dir`); `#squad` reaches every member of the
+sender's squad (role-form saves had wiped every role's channels, so it reached nobody); a role saved from the form
+keeps what the form does not send (`permission_mode` was reset too); the role form edits channels, allowed
+commands, folders and `may_restart`.
 
 ## Shipped in the 2026-11-10 build
 
@@ -124,11 +161,6 @@ now set it). Committing an inline model or effort edit disables the input, which
 `loadFleet` poll redraw the table mid-save; hold an explicit editing flag instead of testing
 `document.activeElement`.
 
-## 9. Task ledger and board — M
-
-Which agent is on which task: tasks as objects (`T-12`) that agents receive in their kickoff, look up and log
-to. Status, inventory and design: [docs/objects-and-knowledge.md](docs/objects-and-knowledge.md), stage 1.
-
 ## 10. Engram for Almanac — M to L
 
 Decision recorded: native Engram (`D:\$Coding Projects\gskills-claude\engram`) was **not** installed in this repo.
@@ -216,6 +248,16 @@ can be indexed after the fact with a model pass over the saved transcripts, less
 - A restart relies on the launcher (`run.ps1` / `run.cmd` / `run.sh`, exit code 75, `ALMANAC_LAUNCHER=1`).
   A terminal that runs Almanac inside a kill-on-close job object would kill the agents only when that job closes;
   the launcher's loop keeps it open across a restart, but closing the terminal ends them as before.
+- Not seen working against the real thing: auto-continue has never met a really stalled agent (only an injected
+  transcript record through the real recover code); `mesh_restart` has never restarted the live hub (only stub
+  interpreters and the preflight); a Gemini error class is never retried, for lack of a single saved agy error
+  sample (`recover.TRANSIENT`); whether agy's totals ever reset is unknown, and a drop is taken as a reset.
+- Seen in a browser only on the rig door (`door_rig.py`, a fake process table, no live agents), 2026-11-11: FLEET
+  and MESH stall pills with their `since` tooltips from the real recover pass, the header alert and the INBOX
+  escalation thread, PLAN with a real task tree, markdown in the contact stream, and the ROLES form saving
+  `may_restart`, channels and folders (and showing the refusal for a missing one). Not seen: GALLERY tiles, the
+  CHATS markdown pane, PLAN's by-owner toggle and task pane, a restart from the page. After a save the role form
+  keeps the text as typed rather than the normalized channels.
 - A server restarted mid-edit runs a mix of old API and new static files (the topology now says so instead of
   failing). Consider an API version stamp the page checks once.
 - Review in this squad: the Gemini reviewer could not start at launch (no runner), so every slice was reviewed by
