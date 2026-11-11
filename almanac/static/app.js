@@ -1784,13 +1784,11 @@ async function loadPeerContext() {
 // Read-only. Titles, bodies and log lines are written by agents: set with textContent only (el()).
 const PLAN_STATUSES = ["queued", "in progress", "in review", "accepted", "blocked"];
 const PLAN_EMPTY = "No tasks filed. The architect files them with mesh_file.";
-const PLAN_FIXTURE = new URLSearchParams(location.search).get("plan") === "fixture";   // ?plan=fixture: draw sample rows
 const slug = (s) => String(s || "").toLowerCase().replace(/[^a-z]+/g, "-");
 
 // fetch, not api(): a server older than the plan answers 404 for these routes, which must neither flag the LINK as down
-// nor show an error; it returns null and the plan shows its empty state
+// nor be asked again every poll; it returns null and the plan says "this server predates tasks: restart Almanac"
 async function planGet(path) {
-  if (PLAN_FIXTURE) return planFixture(path);
   const res = await fetch(path, { credentials: "same-origin" });
   const doc = await res.json().catch(() => ({}));
   if (res.status === 404 && doc.error === "Not found") return null;
@@ -1828,7 +1826,7 @@ async function loadPlan(rev) {
 function planOwnerState(o) {
   if (!o.owner_name) return "none";
   const p = meshState.peers.find((q) => (o.owner_session ? q.session_id === o.owner_session : q.name === o.owner_name));
-  return !p ? "ended" : p.stalled ? "stalled" : active(p) ? "busy" : "idle";
+  return !p ? "ended" : p.stall ? "stalled" : active(p) ? "busy" : "idle";   // p.stall: {error, text, ts} while stopped
 }
 const statusPill = (s) => el("span", { cls: `flag st-${slug(s)}`, text: s || "–" });
 function ownerChip(o) {
@@ -1839,8 +1837,11 @@ function ownerChip(o) {
 }
 function planLast(l) {
   if (!l) return "";
+  const body = (l.body || "").replace(/\s+/g, " ").trim();
+  // a create or assign row has no body; a "dead" entry whose body already starts "dead:" is not prefixed twice
   const what = l.kind === "status" && l.status_to ? l.status_to
-    : `${["note", "status", "create"].includes(l.kind) ? "" : `${l.kind}: `}${(l.body || "").replace(/\s+/g, " ")}`;
+    : l.kind === "create" ? body || "filed" : l.kind === "assign" ? body || "assigned"
+    : l.kind === "note" || body.toLowerCase().startsWith(`${l.kind}:`) ? body : `${l.kind}: ${body}`;
   return `${l.agent_name} · ${what} · ${age(l.ts)}`;
 }
 
@@ -1955,7 +1956,8 @@ async function loadTask(ref) {
     o.children?.total ? el("span", { cls: "dim", text: ` · accepted ${o.children.accepted}/${o.children.total}` }) : null,
   ].filter((n) => n !== null));
   const logLine = (l) => `${clock(l.ts)} ${l.agent_name} [${l.kind}]`
-    + `${l.status_to ? ` ${l.status_from || "–"} → ${l.status_to}` : ""}${l.owner_to ? ` owner → ${l.owner_to}` : ""}`
+    + `${!l.status_to ? "" : l.kind === "create" ? ` as ${l.status_to}` : ` ${l.status_from || "–"} → ${l.status_to}`}`
+    + `${l.owner_to ? ` owner → ${l.owner_to}` : ""}`
     + `${l.body ? `\n${l.body}` : ""}`;
   const logCls = (k) => (k === "dead" ? "error" : k === "message" ? "peer_out" : k === "status" || k === "assign" ? "tool" : "claude");
   $("mesh-ctx-feed").replaceChildren(
@@ -1966,30 +1968,6 @@ async function loadTask(ref) {
       : [el("li", { cls: "result", text: "no log entries yet" })]),
   );
   $("mesh-ctx-feed").scrollTop = 0;                    // the log is newest first
-}
-
-// ponytail: sample data for ?plan=fixture, so the view can be checked without the backend; drop once it has real rows
-function planFixture(path) {
-  const now = Date.now() / 1000;
-  const t = (id, parent, title, status, owner, files, last, children = { total: 0, accepted: 0 }, ownerState = owner ? "idle" : null) => ({
-    ref: `T-${id}`, id, kind: "task", title, status, squad_id: meshState.squadFilter, parent: parent ? `T-${parent}` : null,
-    owner_name: owner, owner_session: null, owner_state: ownerState, files, created_by_name: "arch-claude",
-    created_ts: now - 3600, updated_ts: now - 60, children, log_count: 2,
-    last_log: last && { ts: now - last[0], agent_name: last[1], kind: last[2], body: last[3], status_to: last[2] === "status" ? last[3] : null } });
-  const objects = [
-    t(1, null, "Stage 1: the plan view", "in progress", "arch-claude", [], [300, "arch-claude", "note", "split into backend and view"], { total: 2, accepted: 1 }),
-    t(2, 1, "S1-backend: objects, object_log, routes", "accepted", "impl-backend", ["almanac/store.py", "almanac/web.py"], [900, "rev-gemini", "status", "accepted"]),
-    t(3, 1, "S1-view: PLAN in MESH <b>stays text</b>", "in review", "impl-plan", ["almanac/static/app.js"], [240, "impl-plan", "status", "in review"]),
-    t(4, null, "Engram export to markdown", "queued", null, [], null),
-    t(5, null, "Old two-part tokens keep parsing", "blocked", "gone-agent", ["almanac/web.py"], [60, "gone-agent", "dead", "three-way split broke them"]),
-    t(6, 5, "Retry after the API error", "in progress", "impl-claude", [], null, undefined, "stalled"),
-  ];
-  if (path.startsWith("/api/mesh/objects")) return { objects, rev: 1 };
-  const o = objects.find((x) => x.ref === new URLSearchParams(path.split("?")[1]).get("ref"));
-  if (!o) throw new Error("unknown ref");
-  return { object: { ...o, body: `Body of ${o.ref}.\n<i>markup</i> stays text.` }, log: [
-    { id: 2, ts: now - 240, agent_name: o.owner_name || "arch-claude", kind: "status", body: "handed in", status_from: "in progress", status_to: o.status },
-    { id: 1, ts: now - 3600, agent_name: "arch-claude", kind: "create", body: "filed" }] };
 }
 
 // ------------------------------------------------------------------ mesh: topology (who talks to whom)
