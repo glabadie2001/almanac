@@ -1698,6 +1698,28 @@ class Store:
             r = self.db.execute(f"select {LOG_COLUMNS} from object_log where id = ?", (lid,)).fetchone()
         return _log(r)
 
+    def reparent_object(self, oid: int, parent_id: int | None, *, who: dict, body: str) -> dict:
+        """Set (or clear, None) an object's parent and write the `parent` log row, in one transaction."""
+        now = time.time()
+        with self.lock:
+            self.db.execute("update objects set parent_id = ?, updated_ts = ? where id = ?", (parent_id, now, oid))
+            lid = self._insert_log(oid, now, who, "parent", body, None, None, None, None)
+            self.db.commit()
+            r = self.db.execute(f"select {LOG_COLUMNS} from object_log where id = ?", (lid,)).fetchone()
+        return _log(r)
+
+    def amend_object(self, oid: int, *, title: str, body: str, files: list[str], who: dict, log_body: str) -> dict:
+        """Replace an object's title, body and files and write the `amend` log row (which holds the old text), in one
+        transaction."""
+        now = time.time()
+        with self.lock:
+            self.db.execute("update objects set title = ?, body = ?, files = ?, updated_ts = ? where id = ?",
+                            (title, body, json.dumps(files), now, oid))
+            lid = self._insert_log(oid, now, who, "amend", log_body, None, None, None, None)
+            self.db.commit()
+            r = self.db.execute(f"select {LOG_COLUMNS} from object_log where id = ?", (lid,)).fetchone()
+        return _log(r)
+
     def object_row(self, oid: int) -> dict | None:
         with self.lock:
             r = self.db.execute(f"select {OBJECT_COLUMNS} from objects where id = ?", (oid,)).fetchone()
@@ -1729,6 +1751,13 @@ class Store:
         with self.lock:
             rows = self.db.execute(f"select {OBJECT_COLUMNS} from objects where {' and '.join(clauses)} order by id",
                                    params).fetchall()
+        return [_object(r) for r in rows]
+
+    def children(self, parent_id: int) -> list[dict]:
+        """An object's direct children wherever they are (backlog or any squad), by id."""
+        with self.lock:
+            rows = self.db.execute(f"select {OBJECT_COLUMNS} from objects where parent_id = ? order by id",
+                                   (parent_id,)).fetchall()
         return [_object(r) for r in rows]
 
     def object_stats(self, ids: list[int]) -> dict:

@@ -30,6 +30,9 @@ POST /api/squad/member       {squad_id, role_id, agent_name?, task?, model?, ...
 POST /api/mesh/object/respawn {ref, model?, effort?}: end a task owner's session and start a fresh one of the same
                              handle and worktree on that task, its log as the kickoff (the operator, or a squadmate
                              whose role may spawn; never on itself)
+POST /api/mesh/object/amend  {ref, title?, body?, files?}: replace a task's title, body and files; the `amend` log
+                             entry keeps the old ones (the operator; a squad's task: a member whose role may spawn;
+                             a backlog task: any agent of its project)
 POST /api/mesh/spawn         {task, name?, role?, ref?}: an agent whose role may_spawn adds one member of the squad's
                              spawn_role (or of `role` when spawn_role is `*`), within spawn_limit (403 or 400 with
                              the reason otherwise). `ref`: put it on an existing queued, unowned task of the squad
@@ -1560,6 +1563,25 @@ def _backlog_data(service, body: dict) -> dict:
     return data
 
 
+def _parent_row(service, ref, squad: str | None, project: str, child: int | None = None) -> dict:
+    """The task `ref` as a parent of a task in `squad` (None: the backlog of `project`): it must be a task of that same
+    squad, or of the same project's backlog. `child`: the task being re-parented, which may not be, or sit under, its
+    own new parent. (PLAN has no depth limit.)"""
+    pid, _ = parse_ref(ref)
+    parent = service.store.object_row(pid)
+    where = f"squad {squad}" if squad else "the backlog of this project"
+    if (parent is None or parent["kind"] != "task" or parent["squad_id"] != squad
+            or (not squad and parent["project"] != project)):
+        raise ValueError(f"parent {ref}: no task of {where}")
+    walk, seen = parent, set()
+    while child is not None and walk is not None and walk["id"] not in seen:
+        if walk["id"] == child:
+            raise ValueError(f"parent {ref}: it is, or sits under, T-{child} itself")
+        seen.add(walk["id"])
+        walk = service.store.object_row(walk["parent_id"]) if walk["parent_id"] else None
+    return parent
+
+
 def file_object(service, agent, caller, body: dict) -> dict:
     """POST /api/mesh/object: file a task; with an owner, that is its assignment. `backlog`: no squad yet, in the
     caller's project (the operator's: `project`, a folder, or the squad named), queued until dispatched."""
@@ -1568,9 +1590,8 @@ def file_object(service, agent, caller, body: dict) -> dict:
         raise ValueError(f"kind {kind}: not yet")
     backlog = _flag(body.get("backlog"))
     if backlog:
-        for key in ("owner", "parent"):
-            if body.get(key):
-                raise ValueError(f"a backlog task has no {key} until it is dispatched")
+        if body.get("owner"):
+            raise ValueError("a backlog task has no owner until it is dispatched")
         if body.get("status") not in (None, "", "queued"):
             raise ValueError("a backlog task is queued until it is dispatched")
     elif any(body.get(k) not in (None, "", []) for k in ("roster", "spawn_role", "spawn_limit")):
@@ -1587,12 +1608,7 @@ def file_object(service, agent, caller, body: dict) -> dict:
     else:
         project, data = (service.store.squad(squad) or {}).get("cwd") or "", None
     files = _files(body.get("files") or [], project)
-    parent_id = None
-    if body.get("parent"):
-        parent_id, _ = parse_ref(body["parent"])
-        parent = service.store.object_row(parent_id)
-        if parent is None or parent["kind"] != "task" or parent["squad_id"] != squad:
-            raise ValueError(f"parent {body['parent']}: no task of squad {squad}")
+    parent_id = _parent_row(service, body["parent"], squad, project)["id"] if body.get("parent") else None
     owner = _owner(service, squad, body["owner"]) if body.get("owner") else None
     status = _status(body["status"]) if body.get("status") else ("in progress" if owner else "queued")
     who = log_identity(agent, caller)
@@ -1605,6 +1621,54 @@ def file_object(service, agent, caller, body: dict) -> dict:
         delivered, mid = _assign(service, row, owner, agent, caller)
         service.store.log_object(row["id"], who=who, kind="assign", owner_name=owner["agent_name"], message_id=mid)
     return dict(object=object_docs(service, [row], body=True)[0], delivered=delivered)
+
+
+def _new_parent(service, row: dict, raw) -> dict | None:
+    """mesh_log(parent=): the new parent of backlog task `row`, None for '' (no parent). Not for a task that is in a
+    squad, nor a parent it already has."""
+    ref = ref_of(row)
+    if row["squad_id"]:
+        raise ValueError(f"{ref} is in squad {row['squad_id']}: only a backlog task changes its parent")
+    if not isinstance(raw, str):
+        raise ValueError("parent must be a ref, or '' to clear it")
+    new = _parent_row(service, raw.strip(), None, row["project"], child=row["id"]) if raw.strip() else None
+    if (new and new["id"]) == row["parent_id"]:
+        raise ValueError(f"{ref} already has " + (f"parent T-{row['parent_id']}" if new else "no parent"))
+    return new
+
+
+def amend_task(service, agent, caller, body: dict) -> dict:
+    """POST /api/mesh/object/amend {ref, title?, body?, files?}: replace a task's title, body and files (the ones sent).
+    The `amend` log entry keeps all three as they were, so nothing is lost. The operator may; for a task in a squad a
+    member of it whose role may spawn (its lead); for a backlog task any agent of its project. The same length and
+    file checks as filing."""
+    row = load_object(service, agent, caller, body.get("ref") or "")
+    ref = ref_of(row)
+    if agent and row["squad_id"]:
+        mine = service.store.role((caller or {}).get("role_id") or "") if (caller or {}).get("role_id") else None
+        if not mine or not mine.get("may_spawn"):
+            raise _refused(403, f"role {(caller or {}).get('role_id') or '(none)'} may not amend a squad's tasks: "
+                                "ask your lead or the operator")
+    if all(body.get(k) is None for k in ("title", "body", "files")):
+        raise ValueError("amend needs a title, a body or files")
+    title, text, files = row["title"], row["body"], row["files"]
+    if body.get("title") is not None:
+        title = _text(body, "title")
+        if not 1 <= len(title) <= TITLE_MAX:
+            raise ValueError(f"title is required, 1 to {TITLE_MAX} characters")
+    if body.get("body") is not None:
+        text = _text(body, "body")
+    if body.get("files") is not None:
+        files = _files(body["files"], row["project"])
+    changed = [k for k, new, old in (("title", title, row["title"]), ("body", text, row["body"]),
+                                     ("files", files, row["files"])) if new != old]
+    if not changed:
+        raise ValueError(f"{ref} already reads that way: nothing to amend")
+    entry = service.store.amend_object(
+        row["id"], title=title, body=text, files=files, who=log_identity(agent, caller),
+        log_body=(f"amended {', '.join(changed)}. Before:\ntitle: {row['title']}\n"
+                  f"files: {', '.join(row['files']) or '(none)'}\nbody:\n{row['body']}"))
+    return dict(object=object_docs(service, [service.store.object_row(row["id"])], body=True)[0], entry=log_doc(entry))
 
 
 def log_to_object(service, agent, caller, body: dict, *, after: list | None = None) -> dict:
@@ -1625,15 +1689,23 @@ def log_to_object(service, agent, caller, body: dict, *, after: list | None = No
         raise _refused(403, f"{ref_of(row)} is in the backlog: only the operator changes its status")
     owner = _owner(service, row["squad_id"], body["owner"]) if body.get("owner") else None
     owner = owner if owner and owner["session_id"] != row["owner_session"] else None
-    if not (text or status or owner):
-        raise ValueError("body is required unless status or owner changes")
+    reparent = body.get("parent") is not None
+    new_parent = _new_parent(service, row, body["parent"]) if reparent else None
+    if not (text or status or owner or reparent):
+        raise ValueError("body is required unless status, owner or parent changes")
     who = log_identity(agent, caller)
-    delivered = mid = None
-    if owner:
-        delivered, mid = _assign(service, dict(row, owner_session=owner["session_id"]), owner, agent, caller)
-    entry = service.store.log_object(
-        row["id"], who=who, kind="assign" if owner else "status" if status else kind, body=text, status=status,
-        owner_session=owner and owner["session_id"], owner_name=owner and owner["agent_name"], message_id=mid)
+    delivered = mid = entry = None
+    if reparent:
+        old = f"T-{row['parent_id']}" if row["parent_id"] else "(none)"
+        entry = service.store.reparent_object(
+            row["id"], new_parent and new_parent["id"], who=who,
+            body=f"parent {old} → {ref_of(new_parent) if new_parent else '(none)'}")
+    if text or status or owner:
+        if owner:
+            delivered, mid = _assign(service, dict(row, owner_session=owner["session_id"]), owner, agent, caller)
+        entry = service.store.log_object(
+            row["id"], who=who, kind="assign" if owner else "status" if status else kind, body=text, status=status,
+            owner_session=owner and owner["session_id"], owner_name=owner and owner["agent_name"], message_id=mid)
     by_creator = (row["created_by"] == who.get("session")) if row["created_by"] else row["created_by_name"] == who["agent_name"]
     if status and not by_creator:
         notice = f"[{ref_of(row)} {row['status']} → {status} by {who['agent_name']}] {row['title']}"
@@ -1807,6 +1879,39 @@ def _compact(service, row: dict, sp: dict, n: int) -> None:
 _DISPATCH_LOCK, _DISPATCHING = threading.Lock(), set()
 
 
+def _move_children(service, row: dict, squad: dict) -> dict:
+    """Under _DISPATCH_LOCK, `row` (a backlog parent) just joined `squad`: bring its queued backlog children (and theirs,
+    the same way) into the squad too, queued and unowned as they are. A child that is not queued, is being
+    dispatched, is already in a squad or is of another project stays where it is. {moved: [ref], left: [{ref, why}]};
+    each moved child's log says so, and the parent's log says which."""
+    moved, left, stack = [], [], [row["id"]]
+    while stack:
+        for kid in service.store.children(stack.pop()):
+            kref = ref_of(kid)
+            if kid["squad_id"]:
+                why = f"already in squad {kid['squad_id']}"
+            elif kid["id"] in _DISPATCHING:
+                why = "being dispatched"
+            elif kid["project"] != row["project"]:
+                why = "another project"
+            elif kid["status"] != "queued":
+                why = kid["status"]
+            else:
+                service.store.log_object(
+                    kid["id"], who=dict(agent_name="operator"), kind="assign", squad_id=squad["id"],
+                    body=f"moved from the backlog into squad {squad['name']} ({squad['id']}) with its parent "
+                         f"T-{kid['parent_id']} by operator")
+                moved.append(kref)
+                stack.append(kid["id"])
+                continue
+            left.append(dict(ref=kref, why=why))
+    if moved or left:
+        service.store.log_object(row["id"], who=HUB, kind="note", body=(
+            ("its slices moved with it: " + ", ".join(moved) if moved else "no slice moved with it")
+            + ("; left where they are: " + ", ".join(f"{x['ref']} ({x['why']})" for x in left) if left else "")))
+    return dict(moved=moved, left=left)
+
+
 def dispatch_task(service, ref, *, almanac_url: str, token: str) -> dict:
     """POST /api/squads/dispatch (the operator's): launch a squad on a backlog task. It is the lead's task, so no
     second T is filed; it joins the squad only once the lead has started. A failed launch leaves it as it was."""
@@ -1838,6 +1943,9 @@ def dispatch_task(service, ref, *, almanac_url: str, token: str) -> dict:
             _DISPATCHING.discard(row["id"])
     after = service.store.object_row(row["id"])
     res["dispatched"] = after["squad_id"] == res["squad"]["id"]
+    if res["dispatched"]:
+        with _DISPATCH_LOCK:             # its queued slices go where it went
+            res["children"] = _move_children(service, after, res["squad"])
     res["object"] = object_docs(service, [after], body=True)[0]
     return res
 
@@ -1865,17 +1973,20 @@ def assign_task(service, ref, squad_id) -> dict:
             raise _refused(409, f"squad {squad['id']} works in {squad['cwd']}, not in {ref}'s project {row['project']}")
         service.store.log_object(row["id"], who=dict(agent_name="operator"), kind="assign", squad_id=squad["id"],
                                  body=f"moved from the backlog into squad {squad['name']} ({squad['id']}) by operator")
+        children = _move_children(service, row, squad)
     lead = next((a for a in squad["agents"] if not a["spawned_by"]), None)        # oldest first: launched first
     live = {p.get("session_id") for p in service.mesh_peers(squad_id=squad["id"])}
     found = lead and service.store.spawned(squad_id=squad["id"], agent_name=lead["agent_name"], limit=1)
     lead = found[0] if found else lead                                             # its newest session; the move is done: never refuse now
-    out = dict(ok=True, ref=ref, squad_id=squad["id"], lead=lead and lead["agent_name"], lead_live=False, delivered=False)
+    out = dict(ok=True, ref=ref, squad_id=squad["id"], lead=lead and lead["agent_name"], lead_live=False, delivered=False,
+               children=children)
     if lead and lead["session_id"] in live:
+        with_it = f"\n\nIts slices moved with it, queued and unowned too: {', '.join(children['moved'])}." if children["moved"] else ""
         out["delivered"], _ = _hub_tell(
             service, to_name=lead["agent_name"], to_session=lead["session_id"], agent=None, caller=None, squad=squad["id"],
             text=(f"[{ref} moved from the backlog into your squad by the operator] {row['title']}\n\nIt is queued and "
                   f"unowned. Put a fresh member on it with mesh_spawn(ref=\"{ref}\", ...), or hand it to a live member "
-                  f"with mesh_log(ref=\"{ref}\", owner=...)."))
+                  f"with mesh_log(ref=\"{ref}\", owner=...)." + with_it))
     out["lead_live"] = out["delivered"]
     if not out["delivered"]:
         out["note"] = (f"{ref} joined squad {squad['id']}, but its lead {out['lead'] or '(none)'} is not live: nobody was "
@@ -2290,6 +2401,9 @@ def make_handler(service, token, *, hosts=()):
                 for step in after:
                     step()
                 return None
+            if method == "POST" and path == "/api/mesh/object/amend":
+                return self._send(200, amend_task(service, self.agent, service.caller(self.agent, self.agent_session),
+                                                  self._body()))
             if method == "POST" and path == "/api/mesh/object/respawn":
                 body = self._body()
                 port = getattr(self.server, "server_port", 8812)

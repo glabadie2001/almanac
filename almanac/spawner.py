@@ -185,10 +185,12 @@ def build_mesh_charter(
         "`mesh_log(ref, status=\"in review\", body=<files touched, test command and result, what is left>)`. As you go, "
         "`mesh_log` what you learned (`kind=\"learned\"`), dead ends (`kind=\"dead\"`, or `kind=\"parked\"` with "
         "\"retry when ...\") and what comes next (`kind=\"next\"`). Reply about a task with `mesh_send(..., re=\"T-12\")`. "
+        "Change a task's title, body or files with `mesh_amend(ref, ...)` (the log keeps the old text); a backlog task can sit "
+        "under another with `parent` on `mesh_file` or `mesh_log`. "
         "Work for later, outside this squad's mission, goes in the project backlog with `mesh_file(backlog=true, ...)` "
         "(`mesh_objects(backlog=true)` lists it); the operator dispatches a squad on it, or assigns it to a running "
         "squad, whose lead then puts a fresh member on it with `mesh_spawn(ref=\"T-n\")`.",
-        f"6. **Shell CLI Fallback**: You can also run `\"{python_exe}\" -P -m almanac.mcp_mesh --self {agent_name} --cli <roster|context|contacts|send|wait|spawn|respawn|objects|object|file|log|restart> ...` (with `PYTHONPATH=\"{REPO_ROOT}\"`; your own token and Almanac's address come from the environment).",
+        f"6. **Shell CLI Fallback**: You can also run `\"{python_exe}\" -P -m almanac.mcp_mesh --self {agent_name} --cli <roster|context|contacts|send|wait|spawn|respawn|objects|object|file|log|amend|restart> ...` (with `PYTHONPATH=\"{REPO_ROOT}\"`; your own token and Almanac's address come from the environment).",
         "7. **Operator**: `mesh_send(to=\"operator\", ...)` reaches the human running this squad; use it for decisions only they can make and for the final report; `needs=\"blocking\"` raises an alert on their screen, so use it only when the squad cannot proceed."
         if may_page_operator else
         "7. **Operator**: your role does not page the operator; route through a teammate whose role does. You may always answer a message the operator sends you.",
