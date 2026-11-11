@@ -157,7 +157,13 @@ def build_mesh_charter(
         "4. **Communicate (`uds-messaging`)**: Call `mesh_send(to=\"<peer_name>|@squad|#channel\", message=\"...\")` (or Claude's native `SendMessage(to=\"<peer_name>\", ...)`). In Antigravity/Gemini, if `almanac-mesh` is lazy-loaded, call via `call_mcp_tool(ServerName=\"almanac-mesh_almanac-mesh\", ToolName=\"mesh_send\", Arguments={...})`. Inbound peer messages arrive wrapped in `<cross-session-message from-name=\"...\">`. "
         "When you need an answer, add `needs=\"reply\"` (wanted, not urgent) or `needs=\"blocking\"` (you cannot continue without it); the message arrives with a `[needs: ...]` line and stays open until its recipient replies to the sender directly. Answer any flagged message you receive with a direct `mesh_send` to its sender.",
         "5. **Wait When Blocked**: Call `mesh_wait(timeout_seconds=120)` when waiting on a teammate's reply or review.",
-        f"6. **Shell CLI Fallback**: You can also run `\"{python_exe}\" -P -m almanac.mcp_mesh --self {agent_name} --cli <roster|context|contacts|send|wait|spawn> ...` (with `PYTHONPATH=\"{REPO_ROOT}\"`; your own token and Almanac's address come from the environment).",
+        "5a. **Tasks are objects** with refs like `T-12`; `mesh_objects()` lists your squad's plan and `mesh_object(ref)` "
+        "reads one with its log. Architects file each slice with `mesh_file(kind=\"task\", title=..., body=..., owner=..., "
+        "files=[...])` instead of describing it in a message: filing with an owner is the assignment. Owners hand in with "
+        "`mesh_log(ref, status=\"in review\", body=<files touched, test command and result, what is left>)`. As you go, "
+        "`mesh_log` what you learned (`kind=\"learned\"`), dead ends (`kind=\"dead\"`, or `kind=\"parked\"` with "
+        "\"retry when ...\") and what comes next (`kind=\"next\"`). Reply about a task with `mesh_send(..., re=\"T-12\")`.",
+        f"6. **Shell CLI Fallback**: You can also run `\"{python_exe}\" -P -m almanac.mcp_mesh --self {agent_name} --cli <roster|context|contacts|send|wait|spawn|objects|object|file|log> ...` (with `PYTHONPATH=\"{REPO_ROOT}\"`; your own token and Almanac's address come from the environment).",
         "7. **Operator**: `mesh_send(to=\"operator\", ...)` reaches the human running this squad; use it for decisions only they can make and for the final report; `needs=\"blocking\"` raises an alert on their screen, so use it only when the squad cannot proceed."
         if may_page_operator else
         "7. **Operator**: your role does not page the operator; route through a teammate whose role does. You may always answer a message the operator sends you.",
@@ -734,11 +740,12 @@ def launch_squad(
     launched_agents: list[dict] = []
     for p in prepared:
         spec = p["spec"]
+        task_row = file_spawn_task(service, squad_id, p["task"], spec.get("files"))
         kickoff_parts = []
         if brief and brief.strip():
             kickoff_parts.append(f"## Squad Mission ({name or squad_slug})\n{brief.strip()}")
         if p["task"]:
-            kickoff_parts.append(f"## Your Initial Assignment (`{p['agent_name']}`)\n{p['task']}")
+            kickoff_parts.append(f"## Your Initial Assignment (`{_ref(task_row, p['agent_name'])}`)\n{p['task']}")
         if kickoff_parts:
             kickoff_parts.append(
                 "Coordinate with your squadmates via `mesh_send`, check `mesh_roster` and `mesh_context_stream` "
@@ -772,6 +779,7 @@ def launch_squad(
             # one member that cannot start (a worktree git refuses, a bad role) must not orphan the ones already running
             res = dict(ok=False, pid=None, agent_name=p["agent_name"], session_id=None, provider=p["provider"],
                        role_id=p["role_id"], error=str(exc))
+        own_spawn_task(service, task_row, res)
         launched_agents.append(res)
 
     if brief and brief.strip():
@@ -791,6 +799,36 @@ def launch_squad(
         launched=ok_count,
         failed=len(launched_agents) - ok_count,
     )
+
+
+def file_spawn_task(service, squad_id: str, task: str, files=None, *, by: str | None = None,
+                    by_session: str | None = None) -> dict | None:
+    """A spawn's task as a T, filed before the spawn (the session is minted inside it), unowned and queued, so a spawn
+    that fails leaves it honestly unassigned. Title: the task's first line, cut at 120. None without a task."""
+    from almanac.door import TITLE_MAX, _files
+    task = str(task or "").strip()
+    if not task or not hasattr(service.store, "create_object"):
+        return None
+    project = (service.store.squad(squad_id) or {}).get("cwd") or ""
+    who = dict(session=by_session, agent_name=by or "operator")
+    return service.store.create_object(
+        kind="task", project=project, squad_id=squad_id, title=task.splitlines()[0].strip()[:TITLE_MAX], body=task,
+        status="queued", owner_session=None, parent_id=None, files=_files(files or [], project),
+        created_by=by_session, created_by_name=who["agent_name"], who=who)
+
+
+def own_spawn_task(service, task_row: dict | None, res: dict, *, by: str | None = None,
+                   by_session: str | None = None) -> None:
+    """After a successful spawn its T belongs to the new session and is in progress. No assignment message: the
+    kickoff already carries the task, and a second prompt right after it would restart the newcomer's turn."""
+    if task_row and res.get("ok") and res.get("session_id"):
+        service.store.log_object(task_row["id"], who=dict(session=by_session, agent_name=by or "operator"),
+                                 kind="assign", status="in progress", owner_session=res["session_id"],
+                                 owner_name=res.get("agent_name"))
+
+
+def _ref(task_row: dict | None, fallback: str) -> str:
+    return f"T-{task_row['id']}" if task_row else fallback
 
 
 # ---------------------------------------------------------------------- elastic squads: adding a member to a running squad
@@ -835,6 +873,8 @@ def join_squad(
     task: str,
     agent_name: str | None = None,
     spawned_by: str | None = None,
+    spawned_by_session: str | None = None,
+    files=None,
     watch: float = 0.6,
     **operator_overrides,
 ) -> dict:
@@ -882,10 +922,11 @@ def join_squad(
         relays = sorted({p["name"] for p in service.mesh_peers(squad_id=squad_id) if p.get("agent_role") in pagers})
         report_to = (" or ".join(f"`{r}`" for r in relays) if relays
                      else "`#squad` (`mesh_send(to=\"#squad\")`), since nobody live in the squad may page the operator")
+    task_row = file_spawn_task(service, squad_id, task, files, by=spawned_by, by_session=spawned_by_session)
     kickoff = []
     if (squad.get("brief") or "").strip():
         kickoff.append(f"## Squad Mission ({squad['name']})\n{squad['brief'].strip()}")
-    kickoff.append(f"## Your Initial Assignment (`{name}`)\n{task or '(none given: ask whoever added you)'}")
+    kickoff.append(f"## Your Initial Assignment (`{_ref(task_row, name)}`)\n{task or '(none given: ask whoever added you)'}")
     kickoff.append(f"You were added to the running squad by {who}. Report to {report_to} over `mesh_send` when your slice "
                    "is done: files touched, the test command and its result, anything you could not do.")
     wmode = (operator_overrides.get("workspace_mode") or role.get("workspace_mode") or "shared").strip().lower()
@@ -913,6 +954,7 @@ def join_squad(
         watch=watch,
         spawned_by=spawned_by,
     )
+    own_spawn_task(service, task_row, res, by=spawned_by, by_session=spawned_by_session)
     if res.get("ok"):
         try:
             # not to the newcomer: it would arrive as a second prompt right after its kickoff and restart its turn

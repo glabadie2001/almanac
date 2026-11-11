@@ -10,6 +10,10 @@ CLI mode (usable from any agent shell or script):
     python -m almanac.mcp_mesh --cli contacts [--peer <name>] [--channel <#chan>]
     python -m almanac.mcp_mesh --cli send <to> <message...> [--channel <#chan>]
     python -m almanac.mcp_mesh --cli wait [--timeout 120]
+    python -m almanac.mcp_mesh --cli objects [--status <s,..>] [--owner <name|none>] [--q <text>]
+    python -m almanac.mcp_mesh --cli object <ref> [--log-limit 20]
+    python -m almanac.mcp_mesh --cli file <title> [--body <text>] [--files <path> ...] [--owner <name>] [--parent <ref>]
+    python -m almanac.mcp_mesh --cli log <ref> [<body...>] [--kind <k>] [--status <s>] [--owner <name>]
 """
 from __future__ import annotations
 
@@ -128,6 +132,10 @@ MCP_TOOLS = [
                         "you a direct message. Omit for an ordinary message."
                     ),
                 },
+                "re": {
+                    "type": "string",
+                    "description": "The task this message is about (e.g. 'T-12'): it is logged on that task.",
+                },
             },
             "required": ["to", "message"],
         },
@@ -182,6 +190,78 @@ MCP_TOOLS = [
                     "description": "Optional message cursor ID; defaults to this session's last seen message ID.",
                 },
             },
+        },
+    },
+    {
+        "name": "mesh_objects",
+        "description": (
+            "List your squad's tasks (the plan) in tree order: parents before their parts. Each row has its ref "
+            "(T-12), title, status, owner and the last log line."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "description": "Comma list: queued, in progress, in review, accepted, blocked."},
+                "owner": {"type": "string", "description": "A handle, or 'none' for unowned tasks."},
+                "q": {"type": "string", "description": "Text to find in titles and bodies."},
+                "kind": {"type": "string", "description": "Object kind (stage 1: task)."},
+                "limit": {"type": "integer", "description": "Max rows (default 200, max 500)."},
+                "squad": {"type": "string", "description": "The operator's: which squad. Agents always read their own."},
+            },
+        },
+    },
+    {
+        "name": "mesh_object",
+        "description": "Read one task by ref (T-12): body, files, owner, status and its log, newest first.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "The ref, e.g. 'T-12' (or the bare id)."},
+                "log_limit": {"type": "integer", "description": "Log entries to return (default 20, max 500)."},
+            },
+            "required": ["ref"],
+        },
+    },
+    {
+        "name": "mesh_file",
+        "description": (
+            "File a task in your squad. Filing it with an owner is the assignment: the owner gets one message with "
+            "the task. Use `parent` to make it part of another task."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ["task"], "description": "Stage 1 files tasks only."},
+                "title": {"type": "string", "description": "One line, at most 120 characters."},
+                "body": {"type": "string", "description": "What to do, at most 8,000 characters."},
+                "files": {"type": "array", "items": {"type": "string"},
+                          "description": "Repo-relative paths or globs the task may touch (at most 50)."},
+                "owner": {"type": "string", "description": "The squad member's handle who owns it."},
+                "parent": {"type": "string", "description": "Ref of the task this is a part of."},
+                "status": {"type": "string", "enum": ["queued", "in progress", "in review", "accepted", "blocked"],
+                           "description": "Default: in progress with an owner, queued without."},
+            },
+            "required": ["kind", "title", "body"],
+        },
+    },
+    {
+        "name": "mesh_log",
+        "description": (
+            "Append to a task's log, optionally changing its status or owner. Hand in with status='in review' and a "
+            "body naming files touched, the test command and result, and what is left. A status change tells the "
+            "task's creator; a new owner gets the assignment message."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "The task's ref, e.g. 'T-12'."},
+                "body": {"type": "string", "description": "The entry. Required unless status or owner changes."},
+                "kind": {"type": "string", "enum": ["note", "learned", "dead", "parked", "next"],
+                         "description": "note (default), learned, dead (a dead end), parked ('retry when ...'), next."},
+                "status": {"type": "string", "enum": ["queued", "in progress", "in review", "accepted", "blocked"]},
+                "owner": {"type": "string", "description": "Hand the task to this squad member."},
+            },
+            "required": ["ref"],
         },
     },
 ]
@@ -303,7 +383,27 @@ class MeshClient:
                 "squad_id": args.get("squad_id") or self.squad_id,
                 "needs": args.get("needs") or None,
             }
+            if args.get("re"):
+                payload["re"] = str(args["re"])
             return self._api("/api/mesh/send", method="POST", body=payload)
+        if name == "mesh_objects":
+            params = {k: args[k] for k in ("status", "owner", "q", "kind", "limit") if args.get(k)}
+            if args.get("squad") or self.squad_id:
+                params["squad"] = args.get("squad") or self.squad_id
+            return self._api(f"/api/mesh/objects?{urllib.parse.urlencode(params)}")
+        if name == "mesh_object":
+            ref = str(args.get("ref") or "").strip()
+            if not ref:
+                raise ValueError("ref is required")
+            return self._api(f"/api/mesh/object?{urllib.parse.urlencode({'ref': ref, 'log_limit': int(args.get('log_limit') or 20)})}")
+        if name == "mesh_file":
+            payload = {k: args[k] for k in ("kind", "title", "body", "files", "owner", "parent", "status") if args.get(k)}
+            if self.squad_id:
+                payload["squad"] = self.squad_id
+            return self._api("/api/mesh/object", method="POST", body=payload)
+        if name == "mesh_log":
+            payload = {k: args[k] for k in ("ref", "body", "kind", "status", "owner") if args.get(k)}
+            return self._api("/api/mesh/object/log", method="POST", body=payload)
         if name == "mesh_spawn":
             task = str(args.get("task") or "").strip()
             if not task:
@@ -416,11 +516,37 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
     p_send.add_argument("--channel")
     p_send.add_argument("--from", dest="from_name")
     p_send.add_argument("--needs", choices=("reply", "blocking"))
+    p_send.add_argument("--re")
 
     p_spawn = sp.add_parser("spawn")
     p_spawn.add_argument("task", nargs="+")
     p_spawn.add_argument("--name")
     p_spawn.add_argument("--role")
+
+    p_objs = sp.add_parser("objects")
+    for flag in ("--status", "--owner", "--q", "--kind", "--squad"):
+        p_objs.add_argument(flag)
+    p_objs.add_argument("--limit", type=int)
+
+    p_obj = sp.add_parser("object")
+    p_obj.add_argument("ref")
+    p_obj.add_argument("--log-limit", type=int, default=20)
+
+    p_file = sp.add_parser("file")
+    p_file.add_argument("title")
+    p_file.add_argument("--body", default="")
+    p_file.add_argument("--files", nargs="*")
+    p_file.add_argument("--owner")
+    p_file.add_argument("--parent")
+    p_file.add_argument("--status")
+    p_file.add_argument("--kind", default="task")
+
+    p_log = sp.add_parser("log")
+    p_log.add_argument("ref")
+    p_log.add_argument("body", nargs="*")
+    p_log.add_argument("--kind")
+    p_log.add_argument("--status")
+    p_log.add_argument("--owner")
 
     p_wait = sp.add_parser("wait")
     p_wait.add_argument("--timeout", type=float, default=120.0)
@@ -444,8 +570,18 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
         res = client.call_tool(
             "mesh_send",
             {"to": ns.to, "message": " ".join(ns.message), "channel": ns.channel, "from_name": ns.from_name,
-             "needs": ns.needs},
+             "needs": ns.needs, "re": ns.re},
         )
+    elif ns.cmd == "objects":
+        res = client.call_tool("mesh_objects", {k: getattr(ns, k) for k in ("status", "owner", "q", "kind", "squad", "limit")})
+    elif ns.cmd == "object":
+        res = client.call_tool("mesh_object", {"ref": ns.ref, "log_limit": ns.log_limit})
+    elif ns.cmd == "file":
+        res = client.call_tool("mesh_file", {"kind": ns.kind, "title": ns.title, "body": ns.body, "files": ns.files,
+                                             "owner": ns.owner, "parent": ns.parent, "status": ns.status})
+    elif ns.cmd == "log":
+        res = client.call_tool("mesh_log", {"ref": ns.ref, "body": " ".join(ns.body), "kind": ns.kind,
+                                            "status": ns.status, "owner": ns.owner})
     else:
         res = client.call_tool("mesh_wait", {"timeout_seconds": ns.timeout, "channel": ns.channel, "since_id": ns.since_id})
     print(json.dumps(res, indent=2))
