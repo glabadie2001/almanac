@@ -1306,8 +1306,19 @@ def load_object(service, agent, caller, ref, *, bad_ref=404) -> dict:
     if row is None or (kind and row["kind"] != kind):
         raise _refused(bad_ref, f"no object {ref}")
     if agent and row["squad_id"] != (caller or {}).get("squad_id"):
-        raise _refused(403 if bad_ref == 404 else bad_ref, f"{ref} belongs to another squad")
+        # a backlog task (no squad yet) is any squad's of the same project to read and log to
+        if row["squad_id"] or not caller or row["project"] != caller_project(service, caller):
+            raise _refused(403 if bad_ref == 404 else bad_ref, f"{ref} belongs to another squad")
     return row
+
+
+def caller_project(service, caller: dict) -> str:
+    """The project a squad works in: the checkout root of its folder."""
+    from almanac.spawner import project_root
+    squad = service.store.squad(caller.get("squad_id") or "") or {}
+    if not squad.get("cwd"):
+        raise _refused(403, "not in a squad")
+    return project_root(squad["cwd"])
 
 
 def log_identity(agent, caller) -> dict:
@@ -1337,6 +1348,7 @@ def object_docs(service, rows: list[dict], *, body: bool = False) -> list[dict]:
                    owner_name=names.get(sid), owner_session=sid,
                    owner_state=(states.get(sid, "ended") if sid else None), files=r["files"],
                    created_by_name=r["created_by_name"], created_ts=r["created_ts"], updated_ts=r["updated_ts"],
+                   project=r["project"], data=r["data"],
                    children=dict(total=st["children"][0], accepted=st["children"][1]), log_count=st["log_count"],
                    last_log=last and dict(ts=last["ts"], agent_name=last["agent_name"], kind=last["kind"],
                                           body=last["body"][:200], status_to=last["status_to"]))
@@ -1365,14 +1377,26 @@ def tree_order(rows: list[dict]) -> list[dict]:
 
 
 def list_objects(service, agent, caller, query: dict) -> dict:
+    """A squad's tasks, or with `backlog=1` the backlog: an agent's own project's, the operator's of `project`
+    (a folder) or of every project."""
     from almanac.store import TASK_STATUSES
-    squad = object_squad(service, agent, caller, query.get("squad"))
+    project = None
+    if _flag(query.get("backlog")):
+        squad = None
+        if agent:
+            if not caller:
+                raise _refused(403, f"{agent} is not in a squad")
+            project = caller_project(service, caller)
+        elif query.get("project"):
+            project = _project(query["project"])
+    else:
+        squad = object_squad(service, agent, caller, query.get("squad"))
     statuses = [x.strip() for x in (query.get("status") or "").split(",") if x.strip()]
     bad = [x for x in statuses if x not in TASK_STATUSES]
     if bad:
         raise ValueError(f"status {bad[0]!r}: one of {', '.join(TASK_STATUSES)}")
     limit = max(1, min(500, int(query.get("limit", "200"))))
-    rows = service.store.objects(squad_id=squad, kind=query.get("kind") or None, statuses=statuses,
+    rows = service.store.objects(squad_id=squad, kind=query.get("kind") or None, statuses=statuses, project=project,
                                  owner=(query.get("owner") or "").strip() or None, q=query.get("q") or None)
     return dict(objects=object_docs(service, tree_order(rows)[:limit]), rev=service.store.objects_rev())
 
@@ -1461,17 +1485,77 @@ def _assign(service, row: dict, owner: dict, agent, caller) -> tuple[bool | None
                      caller=caller, squad=row["squad_id"])
 
 
+def _flag(value) -> bool:
+    return value is True or str(value or "").strip().lower() in ("1", "true", "yes")
+
+
+def _project(folder) -> str:
+    from almanac.spawner import project_root
+    if not isinstance(folder, str) or not folder.strip() or not Path(folder).expanduser().is_dir():
+        raise ValueError(f"project: no folder {folder!r}")
+    return project_root(folder)
+
+
+DEFAULT_ROSTER = ({"role": "orchestrator-claude"}, {"role": "reviewer-gemini"})   # a dispatch's squad when none is set
+DEFAULT_SPAWN = ("*", 5)                                                           # and what its lead may add
+
+
+def _roster(service, raw) -> list[dict]:
+    """A backlog task's squad: [{role, name?}], lead first; each role must exist. A bare string is a role."""
+    if not isinstance(raw, list) or not 1 <= len(raw) <= 20:
+        raise ValueError("roster: a list of 1 to 20 members, {role, name?}, lead first")
+    out = []
+    for m in raw:
+        m = {"role": m} if isinstance(m, str) else m
+        if not isinstance(m, dict) or not isinstance(m.get("role"), str):
+            raise ValueError("roster: each member is {role, name?}")
+        role, name = m["role"].strip(), m.get("name")
+        if service.store.role(role) is None:
+            raise ValueError(f"roster: no role {role!r}")
+        if name is not None and (not isinstance(name, str) or not 0 < len(name.strip()) <= 40):
+            raise ValueError("roster: a name is 1 to 40 characters")
+        out.append(dict(role=role, **({"name": name.strip()} if name else {})))
+    return out
+
+
+def _backlog_data(service, body: dict) -> dict:
+    """The squad a backlog task will dispatch: `roster`, `spawn_role`, `spawn_limit`, each checked now."""
+    data = {}
+    if body.get("roster") is not None:
+        data["roster"] = _roster(service, body["roster"])
+    if body.get("spawn_role"):
+        data["spawn_role"] = service.store._spawn_settings(body["spawn_role"], 0)[0]
+    if body.get("spawn_limit") not in (None, ""):
+        data["spawn_limit"] = service.store._spawn_settings(None, body["spawn_limit"])[1]
+    return data
+
+
 def file_object(service, agent, caller, body: dict) -> dict:
-    """POST /api/mesh/object: file a task; with an owner, that is its assignment."""
+    """POST /api/mesh/object: file a task; with an owner, that is its assignment. `backlog`: no squad yet, in the
+    caller's project (the operator's: `project`, a folder, or the squad named), queued until dispatched."""
     kind = str(body.get("kind") or "task").strip()
     if kind != "task":
         raise ValueError(f"kind {kind}: not yet")
-    squad = object_squad(service, agent, caller, body.get("squad"))
+    backlog = _flag(body.get("backlog"))
+    if backlog:
+        for key in ("owner", "parent"):
+            if body.get(key):
+                raise ValueError(f"a backlog task has no {key} until it is dispatched")
+        if body.get("status") not in (None, "", "queued"):
+            raise ValueError("a backlog task is queued until it is dispatched")
+    elif any(body.get(k) not in (None, "", []) for k in ("roster", "spawn_role", "spawn_limit")):
+        raise ValueError("roster, spawn_role and spawn_limit are for a backlog task")
+    by_folder = backlog and not agent and body.get("project")
+    squad = None if by_folder else object_squad(service, agent, caller, body.get("squad"))
     title = _text(body, "title")
     if not 1 <= len(title) <= TITLE_MAX:
         raise ValueError(f"title is required, 1 to {TITLE_MAX} characters")
     text = _text(body, "body")
-    project = (service.store.squad(squad) or {}).get("cwd") or ""
+    if backlog:
+        project = _project(body["project"]) if by_folder else caller_project(service, dict(squad_id=squad))
+        data, squad = _backlog_data(service, body), None
+    else:
+        project, data = (service.store.squad(squad) or {}).get("cwd") or "", None
     files = _files(body.get("files") or [], project)
     parent_id = None
     if body.get("parent"):
@@ -1485,7 +1569,7 @@ def file_object(service, agent, caller, body: dict) -> dict:
     row = service.store.create_object(
         kind=kind, project=project, squad_id=squad, title=title, body=text, status=status,
         owner_session=owner and owner["session_id"], parent_id=parent_id, files=files,
-        created_by=who.get("session"), created_by_name=who["agent_name"], who=who)
+        created_by=who.get("session"), created_by_name=who["agent_name"], who=who, data=data)
     delivered = None
     if owner:
         delivered, mid = _assign(service, row, owner, agent, caller)
@@ -1503,6 +1587,8 @@ def log_to_object(service, agent, caller, body: dict) -> dict:
     text = _text(body, "body")
     status = _status(body["status"]) if body.get("status") else None
     status = status if status != row["status"] else None
+    if body.get("owner") and not row["squad_id"]:
+        raise ValueError(f"{ref_of(row)} is in the backlog: it has no owner until it is dispatched")
     owner = _owner(service, row["squad_id"], body["owner"]) if body.get("owner") else None
     owner = owner if owner and owner["session_id"] != row["owner_session"] else None
     if not (text or status or owner):
@@ -1521,6 +1607,42 @@ def log_to_object(service, agent, caller, body: dict) -> dict:
                   text=notice + (f"\n\n{text}" if text else ""), agent=agent, caller=caller, squad=row["squad_id"])
     return dict(object=object_docs(service, [service.store.object_row(row["id"])], body=True)[0],
                 entry=log_doc(entry), delivered=delivered)
+
+
+_DISPATCH_LOCK, _DISPATCHING = threading.Lock(), set()
+
+
+def dispatch_task(service, ref, *, almanac_url: str, token: str) -> dict:
+    """POST /api/squads/dispatch (the operator's): launch a squad on a backlog task. It is the lead's task, so no
+    second T is filed; it joins the squad only once the lead has started. A failed launch leaves it as it was."""
+    from almanac import spawner
+    row = load_object(service, None, None, ref)
+    ref = ref_of(row)
+    data = row["data"]
+    roster = _roster(service, data.get("roster") or list(DEFAULT_ROSTER))   # checked again: a role may have gone
+    spawn_role, spawn_limit = service.store._spawn_settings(data.get("spawn_role") or DEFAULT_SPAWN[0],
+                                                            data.get("spawn_limit", DEFAULT_SPAWN[1]))
+    members = [dict(role_id=m["role"], **({"agent_name": m["name"]} if m.get("name") else {})) for m in roster]
+    members[0].update(files=row["files"], task=(
+        f"{row['title']}\n\nYou lead this squad on backlog task {ref}: the mission above is its body. Plan it, file "
+        f"each slice with mesh_file, and hand in with mesh_log(ref=\"{ref}\", status=\"in review\")."))
+    with _DISPATCH_LOCK:                 # a double click launches one squad
+        current = service.store.object_row(row["id"])
+        if current["squad_id"] or row["id"] in _DISPATCHING:
+            raise _refused(409, f"{ref} is already dispatched"
+                           + (f" to squad {current['squad_id']}" if current["squad_id"] else ""))
+        _DISPATCHING.add(row["id"])
+    try:
+        res = spawner.launch_squad(service, almanac_url=almanac_url, token=token, name=row["title"],
+                                   cwd=row["project"], brief=f"{row['title']}\n\n{row['body']}".strip(),
+                                   members=members, spawn_role=spawn_role, spawn_limit=spawn_limit, lead_task=row)
+    finally:
+        with _DISPATCH_LOCK:
+            _DISPATCHING.discard(row["id"])
+    after = service.store.object_row(row["id"])
+    res["dispatched"] = after["squad_id"] == res["squad"]["id"]
+    res["object"] = object_docs(service, [after], body=True)[0]
+    return res
 
 
 def make_handler(service, token, *, hosts=()):
@@ -1879,6 +2001,17 @@ def make_handler(service, token, *, hosts=()):
                     self._who(),
                 )
                 return self._send(200 if res.get("ok") else 409, res)
+            if method == "POST" and path == "/api/squads/dispatch":     # not under /api/mesh: no agent token opens it
+                port = getattr(self.server, "server_port", 8812)
+                res = dispatch_task(service, self._body().get("ref") or "", almanac_url=f"http://127.0.0.1:{port}",
+                                    token=token)
+                service.store.log_action(
+                    "squad", 0, dict(name=res["squad"]["name"], ref=res["object"]["ref"]), res["dispatched"],
+                    f"dispatched {res['object']['ref']}: launched {res['launched']} agent(s) in {res['squad']['cwd']}"
+                    + "".join(f"; {a.get('agent_name')} failed: {a.get('error')}"
+                              for a in res["squad"]["agents"] if not a.get("ok")),
+                    self._who())
+                return self._send(200 if res["dispatched"] else 409, res)
             if method == "POST" and path == "/api/squads":
                 from almanac import spawner
                 body = self._body()

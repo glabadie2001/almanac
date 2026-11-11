@@ -216,6 +216,8 @@ MCP_TOOLS = [
                 "kind": {"type": "string", "description": "Object kind (stage 1: task)."},
                 "limit": {"type": "integer", "description": "Max rows (default 200, max 500)."},
                 "squad": {"type": "string", "description": "The operator's: which squad. Agents always read their own."},
+                "backlog": {"type": "boolean",
+                            "description": "List the project's backlog instead: tasks no squad has taken yet."},
             },
         },
     },
@@ -249,6 +251,16 @@ MCP_TOOLS = [
                 "parent": {"type": "string", "description": "Ref of the task this is a part of."},
                 "status": {"type": "string", "enum": ["queued", "in progress", "in review", "accepted", "blocked"],
                            "description": "Default: in progress with an owner, queued without."},
+                "backlog": {"type": "boolean", "description": (
+                    "File follow-up work in the project's backlog instead of your squad: no owner, no parent, queued "
+                    "until the operator dispatches a squad on it.")},
+                "roster": {"type": "array", "description": "Backlog only: the squad to dispatch, lead first.",
+                           "items": {"type": "object", "properties": {"role": {"type": "string"},
+                                                                      "name": {"type": "string"}},
+                                     "required": ["role"]}},
+                "spawn_role": {"type": "string",
+                               "description": "Backlog only: the role (or '*') that squad's lead may add."},
+                "spawn_limit": {"type": "integer", "description": "Backlog only: how many members it may add (0-20)."},
             },
             "required": ["title"],
         },
@@ -439,6 +451,8 @@ class MeshClient:
             return self._api("/api/mesh/restart", method="POST", body={}, timeout=PREFLIGHT_WAIT)
         if name == "mesh_objects":
             params = {k: args[k] for k in ("status", "owner", "q", "kind", "limit") if args.get(k)}
+            if args.get("backlog"):
+                return self._api(f"/api/mesh/objects?{urllib.parse.urlencode(dict(params, backlog=1))}")
             if args.get("squad") or self.squad_id:
                 params["squad"] = args.get("squad") or self.squad_id
             return self._api(f"/api/mesh/objects?{urllib.parse.urlencode(params)}")
@@ -448,7 +462,10 @@ class MeshClient:
                 raise ValueError("ref is required")
             return self._api(f"/api/mesh/object?{urllib.parse.urlencode({'ref': ref, 'log_limit': int(args.get('log_limit') or 20)})}")
         if name == "mesh_file":
-            payload = {k: args[k] for k in ("kind", "title", "body", "files", "owner", "parent", "status") if args.get(k)}
+            payload = {k: args[k] for k in ("kind", "title", "body", "files", "owner", "parent", "status", "backlog",
+                                            "roster", "spawn_role") if args.get(k)}
+            if args.get("spawn_limit") is not None:
+                payload["spawn_limit"] = args["spawn_limit"]
             if self.squad_id:
                 payload["squad"] = self.squad_id
             return self._api("/api/mesh/object", method="POST", body=payload)
@@ -585,6 +602,7 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
     for flag in ("--status", "--owner", "--q", "--kind", "--squad"):
         p_objs.add_argument(flag)
     p_objs.add_argument("--limit", type=int)
+    p_objs.add_argument("--backlog", action="store_true")
 
     p_obj = sp.add_parser("object")
     p_obj.add_argument("ref")
@@ -598,6 +616,10 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
     p_file.add_argument("--parent")
     p_file.add_argument("--status")
     p_file.add_argument("--kind", default="task")
+    p_file.add_argument("--backlog", action="store_true")
+    p_file.add_argument("--roster", nargs="*", help="backlog: role or role:name, lead first")
+    p_file.add_argument("--spawn-role")
+    p_file.add_argument("--spawn-limit", type=int)
 
     p_log = sp.add_parser("log")
     p_log.add_argument("ref")
@@ -636,12 +658,17 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
     elif ns.cmd == "restart":
         res = client.call_tool("mesh_restart", {})
     elif ns.cmd == "objects":
-        res = client.call_tool("mesh_objects", {k: getattr(ns, k) for k in ("status", "owner", "q", "kind", "squad", "limit")})
+        res = client.call_tool("mesh_objects", {k: getattr(ns, k) for k in ("status", "owner", "q", "kind", "squad", "limit",
+                                                                         "backlog")})
     elif ns.cmd == "object":
         res = client.call_tool("mesh_object", {"ref": ns.ref, "log_limit": ns.log_limit})
     elif ns.cmd == "file":
         res = client.call_tool("mesh_file", {"kind": ns.kind, "title": ns.title, "body": ns.body, "files": ns.files,
-                                             "owner": ns.owner, "parent": ns.parent, "status": ns.status})
+                                             "owner": ns.owner, "parent": ns.parent, "status": ns.status,
+                                             "backlog": ns.backlog, "spawn_role": ns.spawn_role,
+                                             "spawn_limit": ns.spawn_limit,
+                                             "roster": [dict(zip(("role", "name"), m.split(":", 1)))
+                                                        for m in ns.roster or []]})
     elif ns.cmd == "log":
         res = client.call_tool("mesh_log", {"ref": ns.ref, "body": " ".join(ns.body), "kind": ns.kind,
                                             "status": ns.status, "owner": ns.owner})

@@ -1758,7 +1758,7 @@ $("mesh-spawn-jump").addEventListener("click", () => {
   show("fleet");
   setDrawer("spawn-drawer", "toggle-spawn", true);
 });
-$("mesh-refresh").addEventListener("click", () => { planState.stale = true; loadMesh(); if (meshState.selPeer) loadPeerContext(); });
+$("mesh-refresh").addEventListener("click", () => { planState.stale = true; backlogState.rev = undefined; loadMesh(); if (meshState.selPeer) loadPeerContext(); });
 
 // The selected peer is held by session id when there is one (a handle can be reused across squads, and
 // /api/mesh/context?peer=<handle> opens the newest live session of that name); the handle is kept beside it
@@ -1927,6 +1927,7 @@ async function loadMesh() {
   paintMeshMessages();
   paintPlan();                 // owner chips follow the roster on every poll
   loadPlan(doc.objects_rev);   // the rows are refetched only when objects_rev (or the squad) changes
+  loadBacklog(doc.objects_rev); // every project's, whatever squad is selected
   loadHeat();      // only when the scope changed; the 30 s loop refreshes it
   loadTopo(false, doc.latest_id);
 }
@@ -2272,7 +2273,7 @@ async function loadTask(ref) {
   const logHead = (l) => `${clock(l.ts)} ${l.agent_name} [${l.kind}]`
     + `${!l.status_to ? "" : l.kind === "create" ? ` as ${l.status_to}` : ` ${l.status_from || "–"} → ${l.status_to}`}`
     + `${l.owner_to ? ` owner → ${l.owner_to}` : ""}`;
-  const logCls = (k) => (k === "dead" ? "error" : k === "message" ? "peer_out" : k === "status" || k === "assign" ? "tool" : "claude");
+  const logCls = (k) => (k === "dead" ? "error" : k === "message" ? "peer_out" : k === "status" || k === "assign" || k === "dispatch" ? "tool" : "claude");
   $("mesh-ctx-feed").replaceChildren(
     el("li", { cls: "you" }, o.body ? renderMd(o.body) : "(no body)"),
     el("li", { cls: "result", text: o.files?.length ? `files: ${o.files.join(", ")}` : "files: none" }),
@@ -2281,6 +2282,101 @@ async function loadTask(ref) {
       : [el("li", { cls: "result", text: "no log entries yet" })]),
   );
   $("mesh-ctx-feed").scrollTop = 0;                    // the log is newest first
+}
+
+// ------------------------------------------------------------------ mesh: backlog (tasks no squad has taken yet)
+// Every project's, whatever squad is selected; refetched when objects_rev changes. [DISPATCH] launches a squad on one
+// (POST /api/squads/dispatch, the operator's only), after a second click that names the roster and the limit.
+const backlogState = { rev: undefined, rows: [], note: "", msg: "", armed: null, armedAt: 0, busy: false, sig: "" };
+const BACKLOG_EMPTY = "No backlog. Agents and the operator file one with mesh_file(backlog=true).";
+const DEFAULT_SQUAD = [{ role: "orchestrator-claude" }, { role: "reviewer-gemini" }];   // the door's DEFAULT_ROSTER
+
+function backlogRoster(o) {
+  const r = o.data?.roster?.length ? o.data.roster : DEFAULT_SQUAD;
+  return r.map((m, i) => `${m.name ? `${m.name} ` : ""}${m.role}${i ? "" : " (lead)"}`).join(", ")
+    + (o.data?.roster?.length ? "" : " · default");
+}
+function backlogLimit(o) {
+  const n = o.data?.spawn_limit ?? 5, role = o.data?.spawn_role || "*";
+  return n ? `the lead may add ${n} × ${role === "*" ? "any role" : role}` : "the lead adds nobody";
+}
+
+async function loadBacklog(rev) {
+  if (rev === backlogState.rev) return;
+  backlogState.rev = rev;
+  try {
+    const doc = await planGet("/api/mesh/objects?backlog=1&kind=task&limit=500");
+    backlogState.rows = doc?.objects || [];
+    backlogState.note = doc ? "" : "this server predates the backlog: restart Almanac";
+  } catch (err) {
+    backlogState.rev = undefined;                      // retried on the next poll, only while it fails
+    backlogState.note = `backlog unavailable: ${err.message}`;
+  }
+  paintBacklog();
+}
+
+function backlogRow(o) {
+  const armed = backlogState.armed === o.ref;
+  const btn = el("button", { type: "button", cls: `btn ${armed ? "confirm" : "hi"}`, disabled: backlogState.busy,
+    text: armed ? `[LAUNCH ${backlogRoster(o)}; ${backlogLimit(o)}? click again]` : "[DISPATCH ▸]" });
+  btn.addEventListener("click", (e) => { e.stopPropagation(); dispatchBacklog(o); });
+  btn.addEventListener("keydown", (e) => e.stopPropagation());   // Enter on the button is the button's, not the row's
+  const project = String(o.project || "").split(/[\\/]/).filter(Boolean).pop() || "";
+  const tr = el("tr", { tabindex: "0", "data-ref": o.ref, cls: meshState.selTask === o.ref ? "sel" : "" },
+    el("td", { cls: "cyan", text: o.ref }),
+    el("td", { cls: "task", title: `${o.title}\n${o.project || ""}` }, o.title,
+      project ? el("span", { cls: "dim", text: ` · ${project}` }) : null),
+    el("td", { cls: "last", text: backlogRoster(o), title: `${backlogRoster(o)}\n${backlogLimit(o)}` }),
+    el("td", { cls: "r", text: age(o.created_ts), title: `filed by ${o.created_by_name}` }),
+    el("td", {}, btn),
+  );
+  tr.addEventListener("click", () => openTask(o.ref));
+  tr.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTask(o.ref); } });
+  return tr;
+}
+
+function paintBacklog() {
+  const rows = backlogState.rows;
+  const sig = JSON.stringify([rows, backlogState.armed, backlogState.busy, backlogState.note, backlogState.msg,
+    meshState.selTask, rows.map((o) => age(o.created_ts))]);
+  if (sig === backlogState.sig) return;               // polled: do not rebuild (and drop focus) when nothing changed
+  backlogState.sig = sig;
+  $("backlog-table").hidden = !rows.length;
+  $("backlog-msg").textContent = backlogState.msg || backlogState.note || (rows.length ? "" : BACKLOG_EMPTY);
+  const focused = document.activeElement?.closest?.("#backlog-table tr")?.dataset.ref;
+  $("backlog-table").querySelector("tbody").replaceChildren(...rows.map(backlogRow));
+  if (focused) $("backlog-table").querySelector(`tr[data-ref="${CSS.escape(focused)}"]`)?.focus();
+}
+
+async function dispatchBacklog(o) {
+  if (backlogState.busy) return;
+  if (backlogState.armed !== o.ref) {                  // the first click arms; the second, within 5 s, launches
+    backlogState.armed = o.ref; backlogState.armedAt = Date.now(); backlogState.msg = "";
+    paintBacklog();
+    setTimeout(() => {
+      if (backlogState.armed === o.ref && Date.now() - backlogState.armedAt >= 5000) { backlogState.armed = null; paintBacklog(); }
+    }, 5100);
+    return;
+  }
+  backlogState.armed = null; backlogState.busy = true; backlogState.msg = `dispatching ${o.ref}…`;
+  paintBacklog();
+  let r;
+  try {
+    r = await post("/api/squads/dispatch", { ref: o.ref });   // 409 (not dispatched) comes back as a doc
+  } catch (err) {
+    r = { error: err.message };
+  }
+  const failed = (r.squad?.agents || []).filter((a) => !a.ok).map((a) => `${a.agent_name} failed: ${a.error}`);
+  backlogState.msg = r.dispatched
+    ? [`${o.ref} → squad ${r.squad.name}: ${r.launched} launched`, ...failed].join("; ")
+    : [`${o.ref} not dispatched${r.error ? `: ${r.error}` : ""}`, ...failed].join("; ");
+  backlogState.busy = false; backlogState.rev = undefined;
+  paintBacklog();
+  if (r.dispatched) {
+    setMeshSquad(r.squad.id);
+    openTask(o.ref);                                   // now the lead's task in the new squad's plan
+  }
+  setTimeout(() => { loadFleet(); loadMesh(); }, 900);
 }
 
 // ------------------------------------------------------------------ mesh: topology (who talks to whom)
