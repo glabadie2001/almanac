@@ -253,14 +253,14 @@ class RecoverTests(Fixture):
     def test_every_open_escalation_of_an_agent_closes_on_recovery(self):
         for _ in range(2):
             self.store.record_message(from_name="almanac-hub", to_name="operator", squad_id="sq-1", ts=T0,
-                                      body="[stalled] impl (squad sq-1) ...", transport="system", needs="blocking", closes=False)
+                                      body="[stalled] impl (squad sq-1) ...", transport="system", needs="blocking", answers=False)
         self.at(T0 + 1)
         self.assertEqual(self.store.open_needs(to_name="operator"), [])
 
     def test_a_live_session_is_found_by_session_however_old_its_spawn(self):
         rows = {f"s-{n}": self.store.spawn_of(n) for n in ("arch", "impl")}
         scan = mock.patch.object(self.store, "spawned", side_effect=AssertionError("no scan of the newest 500"))
-        lookup = mock.patch.object(self.store, "spawn_by_session", create=True, side_effect=rows.get)
+        lookup = mock.patch.object(self.store, "spawn_by_session", side_effect=rows.get)
         with scan, lookup:
             self.stall("impl", at=T0)
             self.at(T0 + 20)

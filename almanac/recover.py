@@ -7,9 +7,10 @@ their role: anything else may be the operator's own terminal. Nothing here depen
 the operator always hears an escalation, the agent that added the stalled one (`spawned_by`) only if it is live and
 not stalled itself.
 
-Every message here is journaled as transport `system` with `closes=False`: a `continue` from `almanac-hub` (an
-operator name) would otherwise count as the operator answering the agent's open question, and its transcript copy,
-once ingested, would close it too (the journaled row makes ingest skip the copy).
+Every message here is journaled as a notice (`answers=False`) with transport `system`: a `continue` from
+`almanac-hub` (an operator name) would otherwise count as the operator answering the agent's open question or
+writing to it, and its transcript copy, once ingested, would close the question too (the journaled row makes ingest
+skip the copy). `system` also keeps these rows off the topology and the swimlane.
 """
 from __future__ import annotations
 
@@ -51,7 +52,8 @@ class Recover:
         flagged = _open_escalations(service)              # agent -> its open escalation, across restarts
         for row in service.fleet_now().get("processes", []):
             sid = row.get("session_id")
-            sp = _spawn(service, sid) if sid and row.get("role") == "session" else None
+            # by session, however many spawns came after it (`spawned` returns only the newest 500)
+            sp = service.store.spawn_by_session(sid) if sid and row.get("role") == "session" else None
             if sp is None or not sp.get("squad_id"):
                 continue                                  # not ours to type into
             stall = service.fleet.view(sid)[2].get("stall")
@@ -127,14 +129,6 @@ def _open_escalations(service) -> dict[tuple[str, str], list[tuple[int, float]]]
     return out
 
 
-def _spawn(service, session_id: str) -> dict | None:
-    """The spawn row of one live session, however many spawns came after it (`spawned` returns the newest 500)."""
-    by_session = getattr(service.store, "spawn_by_session", None)   # ponytail: the backend branch adds it; drop the
-    if by_session is not None:                                        # fallback when that branch is merged in
-        return by_session(session_id)
-    return next((s for s in service.store.spawned(limit=500) if s.get("session_id") == session_id), None)
-
-
 def _resolve(service, ids) -> None:
     for i in ids:
         service.store.resolve_message(i)
@@ -154,7 +148,7 @@ def _deliver(service, to: str, text: str, squad: str, row: dict | None = None, n
     if ok:
         # stamped with recover's clock: an escalation is matched to its stall by comparing this with the stall's start
         service.store.record_message(from_name=HUB, to_name=to, to_session=(row or {}).get("session_id"), ts=ts,
-                                     squad_id=squad, body=text, transport="system", needs=needs, closes=False)
+                                     squad_id=squad, body=text, transport="system", needs=needs, answers=False)
     else:
         log.warning("recover: could not reach %s: %s", to, message)
     return ok, message

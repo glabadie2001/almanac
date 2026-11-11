@@ -56,7 +56,7 @@ class CharterTokenTests(Fixture):
         self.assertNotIn(str(state.resolve()), charter)
         cli_line = charter.split("Shell CLI Fallback", 1)[1].split("\n", 1)[0]
         self.assertNotIn("token", cli_line.replace("your own token", ""), "no token file is named")
-        self.assertIn("-P -m almanac.mcp_mesh --self a1 --cli <roster|context|contacts|send|wait|spawn>", charter)
+        self.assertIn("-P -m almanac.mcp_mesh --self a1 --cli <roster|context|contacts|send|wait|spawn|objects|object|file|log>", charter)
 
 
 class WorktreeTests(Fixture):
@@ -170,7 +170,8 @@ class GeminiMeshGrantTests(Fixture):
     def test_agy_is_granted_only_the_mesh_tools_and_never_skips_permissions(self):
         allow = json.loads(gemini_host.MESH_GRANTS)["permissions"]["allow"]
         self.assertEqual(allow, [f"mcp(almanac-mesh_almanac-mesh/{t})" for t in
-                                 ("mesh_roster", "mesh_context_stream", "mesh_contact_stream", "mesh_send", "mesh_spawn", "mesh_wait")])
+                                 ("mesh_roster", "mesh_context_stream", "mesh_contact_stream", "mesh_send", "mesh_spawn", "mesh_wait",
+                              "mesh_objects", "mesh_object", "mesh_file", "mesh_log")])
         host = gemini_host.GeminiHost(name="g", cwd=str(self.root), transcript_path=self.root / "t.jsonl",
                                       sessions_dir=self.root / "s", agy_bin="agy", permission_mode="auto",
                                       in_memory_uds=True, quiet=True)
@@ -210,8 +211,8 @@ class SpawnTokenTests(Fixture):
         self.assertTrue(service.wake.is_set(), "a launch wakes the transcript loop")
         claude_argv, claude_kw = launched[0]
         mcp = json.loads(Path(claude_argv[claude_argv.index("--mcp-config") + 1]).read_text(encoding="utf-8"))
-        self.assertEqual(mcp["mcpServers"]["almanac-mesh"]["env"]["ALMANAC_TOKEN"], web.agent_token(TOKEN, "lead"))
-        self.assertEqual(claude_kw["env"]["ALMANAC_TOKEN"], web.agent_token(TOKEN, "lead"))
+        self.assertEqual(mcp["mcpServers"]["almanac-mesh"]["env"]["ALMANAC_TOKEN"], web.agent_token(TOKEN, "lead", claude_argv[claude_argv.index("--session-id") + 1]))
+        self.assertEqual(claude_kw["env"]["ALMANAC_TOKEN"], web.agent_token(TOKEN, "lead", claude_argv[claude_argv.index("--session-id") + 1]))
         self.assertNotIn(TOKEN, json.dumps(mcp) + " ".join(claude_argv))
         brief = claude_argv[claude_argv.index("--append-system-prompt") + 1]
         self.assertIn(f"  - Role: {store_mod.REVIEWER}", brief, "every agent's brief says who does what")
@@ -221,8 +222,8 @@ class SpawnTokenTests(Fixture):
             bundle = Path(argv[argv.index("--add-dir") + 1])
             bundles.append(bundle)
             cfg = json.loads((bundle / ".agents/plugins/almanac-mesh/mcp_config.json").read_text(encoding="utf-8"))
-            self.assertEqual(cfg["mcpServers"]["almanac-mesh"]["env"]["ALMANAC_TOKEN"], web.agent_token(TOKEN, name))
-            self.assertEqual(kw["env"]["ALMANAC_TOKEN"], web.agent_token(TOKEN, name))
+            self.assertEqual(cfg["mcpServers"]["almanac-mesh"]["env"]["ALMANAC_TOKEN"], web.agent_token(TOKEN, name, argv[argv.index("--session-id") + 1]))
+            self.assertEqual(kw["env"]["ALMANAC_TOKEN"], web.agent_token(TOKEN, name, argv[argv.index("--session-id") + 1]))
         self.assertNotEqual(bundles[0], bundles[1], "Gemini peers no longer share one bundle")
         channels = {s["agent_name"]: s["channels"] for s in store.spawned()}
         self.assertEqual(channels["lead"], ["#squad", "#architecture"])
