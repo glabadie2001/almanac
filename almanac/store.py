@@ -1412,6 +1412,13 @@ class Store:
 
     _KEEP = object()
 
+    def delete_squad(self, squad_id: str) -> None:
+        """Take back a squad row whose launch stopped before it had a member (a dispatch whose lead did not start).
+        A spawn row the failed lead left keeps its squad_id, which then names no squad."""
+        with self.lock:
+            self.db.execute("delete from squads where id = ?", (squad_id,))
+            self.db.commit()
+
     def update_squad(self, squad_id: str, *, spawn_role=_KEEP, spawn_limit=_KEEP) -> dict | None:
         """Change what agents may add to a running squad. Left out = unchanged. None if there is no such squad."""
         current = self.squad(squad_id)
@@ -1629,8 +1636,9 @@ class Store:
 
     def log_object(self, oid: int, *, who: dict, kind: str, body: str = "", status: str | None = None,
                    owner_session: str | None = None, owner_name: str | None = None,
-                   message_id: int | None = None) -> dict:
-        """Append a log row; a `status` or `owner_session` also changes the object (and its updated_ts)."""
+                   message_id: int | None = None, squad_id: str | None = None) -> dict:
+        """Append a log row; a `status`, `owner_session` or `squad_id` (a backlog task's dispatch) also changes the
+        object (and its updated_ts)."""
         now = time.time()
         with self.lock:
             row = self.db.execute("select status from objects where id = ?", (oid,)).fetchone()
@@ -1643,6 +1651,9 @@ class Store:
             if owner_session is not None:
                 sets.append("owner_session = ?")
                 params.append(owner_session)
+            if squad_id is not None:
+                sets.append("squad_id = ?")
+                params.append(squad_id)
             self.db.execute(f"update objects set {', '.join(sets)} where id = ?", (*params, oid))
             lid = self._insert_log(oid, now, who, kind, body, row[0] if status is not None else None, status,
                                    owner_name, message_id)
@@ -1656,9 +1667,13 @@ class Store:
         return _object(r) if r else None
 
     def objects(self, *, squad_id: str | None, kind: str | None = None, statuses=(), owner: str | None = None,
-                q: str | None = None) -> list[dict]:
-        """Matching objects of one squad, by id. `owner`: a handle, or 'none' for unowned."""
+                q: str | None = None, project: str | None = None) -> list[dict]:
+        """Matching objects of one squad, by id; `squad_id=None` is the backlog (of `project`, when given).
+        `owner`: a handle, or 'none' for unowned."""
         clauses, params = ["squad_id is ?"], [squad_id]
+        if project:
+            clauses.append("project = ?")
+            params.append(project)
         if kind:
             clauses.append("kind = ?")
             params.append(kind)
@@ -1743,7 +1758,11 @@ def _choices(doc: dict, key: str, norm) -> list[str]:
 
 
 def _object(r) -> dict:
-    return dict(zip(OBJECT_COLUMNS.split(", "), r), files=_json_list(r[9]))
+    try:
+        data = json.loads(r[16] or "{}")
+    except ValueError:
+        data = {}
+    return dict(zip(OBJECT_COLUMNS.split(", "), r), files=_json_list(r[9]), data=data if isinstance(data, dict) else {})
 
 
 def _log(r) -> dict:

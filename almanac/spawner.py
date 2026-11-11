@@ -10,6 +10,7 @@ Each spawned agent receives:
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -163,7 +164,9 @@ def build_mesh_charter(
         "files=[...])` instead of describing it in a message: filing with an owner is the assignment. Owners hand in with "
         "`mesh_log(ref, status=\"in review\", body=<files touched, test command and result, what is left>)`. As you go, "
         "`mesh_log` what you learned (`kind=\"learned\"`), dead ends (`kind=\"dead\"`, or `kind=\"parked\"` with "
-        "\"retry when ...\") and what comes next (`kind=\"next\"`). Reply about a task with `mesh_send(..., re=\"T-12\")`.",
+        "\"retry when ...\") and what comes next (`kind=\"next\"`). Reply about a task with `mesh_send(..., re=\"T-12\")`. "
+        "Work for later, outside this squad's mission, goes in the project backlog with `mesh_file(backlog=true, ...)` "
+        "(`mesh_objects(backlog=true)` lists it); the operator dispatches a squad on it.",
         f"6. **Shell CLI Fallback**: You can also run `\"{python_exe}\" -P -m almanac.mcp_mesh --self {agent_name} --cli <roster|context|contacts|send|wait|spawn|objects|object|file|log|restart> ...` (with `PYTHONPATH=\"{REPO_ROOT}\"`; your own token and Almanac's address come from the environment).",
         "7. **Operator**: `mesh_send(to=\"operator\", ...)` reaches the human running this squad; use it for decisions only they can make and for the final report; `needs=\"blocking\"` raises an alert on their screen, so use it only when the squad cannot proceed."
         if may_page_operator else
@@ -256,6 +259,20 @@ def snapshot_commit(top: Path, state_dir: Path | None = None) -> str:
                GIT_COMMITTER_NAME="Almanac", GIT_COMMITTER_EMAIL="almanac@localhost")
     return _git(top, "commit-tree", tree, "-p", head, "-m", "almanac: uncommitted work at spawn",
                 env=dict(os.environ, **who))
+
+
+@functools.lru_cache(maxsize=64)
+def project_root(cwd: str) -> str:
+    """A project's key: the git checkout root holding `cwd`, resolved as `launch_squad` resolves a squad's cwd;
+    `cwd` itself (resolved) outside git. Called with a squad's cwd (the operator's folder), never a worktree."""
+    folder = Path(cwd).expanduser().resolve()
+    try:
+        out = subprocess.run(["git", "-C", str(folder), "rev-parse", "--show-toplevel"], capture_output=True,
+                             timeout=10, creationflags=NO_WINDOW)
+    except (OSError, subprocess.SubprocessError):
+        return str(folder)
+    top = out.stdout.decode("utf-8", "replace").strip()
+    return str(Path(top).resolve()) if out.returncode == 0 and top else str(folder)
 
 
 def ensure_worktree(repo_cwd: Path, state_dir: Path, agent_name: str, squad_id: str | None = None) -> Path:
@@ -707,9 +724,13 @@ def launch_squad(
     watch: float = 0.3,
     spawn_role: str | None = None,
     spawn_limit: int = 0,
+    lead_task: dict | None = None,
 ) -> dict:
     """Spawn a multi-agent cross-model squad with pre-wired peer rosters and a shared kickoff brief.
-    `spawn_role` / `spawn_limit`: what an agent whose role may_spawn can add later (see `join_squad`)."""
+    `spawn_role` / `spawn_limit`: what an agent whose role may_spawn can add later (see `join_squad`).
+    `lead_task`: a backlog task being dispatched. It is the first member's T (no second one is filed), and only once
+    that member has started does it join the squad, owned and in progress, with one `dispatch` log row. A lead that
+    does not start stops the launch: nobody else is started and the squad row is deleted."""
     if not isinstance(members, list) or not members:
         raise ValueError("members must be a non-empty list of agent specs")
     if len(members) > 20:
@@ -765,9 +786,9 @@ def launch_squad(
     ]
 
     launched_agents: list[dict] = []
-    for p in prepared:
+    for i, p in enumerate(prepared):
         spec = p["spec"]
-        task_row = file_spawn_task(service, squad_id, p["task"], p["files"])
+        task_row = lead_task if lead_task and i == 0 else file_spawn_task(service, squad_id, p["task"], p["files"])
         kickoff_parts = []
         if brief and brief.strip():
             kickoff_parts.append(f"## Squad Mission ({name or squad_slug})\n{brief.strip()}")
@@ -806,10 +827,20 @@ def launch_squad(
             # one member that cannot start (a worktree git refuses, a bad role) must not orphan the ones already running
             res = dict(ok=False, pid=None, agent_name=p["agent_name"], session_id=None, provider=p["provider"],
                        role_id=p["role_id"], error=str(exc))
-        own_spawn_task(service, task_row, res)
         launched_agents.append(res)
+        if lead_task and task_row is lead_task:
+            if not (res.get("ok") and res.get("session_id")):
+                # no leaderless squad: start nobody else, and take back the squad row spawn_agent needed to exist
+                service.store.delete_squad(squad_id)
+                return dict(ok=False, squad=dict(squad_doc, agents=launched_agents), launched=0, failed=1)
+            service.store.log_object(lead_task["id"], who=dict(agent_name="operator"), kind="dispatch",
+                                     body=f"squad {squad_id}, led by {res.get('agent_name')}",
+                                     squad_id=squad_id, status="in progress", owner_session=res["session_id"],
+                                     owner_name=res.get("agent_name"))
+        else:
+            own_spawn_task(service, task_row, res)
 
-    if brief and brief.strip():
+    if brief and brief.strip() and any(a.get("ok") for a in launched_agents):   # no notice to a squad of nobody
         service.store.record_message(
             from_name="operator",
             to_name="@squad",
