@@ -1062,7 +1062,9 @@ def join_squad(
     choice = dict(model=model, effort=effort, why=why or None)     # normalized as spawn_agent normalizes them
     existing = task_row is not None
     if existing:
-        from almanac.door import _files
+        from almanac.door import BODY_MAX, _files
+        if len(task) > BODY_MAX:
+            raise ValueError(f"task is {len(task)} characters; trim it to {BODY_MAX}")
         files = _files(files, squad["cwd"]) if files else None      # checked before anything starts
     else:
         task_row = file_spawn_task(service, squad_id, task, files, by=spawned_by, by_session=spawned_by_session,
@@ -1105,10 +1107,13 @@ def join_squad(
         watch=watch,
         spawned_by=spawned_by,
     )
-    # a new T carries the choice in its data; an existing task's data is not ours to change, so its assign entry says it
+    # a new T carries the choice, files and task in its row; an existing task's row is not ours to change, so its assign
+    # entry says them (a respawn's kickoff renders the log, so they survive it)
     own_spawn_task(service, task_row, res, by=spawned_by, by_session=spawned_by_session,
                    body=(f"on {choice['model'] or 'the default model'} at {choice['effort'] or 'the default effort'}"
-                         + (f": {why}" if why else "")) if existing else "")
+                         + (f": {why}" if why else "")
+                         + (f"\nFiles: {', '.join(files)}" if files else "")
+                         + (f"\nMore instructions: {task}" if task else "")) if existing else "")
     res["choice"] = choice
     if res.get("ok"):
         blurb = f"{_ref(task_row, name)} {task_row['title']} {task}".strip() if existing else task

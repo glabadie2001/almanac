@@ -2454,12 +2454,12 @@ function backlogRow(o) {
   const assign = [];
   if (squads.length) {                                  // not offered when its project has no active squad
     const picked = squads.find((q) => q.id === backlogState.pick[o.ref]) || squads[0];
-    const sel = el("select", { cls: "inline-effort-select", "aria-label": `squad to assign ${o.ref} to`, disabled: backlogState.busy },
+    const sel = el("select", { cls: "inline-effort-select", title: picked.name, "aria-label": `squad to assign ${o.ref} to`, disabled: backlogState.busy },
       ...squads.map((q) => el("option", { value: q.id, text: q.name, selected: q.id === picked.id })));
     sel.addEventListener("change", () => { backlogState.pick[o.ref] = sel.value; backlogState.armedAssign = null; paintBacklog(); });
     sel.addEventListener("click", (e) => e.stopPropagation());
     sel.addEventListener("keydown", (e) => e.stopPropagation());
-    const armedA = backlogState.armedAssign === o.ref;
+    const armedA = backlogState.armedAssign === `${o.ref}:${picked.id}`;   // the squad it names, not just the task
     const ab = el("button", { type: "button", cls: `btn ${armedA ? "confirm" : ""}`, disabled: backlogState.busy,
       text: armedA ? "[ASSIGN? click again]" : "[ASSIGN ▸]", title: `move ${o.ref} into squad ${picked.name}; its lead is told` });
     ab.addEventListener("click", (e) => { e.stopPropagation(); assignBacklog(o, picked); });
@@ -2530,12 +2530,13 @@ async function dispatchBacklog(o) {
 
 async function assignBacklog(o, squad) {
   if (backlogState.busy) return;
-  if (backlogState.armedAssign !== o.ref) {             // the first click arms; the second, within 5 s, assigns
-    backlogState.armedAssign = o.ref; backlogState.armed = null; backlogState.armedAt = Date.now();
+  const key = `${o.ref}:${squad.id}`;
+  if (backlogState.armedAssign !== key) {             // the first click arms; the second, within 5 s, assigns
+    backlogState.armedAssign = key; backlogState.armed = null; backlogState.armedAt = Date.now();
     backlogState.msg = `${o.ref}: move into squad ${squad.name}; its lead is told. Click [ASSIGN?] again within 5 s.`;
     paintBacklog();
     setTimeout(() => {
-      if (backlogState.armedAssign === o.ref && Date.now() - backlogState.armedAt >= 5000) {
+      if (backlogState.armedAssign === key && Date.now() - backlogState.armedAt >= 5000) {
         backlogState.armedAssign = null; backlogState.msg = `${o.ref}: not assigned`; paintBacklog();
       }
     }, 5100);

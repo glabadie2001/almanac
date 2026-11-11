@@ -107,6 +107,21 @@ class AssignTests(AssignRig):
         self.assertEqual(len(self.inbox["arch"]), 1)
         self.assertEqual([e["kind"] for e in self.store.object_log(1, 10)], ["assign", "create"])
 
+    def test_a_squad_that_ended_before_the_lock_is_refused(self):
+        real = self.store.squad
+        calls = []
+
+        def squad(sid):                      # the first read says active; the read under the lock says ended
+            doc = real(sid)
+            calls.append(sid)
+            return dict(doc, status="active" if len(calls) == 1 else "ended") if doc else doc
+
+        with mock.patch.object(self.store, "squad", side_effect=squad):
+            status, _, res = self.assign()
+        self.assertEqual(status, 409, res)
+        self.assertIn("ended", res["error"])
+        self.assertIsNone(self.row()["squad_id"])
+
     def test_the_squad_list_carries_the_project_the_backlog_matches_on(self):
         _, _, res = self.request(self.handler, "/api/squads", token=TOKEN)
         self.assertEqual({s["id"]: s["project"] for s in res["squads"]}["sq-1"], self.project)
@@ -156,6 +171,23 @@ class SpawnOnATaskTests(AssignRig):
         self.assertTrue(entry["body"].endswith(": rote edits, fails loudly"), entry["body"])
         model, effort = res["choice"]["model"], res["choice"]["effort"]
         self.assertIn(f"on {model or 'the default model'} at {effort or 'the default effort'}", entry["body"])
+
+    def test_files_and_extra_instructions_survive_a_respawn_in_the_log(self):
+        status, _, res = self.spawn_on(task="Keep clear of door.py.", files=["almanac/spawner.py"])
+        self.assertEqual(status, 200, res)
+        body = self.store.object_log(1, 1)[0]["body"]
+        self.assertIn("\nFiles: almanac/spawner.py", body)
+        self.assertIn("\nMore instructions: Keep clear of door.py.", body)
+        log = list(reversed(self.store.object_log(1, 100)))
+        kickoff = door.respawn_kickoff(self.row(), log, self.store.squad("sq-1"), res["agent_name"], 50_000)
+        self.assertIn("Files: almanac/spawner.py", kickoff)
+        self.assertIn("Keep clear of door.py.", kickoff)
+
+    def test_extra_instructions_are_capped_like_a_task(self):
+        status, _, res = self.spawn_on(task="x" * (door.BODY_MAX + 1))
+        self.assertEqual(status, 400, res)
+        self.assertIn("trim it to", res["error"])
+        self.assertEqual((self.argv, self.row()["owner_session"]), ([], None))
 
     def test_task_is_extra_instructions_and_files_replace_the_tasks(self):
         status, _, res = self.spawn_on(task="Mind the Windows paths.", files=["almanac/spawner.py"])

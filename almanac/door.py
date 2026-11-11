@@ -1690,7 +1690,7 @@ def assign_task(service, ref, squad_id) -> dict:
         raise _refused(404, f"no squad {squad_id!r}")
     from almanac.spawner import project_root
     with _DISPATCH_LOCK:                 # a double click assigns once
-        row = service.store.object_row(row["id"])
+        row, squad = service.store.object_row(row["id"]), service.store.squad(squad["id"]) or squad   # both read again
         if row["squad_id"] or row["id"] in _DISPATCHING:
             raise _refused(409, f"{ref} is not in the backlog: it belongs to squad {row['squad_id']}"
                            if row["squad_id"] else f"{ref} is being dispatched")
