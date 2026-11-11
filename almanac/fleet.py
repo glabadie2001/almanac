@@ -295,7 +295,8 @@ def read_tail(path: Path, window: int = 600_000, keep: int | None = None) -> tup
             ctx, total = 0, False
             if rec.get("context_tokens"):                      # gemini_host: one step's own re-read
                 ctx = int(rec["context_tokens"])
-            elif isinstance(use, dict) and model != "<synthetic>":
+            elif isinstance(use, dict) and model != "<synthetic>" and not (
+                    speaker == "gemini" and meta["context"] and not meta["context_total"]):  # keep a step's own figure
                 ctx = sum(int(use.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
                 total = speaker == "gemini"                    # Gemini usage without a step's own: running totals
             if ctx:

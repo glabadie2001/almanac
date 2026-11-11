@@ -629,8 +629,10 @@ class Store:
                 if prov == "gemini" and session:
                     counts = self._gemini_turn(session, counts)
             if main and session and usage and any(counts) and msg.get("model") not in (None, "<synthetic>"):
-                self.db.execute("update sessions set model = ?, context = ? where id = ?", (
-                    msg.get("model"), int(rec.get("context_tokens") or 0) or counts[0] + counts[1] + counts[2], session))
+                self.db.execute("update sessions set model = ?, context = coalesce(?, context) where id = ?", (
+                    # a step that re-read nothing (agy's /compact checkpoint) leaves the reading as it was
+                    msg.get("model"), int(rec.get("context_tokens") or 0) or counts[0] + counts[1] + counts[2] or None,
+                    session))
             if usage and msg.get("id"):
                 self.db.execute("insert or replace into usage values (?, ?, ?, ?, ?, ?, ?, ?)",
                                 (msg["id"], session, ts, msg.get("model"), *counts))
@@ -1480,13 +1482,13 @@ class Store:
                 # whose newest row was retired (fresh-per-task) gives its slot back
                 "(select count(distinct a.agent_name) from spawned_agents a where a.squad_id = squads.id "
                 "and a.spawned_by is not null and (select n.retired_ts from spawned_agents n where n.squad_id = a.squad_id "
-                "and n.agent_name = a.agent_name order by n.created_ts desc limit 1) is null) "
+                "and n.agent_name = a.agent_name order by n.created_ts desc, n.rowid desc limit 1) is null) "
                 f"from squads {where}order by created_ts desc limit ?",
                 (*params, max(1, min(200, int(limit)))),
             ).fetchall()
             agents_rows = self.db.execute(
                 "select agent_name, session_id, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, created_ts, "
-                f"spawned_by from spawned_agents {'where squad_id = ? ' if squad_id else ''}order by created_ts asc",
+                f"spawned_by from spawned_agents {'where squad_id = ? ' if squad_id else ''}order by created_ts asc, rowid asc",
                 params,
             ).fetchall()
         by_squad: dict[str, list[dict]] = {}
@@ -1585,7 +1587,7 @@ class Store:
             if agent_name:
                 self.db.execute(
                     "update spawned_agents set model = coalesce(?, model), effort = coalesce(?, effort) where session_id = "
-                    "(select session_id from spawned_agents where agent_name = ? order by created_ts desc limit 1)",
+                    "(select session_id from spawned_agents where agent_name = ? order by created_ts desc, rowid desc limit 1)",
                     (model, effort, agent_name),
                 )
             self.db.commit()
@@ -1621,7 +1623,7 @@ class Store:
         with self.lock:
             rows = self.db.execute(
                 "select agent_name, session_id, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, created_ts, "
-                f"channels, spawned_by, retired_ts from spawned_agents {where}order by created_ts desc limit ?",
+                f"channels, spawned_by, retired_ts from spawned_agents {where}order by created_ts desc, rowid desc limit ?",
                 (*params, limit),
             ).fetchall()
         return [
@@ -1769,11 +1771,15 @@ class Store:
                                 (session_id,)).fetchone()
         return dict(zip(SPAWNED_COLUMNS.split(", ") + ["retired_ts"], a), channels=_json_list(a[11])) if a else None
 
-    def retire_spawn(self, session_id: str) -> None:
-        """Mark a spawn row retired (fresh-per-task): its handle no longer counts toward the squad's spawn_used."""
+    def retire_spawn(self, session_id: str, retired: bool = True) -> None:
+        """Mark a spawn row retired (fresh-per-task): its handle no longer counts toward the squad's spawn_used.
+        `retired=False` takes that back (a session that could not be ended after all)."""
         with self.lock:
-            self.db.execute("update spawned_agents set retired_ts = ? where session_id = ? and retired_ts is null",
-                            (time.time(), session_id))
+            if retired:
+                self.db.execute("update spawned_agents set retired_ts = ? where session_id = ? and retired_ts is null",
+                                (time.time(), session_id))
+            else:
+                self.db.execute("update spawned_agents set retired_ts = null where session_id = ?", (session_id,))
             self.db.commit()
 
 

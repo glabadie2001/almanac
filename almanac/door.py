@@ -1666,9 +1666,13 @@ def context_boundary(service, row: dict, caller: dict | None, *, after: list) ->
     owner = service.store.spawn_by_session(row["owner_session"]) if row["owner_session"] else None
     if owner and owner["squad_id"] == squad:
         members.append(owner)
-    creator = service.store.spawned(squad_id=squad, agent_name=row["created_by_name"], limit=1)
+    # the creator by its session, so another squad's member of the same name is never touched; then that handle's
+    # newest session here: a respawned lead is still the lead
+    first = service.store.spawn_by_session(row["created_by"]) if row["created_by"] else None
+    creator = (service.store.spawned(squad_id=squad, agent_name=first["agent_name"], limit=1)
+               if first and first["squad_id"] == squad else [])
     if creator and creator[0]["session_id"] not in {m["session_id"] for m in members}:
-        members.append(creator[0])                # its newest session: a respawned lead is still the lead
+        members.append(creator[0])
     for sp in members:
         if sp.get("retired_ts"):
             continue
@@ -1725,15 +1729,20 @@ def _retire(service, row: dict, sp: dict, caller: dict | None, after: list) -> N
             service.fleet.last["at"] = 0
         return True, "was ended" if ok else "was not running"
 
-    if proc is not None and caller and caller.get("session_id") == sid:
+    # the deferred end only when it can work; otherwise the ordinary path below says it was not retired
+    if (proc is not None and caller and caller.get("session_id") == sid and service.fleet is not None
+            and proc.get("created")):
         service.store.retire_spawn(sid)
         service.store.log_object(row["id"], who=HUB, kind="retired", body=(
             f"{name} retired on {ref} (fresh-per-task): its session {sid} ends once this reply is written{size}{keep}"))
 
         def end_self():
             ok, what = end()
-            if not ok:
+            if not ok:                  # still running after all: it gets its row and its slot back
                 logging.getLogger("almanac").warning("retiring %s (session %s): %s", name, sid, what)
+                service.store.retire_spawn(sid, retired=False)
+                service.store.log_object(row["id"], who=HUB, kind="retired", body=(
+                    f"{name} was not retired (fresh-per-task): its session {sid} {what}{size}"))
         after.append(end_self)
         return
     ok, what = end()
@@ -1746,6 +1755,12 @@ def _retire(service, row: dict, sp: dict, caller: dict | None, after: list) -> N
         f"{name} retired on {ref} (fresh-per-task): its session {sid} {what}{size}{keep}"))
 
 
+# No second /compact to a session within this many seconds of the last. Time, not a watched reading: an agent typed
+# at mid-turn keeps taking steps, so its reading moves before the queued /compact runs, and two accepts in one turn
+# would otherwise queue it twice.
+COMPACT_COOLDOWN = 600
+
+
 def _compact(service, row: dict, sp: dict, n: int) -> None:
     """compact-at-N: type `/compact` into a Claude agent's console (console.send, never fleet.send: that delivers a
     peer message, not keys; typed mid-turn it queues), or have a Gemini agent's host send agy a raw `/compact` turn.
@@ -1756,8 +1771,9 @@ def _compact(service, row: dict, sp: dict, n: int) -> None:
     context = (proc or {}).get("context")
     if not proc or not context or proc.get("context_total") or context < n:
         return
-    sent = service.__dict__.setdefault("compacted", {})       # {session: its context when /compact was last sent}
-    if sent.get(sid) == context:
+    sent = service.__dict__.setdefault("compacted", {})   # {session: (its context, time) when /compact was last sent}
+    last, at = sent.get(sid, (None, float("-inf")))
+    if last == context or time.monotonic() - at < COMPACT_COOLDOWN:
         return
     before = f"{name} at {context:,} tokens (compact-at-{n})"
     provider = proc.get("provider") or sp.get("provider") or "claude"
@@ -1773,14 +1789,14 @@ def _compact(service, row: dict, sp: dict, n: int) -> None:
             except Exception as exc:
                 ok, what = False, f"its host could not be told: {exc}"
     elif proc.get("role") == "headless" or sid in (service.__dict__.get("headless_procs") or {}):
-        sent[sid] = context                       # nothing will change that: say it once per reading
+        sent[sid] = (context, time.monotonic())        # nothing will change that: say it once per reading
         service.store.log_object(row["id"], who=HUB, kind="compact", body=(
             f"{before} not compacted: a headless Claude has no console to type /compact into"))
         return
     else:
         ok, what = console.send(proc["pid"], "/compact")
     if ok:
-        sent[sid] = context
+        sent[sid] = (context, time.monotonic())
     service.store.log_object(row["id"], who=HUB, kind="compact", body=(
         f"{before}: /compact sent ({what})" if ok else f"{before}: /compact not sent: {what}"))
 

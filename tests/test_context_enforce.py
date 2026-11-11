@@ -10,6 +10,7 @@ from support import TOKEN, Fixture
 from test_respawn import RespawnRig
 
 from almanac import door, fleet as fl, gemini_host, spawner, web
+from almanac.store import Store
 
 
 class EnforceRig(RespawnRig):
@@ -126,6 +127,24 @@ class SelfTests(EnforceRig):
         after[0]()
         self.assertEqual(self.killed, [500])
 
+    def test_an_end_that_fails_after_the_reply_takes_the_retire_back(self):
+        self.fleet.kill.side_effect = lambda pid, created: (False, "Access is denied.", {"pid": pid})
+        after, used = [], self.used()
+        door.log_to_object(self.service, "impl", self.service.caller("impl", None),
+                           {"ref": f"T-{self.task['id']}", "status": "accepted"}, after=after)
+        self.assertEqual((self.retired(), self.used()), (True, used - 1))
+        after[0]()
+        self.assertEqual((self.retired(), self.used()), (False, used), "still running: its row and slot come back")
+        self.assertIn("was not retired", self.entries("retired")[0]["body"])
+
+    def test_with_no_way_to_end_it_the_retire_is_not_deferred(self):
+        after = []
+        with mock.patch.object(door, "_live_proc", return_value=dict(pid=500)):     # no `created`: nothing to kill by
+            door.log_to_object(self.service, "impl", self.service.caller("impl", None),
+                               {"ref": f"T-{self.task['id']}", "status": "accepted"}, after=after)
+        self.assertEqual((after, self.killed, self.retired()), ([], [], False))
+        self.assertIn("was not retired", self.entries("retired")[0]["body"])
+
 
 class SlotTests(EnforceRig):
     def test_a_retired_member_gives_its_slot_back_and_a_respawn_takes_none(self):
@@ -139,6 +158,16 @@ class SlotTests(EnforceRig):
         self.assertIn("was not running", self.store.object_log(self.task["id"], 1)[0]["body"])
         self.assertEqual(self.used(), 1, "the same handle is a member again: one slot, not two")
         self.assertFalse(self.retired(res["session_id"]))
+
+    def test_on_a_created_ts_tie_the_newest_row_is_the_last_inserted(self):
+        self.accept()
+        self.store.record_spawn(agent_name="impl", session_id="sess-impl-2", squad_id="sq-1", role_id="implementer-claude",
+                                provider="claude", model=None, effort=None, cwd=str(self.ws), worktree_path=None, pid=501,
+                                spawned_by="arch")
+        self.store.db.execute("update spawned_agents set created_ts = 5 where agent_name = 'impl'")
+        self.store.db.commit()
+        self.assertEqual(self.store.spawned(squad_id="sq-1", agent_name="impl", limit=1)[0]["session_id"], "sess-impl-2")
+        self.assertEqual(self.used(), 1, "the respawned handle is a member: its newest row is not retired")
 
     def test_a_retired_handle_cannot_be_given_a_task(self):
         self.accept()
@@ -200,15 +229,56 @@ class CompactTests(EnforceRig):
         self.assertEqual(self.typed, [])
         self.assertIn("headless", self.entries("compact")[0]["body"])
 
-    def test_no_second_compact_until_the_reading_changes(self):
+    def at(self, seconds):
+        return mock.patch.object(door.time, "monotonic", return_value=1_000_000.0 + seconds)
+
+    def test_no_second_compact_on_the_same_reading(self):
         self.lead_at(400_000)
-        second, third = self.object(owner="sess-impl"), self.object(owner="sess-impl")
-        self.accept()
-        self.accept(task=second)
-        self.assertEqual(len(self.typed), 1, "two tasks accepted back to back: one /compact")
+        second = self.object(owner="sess-impl")
+        with self.at(0):
+            self.accept()
+        with self.at(door.COMPACT_COOLDOWN + 1):
+            self.accept(task=second)
+        self.assertEqual(len(self.typed), 1, "the same reading: one /compact")
+
+    def test_two_accepts_a_minute_apart_send_once(self):
+        second = self.object(owner="sess-impl")
+        self.lead_at(400_000)
+        with self.at(0):
+            self.accept()
+        self.lead_at(410_000)                     # a busy lead: its reading moved before the queued /compact ran
+        with self.at(60):
+            self.accept(task=second)
+        self.assertEqual(len(self.typed), 1)
+
+    def test_after_the_cooldown_it_sends_again(self):
+        second = self.object(owner="sess-impl")
+        self.lead_at(400_000)
+        with self.at(0):
+            self.accept()
         self.lead_at(410_000)
-        self.accept(task=third)
+        with self.at(door.COMPACT_COOLDOWN + 1):
+            self.accept(task=second)
         self.assertEqual(len(self.typed), 2)
+
+    def test_the_headless_note_is_given_once_within_the_cooldown(self):
+        self.procs["sess-arch"]["role"] = "headless"
+        second = self.object(owner="sess-impl")
+        self.lead_at(400_000)
+        self.accept()
+        self.lead_at(410_000)
+        self.accept(task=second)
+        self.assertEqual((self.typed, len(self.entries("compact")), len(self.entries("compact", second))), ([], 1, 0))
+
+    def test_another_squads_member_of_the_same_name_is_not_the_creator(self):
+        self.store.record_spawn(agent_name="arch", session_id="sess-arch-2", squad_id="sq-2", role_id="architect-claude",
+                                provider="claude", model=None, effort=None, cwd=str(self.ws), worktree_path=None, pid=101)
+        theirs = self.object(owner="sess-impl")
+        self.store.db.execute("update objects set created_by = 'sess-arch-2' where id = ?", (theirs["id"],))
+        self.store.db.commit()
+        self.lead_at(400_000)
+        self.accept(agent=None, task=theirs)
+        self.assertEqual(self.typed, [], "filed by sq-2's arch: this squad's arch is not its creator")
 
     def test_owner_and_creator_both(self):
         self.store.upsert_role(dict(self.store.role("implementer-claude"), context_policy="compact-at-1000"))
@@ -260,6 +330,44 @@ class GeminiHostTests(Fixture):
         events, meta = fl.read_tail(tx)
         self.assertIsNone(meta["stall"], "an empty SUCCESS is not a failed turn")
         self.assertEqual(events[-1]["text"], "(compacted)")
+
+
+    def test_a_compact_turn_keeps_the_step_reading(self):
+        """agy's checkpoint step re-reads nothing and its result.usage is running totals: neither the stored context
+        nor the live one may move (to 0, or to the totals marked context_total)."""
+        sessions = self.root / "sessions"
+        sessions.mkdir()
+        gem = self.root / "gem"
+        tx = gem / "C--x" / "s-gem.jsonl"
+        tx.parent.mkdir(parents=True)
+        host = gemini_host.GeminiHost(name="gem", cwd=str(self.root), transcript_path=tx, sessions_dir=sessions,
+                                      session_id="s-gem", in_memory_uds=True, quiet=True, system_prompt="Be a lead.",
+                                      model="gemini-4-carbon")
+        self.addCleanup(host.close)
+        totals = {"input_tokens": 10000, "cache_read_tokens": 20000}
+        turns = [
+            [{"type": "step_update", "step_update": {"step_index": 1, "step_type": "agent_response", "state": "DONE",
+                                                     "usage": dict(totals, output_tokens=100)}},
+             {"type": "result", "result": {"status": "SUCCESS", "response": "done",
+                                           "usage": dict(totals, output_tokens=100)}}],
+            [{"type": "step_update", "step_update": {"step_index": 2, "step_type": "checkpoint", "state": "DONE",
+                                                     "usage": {"output_tokens": 784}}},
+             {"type": "result", "result": {"status": "SUCCESS", "response": "",
+                                           "usage": dict(totals, output_tokens=884)}}],
+        ]
+        host.enqueue_prompt("build it")
+        host._on_peer_message({"channel": "__almanac_control__", "body": json.dumps({"op": "compact"})})
+        for out in turns:
+            item = host.turns.get_nowait()
+            proc = mock.MagicMock(stdin=io.StringIO(), stdout=io.StringIO("".join(json.dumps(e) + "\n" for e in out)))
+            with mock.patch.object(host, "_ensure_stream_proc", return_value=proc):
+                host.run_one_turn(item)
+        meta = fl.read_tail(tx)[1]
+        self.assertEqual((meta["context"], meta["context_total"]), (30000, False))
+        store = Store(self.root / "state" / "almanac.db")
+        self.addCleanup(store.close)
+        store.ingest(gem, provider="gemini")
+        self.assertEqual(store.session_context("s-gem"), 30000)
 
 
 class CharterTests(Fixture):
