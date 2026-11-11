@@ -743,9 +743,9 @@ class Service:
         # a sender that is not a live session is still known by its newest spawn record
         known = sender_peer or self.store.spawn_of(sender) or {}
         eff_squad = squad_id or known.get("squad_id")
-        if sender == "operator" and target == "@squad" and not eff_squad:
+        if sender == "operator" and target in ("@squad", "#squad") and not eff_squad:
             live = {p["squad_id"] for p in all_peers if p.get("squad_id")}
-            eff_squad = live.pop() if len(live) == 1 else None     # one live squad is the only reading of @squad
+            eff_squad = live.pop() if len(live) == 1 else None     # one live squad is the only reading of either
 
         if target in ("operator", "almanac-hub", "hub"):
             entry = self.store.record_message(
@@ -764,10 +764,8 @@ class Service:
         # Broadcast targets: @all, @squad, or #channel
         if target in ("@all", "@squad") or target.startswith("#"):
             eff_channel = channel or (target if target.startswith("#") else "#squad" if target == "@squad" else None)
-            if target == "#squad" and not eff_squad and sender != "operator":
-                raise ValueError("#squad needs a squad: the sender is not in one")
-            if target == "@squad" and not eff_squad:
-                raise ValueError("@squad needs a squad: the sender is not in one, no squad_id was given, "
+            if target in ("@squad", "#squad") and not eff_squad:          # #squad and @squad mean one thing
+                raise ValueError(f"{target} needs a squad: the sender is not in one, no squad_id was given, "
                                  "and there is not exactly one live squad")
             # Only @all reaches everyone. A squad post stays in the squad; a channel post goes to its subscribers in
             # the sender's squad (an agent in no squad reaches only peers in none; the operator in none, any squad).
@@ -781,8 +779,7 @@ class Service:
                 if target == "@squad" and p.get("squad_id") != eff_squad:
                     continue
                 if target.startswith("#") and (
-                    # #squad reaches the whole squad, subscribed or not; never a session in no squad
-                    (target not in (p.get("channels") or []) if target != "#squad" else not p.get("squad_id"))
+                    (target != "#squad" and target not in (p.get("channels") or []))   # #squad: the whole squad
                     or ((eff_squad or sender != "operator") and p.get("squad_id") != eff_squad)
                 ):
                     continue

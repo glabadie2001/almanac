@@ -95,8 +95,8 @@ class AgentTokenTests(MeshRig):
 
 class BroadcastScopeTests(MeshRig):
     def test_operator_channel_post_reaches_subscribers_only(self):
-        _, _, res = self.send(to="#squad", text="x")
-        self.assertEqual(set(res["delivered"]), {"arch", "impl", "other"})
+        _, _, res = self.send(to="#impl", text="x")
+        self.assertEqual(set(res["delivered"]), {"impl"})
         self.assertNotIn("outsider", self.heard())
 
     def test_squad_post_stays_in_the_squad(self):
@@ -107,12 +107,13 @@ class BroadcastScopeTests(MeshRig):
         self.assertEqual(self.heard(), {"impl"})
 
     def test_operator_squad_post_needs_exactly_one_live_squad(self):
-        status, _, res = self.send(to="@squad", text="x")
-        self.assertEqual(status, 400)
+        for target in ("@squad", "#squad"):            # the same squad, by either name
+            self.assertEqual(self.send(to=target, text="x")[0], 400, target)
         del self.machine.procs[700]                    # sq-2 ends: one live squad left
         self.fleet.last["at"] = 0
-        status, _, res = self.send(to="@squad", text="x")
-        self.assertEqual((status, set(res["delivered"])), (200, {"arch", "impl"}))
+        for target in ("@squad", "#squad"):
+            status, _, res = self.send(to=target, text="x")
+            self.assertEqual((status, set(res["delivered"])), (200, {"arch", "impl"}), target)
         self.assertNotIn("outsider", self.heard())
 
     def test_a_sender_that_is_not_live_is_placed_by_its_spawn_record(self):

@@ -200,7 +200,8 @@ can be indexed after the fact with a model pass over the saved transcripts, less
 - An agent can still direct-message any live session by name. Left alone on purpose: naming a peer is
   deliberate, and Claude Code's own `SendMessage` allows it regardless.
 - The operator can post a `#channel` across squads when no squad is selected. Left alone on purpose:
-  subscription is explicit.
+  subscription is explicit. `#squad` is the exception: it means `@squad` (every member, subscribed or not), so
+  with no squad selected it needs exactly one live squad, like `@squad`.
 - Worktime: time a tool sits on a permission prompt counts as work (the transcript cannot tell it from a slow
   tool), and a Gemini agent that waits through `call_mcp_tool(ToolName="mesh_wait")` is not seen as waiting.
 - Never seen in a browser: the roster `✉N` badge, a real browser Notification, the elastic strip editor, the
@@ -223,7 +224,8 @@ can be indexed after the fact with a model pass over the saved transcripts, less
   denies every shell command, so a role's `allowed_commands` (exact command lines, agy allow rules) is the only
   way; `--dangerously-skip-permissions` (role permission mode `bypass`) is the other route.
 - Headless `agy` denies `read_file` outside the workspace; a Gemini role's `add_dirs` passes `--add-dir` per
-  folder, which makes each part of the agent's workspace (edits included, as its mode allows), not read-only. `read_file(<target>)` allow rules through `--settings` (beside the command rules) were not tried.
+  folder, which makes each part of the agent's workspace (edits included, as its mode allows), not read-only.
+  `read_file(<target>)` allow rules through `--settings` (beside the command rules) were not tried.
 - An agent token can read any session's context stream (`/api/mesh/context?peer=<any session id>` falls back to
   any stored transcript, the operator's own chats included) and any squad's messages, the operator's inbox among
   them. Same advisory model as the tokens; restricting agents to their own squad's peers is the fix if this ever
