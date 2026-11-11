@@ -2240,9 +2240,17 @@ function paintPlan() {
   if (brief) tog.hidden = mp.classList.contains("clamp") && mp.scrollHeight <= mp.clientHeight + 1;   // fits in two lines
 
   const rows = planState.rows, byOwner = planState.group === "owner";
-  const sig = JSON.stringify([planState.group, meshState.selTask, planState.note, rows, rows.map(planOwnerState), state.ctxWarn, rows.map(planOwnerCtx), rows.map((o) => planLast(o.last_log))]);
-  if (sig === planState.sig) return;                   // polled: do not rebuild (and drop focus) when nothing changed
-  planState.sig = sig;
+  const sig = JSON.stringify([planState.group, meshState.selTask, planState.note, rows, rows.map(planOwnerState), rows.map((o) => planLast(o.last_log))]);
+  // what the owner chips show (rounded k and the warn class), not the raw count: that moves on every step
+  const ctxSig = JSON.stringify(rows.map((o) => { const [n, t] = planOwnerCtx(o); return [ctxText(n, t), ctxWarn(n)]; }));
+  if (sig === planState.sig) {                         // polled: do not rebuild (and drop focus) when nothing changed
+    if (ctxSig !== planState.ctxSig) {                 // only a chip's size or warning moved: swap the chips, leave the rows
+      planState.ctxSig = ctxSig;
+      for (const o of rows) $("plan-table").querySelector(`tr[data-ref="${CSS.escape(o.ref)}"] td:nth-child(4)`)?.replaceChildren(ownerChip(o));
+    }
+    return;
+  }
+  planState.sig = sig; planState.ctxSig = ctxSig;
   $("plan-counts").replaceChildren(
     el("span", { cls: "hi", text: `${rows.length} task${rows.length === 1 ? "" : "s"}` }),
     ...PLAN_STATUSES.flatMap((s) => {
