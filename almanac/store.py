@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import sqlite3
 import statistics
 import threading
@@ -170,6 +171,7 @@ OLD_REVIEWER = "You are the Cross-Model Peer Reviewer. Watch implementers' conte
 DEFAULT_ROLES = (
     dict(
         id="orchestrator-claude",
+        context_policy="compact-at-300000",
         title="Squad Orchestrator (Claude)",
         provider="claude",
         model="opus",
@@ -184,6 +186,7 @@ DEFAULT_ROLES = (
     ),
     dict(
         id="architect-gemini",
+        context_policy="compact-at-300000",
         title="System Architect (Gemini)",
         provider="gemini",
         model="",
@@ -197,6 +200,7 @@ DEFAULT_ROLES = (
     ),
     dict(
         id="architect-claude",
+        context_policy="compact-at-300000",
         title="System Architect (Claude)",
         provider="claude",
         model="opus",
@@ -210,6 +214,7 @@ DEFAULT_ROLES = (
     ),
     dict(
         id="implementer-claude",
+        context_policy="fresh-per-task",
         title="Implementer (Claude)",
         provider="claude",
         model="sonnet",
@@ -224,6 +229,7 @@ DEFAULT_ROLES = (
     ),
     dict(
         id="implementer-gemini",
+        context_policy="fresh-per-task",
         title="Implementer (Gemini)",
         provider="gemini",
         model="",
@@ -235,6 +241,7 @@ DEFAULT_ROLES = (
     ),
     dict(
         id="reviewer-gemini",
+        context_policy="none",
         title="Peer Reviewer (Gemini)",
         provider="gemini",
         model="",
@@ -247,6 +254,7 @@ DEFAULT_ROLES = (
     ),
     dict(
         id="reviewer-claude",
+        context_policy="none",
         title="Peer Reviewer (Claude)",
         provider="claude",
         model="opus",
@@ -352,6 +360,12 @@ class Store:
         for column in ("models", "efforts"):
             if column not in have:
                 self.db.execute(f"alter table roles add column {column} text default '[]'")
+        # v11: what happens to an agent's context at a task boundary. Roles that already exist get the shipped
+        # default by id once, when the column is added (the rest: none); a restart never overwrites a later choice
+        if "context_policy" not in {r[1] for r in self.db.execute("pragma table_info(roles)")}:
+            self.db.execute("alter table roles add column context_policy text default 'none'")
+            for r in DEFAULT_ROLES:
+                self.db.execute("update roles set context_policy = ? where id = ?", (r["context_policy"], r["id"]))
         # v10: a role that may restart Almanac (POST /api/mesh/restart)
         if "may_restart" not in {r[1] for r in self.db.execute("pragma table_info(roles)")}:
             self.db.execute("alter table roles add column may_restart integer default 0")
@@ -428,12 +442,13 @@ class Store:
         self.db.execute(
             f"insert {'or ignore ' if ignore else ''}into roles (id, title, provider, model, effort, workspace_mode, "
             "permission_mode, system_prompt, channels, updated_ts, may_page_operator, may_spawn, allowed_commands, "
-            "may_restart, models, efforts) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "may_restart, models, efforts, context_policy) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (r["id"], r["title"], r["provider"], r["model"], r["effort"], r["workspace_mode"],
              r["permission_mode"], r["system_prompt"], json.dumps(r["channels"]), time.time(),
              int(bool(r.get("may_page_operator"))), int(bool(r.get("may_spawn"))),
              json.dumps(r.get("allowed_commands") or []), int(bool(r.get("may_restart"))),
-             json.dumps(r.get("models") or []), json.dumps(r.get("efforts") or [])),
+             json.dumps(r.get("models") or []), json.dumps(r.get("efforts") or []),
+             r.get("context_policy") or "none"),
         )
 
     def _rekey_spawned(self):
@@ -1260,7 +1275,8 @@ class Store:
         with self.lock:
             rows = self.db.execute(
                 "select id, title, provider, model, effort, workspace_mode, permission_mode, system_prompt, channels, updated_ts, "
-                "may_page_operator, may_spawn, allowed_commands, add_dirs, may_restart, models, efforts from roles order by id"
+                "may_page_operator, may_spawn, allowed_commands, add_dirs, may_restart, models, efforts, "
+                "coalesce(context_policy, 'none') from roles order by id"
             ).fetchall()
         out = []
         for r in rows:
@@ -1287,6 +1303,7 @@ class Store:
                     may_restart=bool(r[14]),
                     models=[str(m) for m in _json_list(r[15])],
                     efforts=[str(e) for e in _json_list(r[16])],
+                    context_policy=r[17],
                 )
             )
         return out
@@ -1341,6 +1358,9 @@ class Store:
         grow = None if grow is None else int(grow is True or str(grow).strip().lower() in ("1", "true", "yes", "on"))
         models, efforts = _choices(doc, "models", lambda m: split_model_effort(provider, m)[0]), \
             _choices(doc, "efforts", lambda e: split_model_effort(provider, None, e)[1])
+        # absent or null keeps the stored policy (a new role: none); anything else must be one of the three forms
+        policy = doc.get("context_policy")
+        policy = normalize_context_policy(policy) if policy is not None else (old or {}).get("context_policy") or "none"
         boot = doc.get("may_restart")
         boot = None if boot is None else int(boot is True or str(boot).strip().lower() in ("1", "true", "yes", "on"))
         cmds = doc.get("allowed_commands")              # a list, or one command per line; absent keeps what it was
@@ -1362,16 +1382,17 @@ class Store:
         with self.lock:
             self.db.execute(
                 "insert into roles (id, title, provider, model, effort, workspace_mode, permission_mode, system_prompt, channels, "
-                "updated_ts, may_page_operator, may_spawn, allowed_commands, add_dirs, may_restart, models, efforts) "
-                "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "updated_ts, may_page_operator, may_spawn, allowed_commands, add_dirs, may_restart, models, efforts, "
+                "context_policy) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "on conflict(id) do update set title=excluded.title, provider=excluded.provider, model=excluded.model, "
                 "effort=excluded.effort, workspace_mode=excluded.workspace_mode, permission_mode=excluded.permission_mode, "
                 "system_prompt=excluded.system_prompt, channels=excluded.channels, updated_ts=excluded.updated_ts, "
                 "may_page_operator=coalesce(?, roles.may_page_operator), may_spawn=coalesce(?, roles.may_spawn), "
                 "allowed_commands=coalesce(?, roles.allowed_commands), add_dirs=coalesce(?, roles.add_dirs), "
-                "may_restart=coalesce(?, roles.may_restart), models=excluded.models, efforts=excluded.efforts",
+                "may_restart=coalesce(?, roles.may_restart), models=excluded.models, efforts=excluded.efforts, "
+                "context_policy=excluded.context_policy",
                 (rid, title, provider, model, effort, wmode, pmode, prompt, json.dumps(channels), now, page or 0, grow or 0,
-                 cmds or "[]", dirs or "[]", boot or 0, json.dumps(models), json.dumps(efforts), page, grow, cmds, dirs, boot),
+                 cmds or "[]", dirs or "[]", boot or 0, json.dumps(models), json.dumps(efforts), policy, page, grow, cmds, dirs, boot),
             )
             self.db.commit()
         return self.role(rid)
@@ -1733,6 +1754,32 @@ class Store:
             a = self.db.execute(f"select {SPAWNED_COLUMNS} from spawned_agents where session_id = ?",
                                 (session_id,)).fetchone()
         return dict(zip(SPAWNED_COLUMNS.split(", "), a), channels=_json_list(a[11])) if a else None
+
+
+CONTEXT_POLICY_FORMS = "none, fresh-per-task, or compact-at-<tokens> (compact-at-300000 or compact-at-300k)"
+
+
+def normalize_context_policy(value) -> str:
+    """A role's `context_policy` in its stored form: none, fresh-per-task, or compact-at-<N> with N whole tokens
+    (`compact-at-300k` is read as 300000). Anything else is refused."""
+    text = str(value if value is not None else "").strip().lower()
+    m = re.fullmatch(r"compact-at-([0-9]{1,9})(k?)", text)
+    if text in ("none", "fresh-per-task"):
+        return text
+    if m and int(m[1]) > 0:
+        return f"compact-at-{int(m[1]) * (1000 if m[2] else 1)}"
+    raise ValueError(f"context_policy must be {CONTEXT_POLICY_FORMS}, not {str(value)!r}")
+
+
+def parse_context_policy(value) -> tuple[str, int | None]:
+    """(kind, n): kind is `none`, `fresh` or `compact`; n is the token count for compact, else None. An empty value
+    (a role stored before the column) is none; an invalid one raises ValueError."""
+    text = normalize_context_policy(value) if value else "none"
+    if text == "fresh-per-task":
+        return "fresh", None
+    if text.startswith("compact-at-"):
+        return "compact", int(text[len("compact-at-"):])
+    return "none", None
 
 
 def _choices(doc: dict, key: str, norm) -> list[str]:
