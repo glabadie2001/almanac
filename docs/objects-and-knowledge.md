@@ -104,8 +104,8 @@ v1 was reviewed by rev-gemini, and the architect ruled on each finding. The deci
 **D2 Scope.** Tasks and findings belong to a squad. Notes belong to a project (the main checkout root, so every
 worktree shares one set) and outlive squads.
 
-**D3 Columns.** `objects`: `id, kind, project, squad_id, title, status, owner_session, parent_id` (finding → task,
-note → the note it supersedes), `files` (repo-relative paths or globs, canonicalized to forward slashes relative to
+**D3 Columns.** `objects`: `id, kind, project, squad_id, title, body, status, owner_session, parent_id` (task →
+the task it is part of, so a squad's tasks form a tree; finding → task; note → the note it supersedes), `files` (repo-relative paths or globs, canonicalized to forward slashes relative to
 the checkout root), `sha, branch, created_by` (session), `created_ts, updated_ts`, and `data` (JSON for
 kind-specific fields). `object_log`: `id, object_id, ts, session, agent_name, role_id, provider, kind, body,
 status_from, status_to, sha, message_id`. The status vocabulary per kind lives in code. A task is created with
@@ -115,8 +115,10 @@ fallback.
 **D4 Agent surface: four tools, explicit links only.**
 - `mesh_object(ref)`: the object and its log tail.
 - `mesh_objects(kind, status, owner, path, q)`: list and search (LIKE first, FTS5 when that falls short).
-- `mesh_log(ref, body, kind, status?)`: append, optionally changing status.
-- `mesh_file(kind, title, body, files?, parent?)`: create.
+- `mesh_log(ref, body, kind?, status?, owner?)`: append, optionally changing status or owner.
+- `mesh_file(kind, title, body, files?, owner?, parent?, status?)`: create. Filing with an owner is the assignment.
+
+Stage 1's exact contract for these is in "Stage 1 spec: the plan view" below.
 
 `mesh_send` gains `re="T-12"`, which logs the message on that object. Nothing else links: no scanning bodies for
 refs. A status change made through `mesh_log` makes the hub send one notice to the object's creator. A plain
@@ -227,7 +229,7 @@ Where the work attaches in today's code:
 | Stage | What | Size |
 |---|---|---|
 | 0 | Identity: agent tokens carry the session id. `web.agent_token` is called at spawner.py:422, before the session id is minted at :445, so reorder those first | S |
-| 1 | Tasks only: `objects`, `object_log`, the four tools, `mesh_send(re=)`, status-change notice to the creator, both spawn paths create a T with `files` and put its ref and log tail in the kickoff, a board in MESH | M |
+| 1 | The plan view: tasks only, as a tree per squad with owners. `objects`, `object_log`, the routes and four tools, `mesh_send(re=)`, assignment by filing with an owner, the status-change notice, both spawn paths file a T, the charter protocol, and PLAN at the top of MESH. Spec below | M |
 | 2 | Findings as a kind with verdicts (item 14) | S–M |
 | 3 | Notes, trust states, freshness, the brief's notes section | M |
 | 4 | Derived stats (`calls.path`, `base_sha`, one in-progress task per session), export, librarian, respawn with handoff (item 13) | M |
@@ -240,6 +242,171 @@ Carried over from the earlier ROADMAP text of items 9 and 14:
   records a verdict (`fix now` | `defer` | `reject`) with a reason. The fix links back when it lands, and a re-run
   marks it verified. Joined with usage and worktime, this gives tokens and minutes per accepted finding, acceptance
   rate by reviewer model, the share of nits, and how often a fix causes a regression.
+
+## Stage 1 spec: the plan view
+
+Goal: the operator sees the squad's plan and who is working on which part. This section is the contract between
+a backend and a UI implementer working in parallel. It is a spec, not a build.
+
+### Model
+
+- **Tree.** A squad's tasks form a tree: top-level tasks have no parent, and `parent_id` makes parts of parts. The
+  parent must be a task in the same squad. It is set only at creation, so there can be no cycles. Stage 1 accepts
+  only `kind = task`; any other kind is refused with `400 "kind <k>: not yet"`.
+- **Statuses:** `queued`, `in progress`, `in review`, `accepted`, `blocked`. When none is given, a new task is
+  `in progress` if it has an owner and `queued` if not. Any status may follow any other; stage 1 enforces no
+  transitions.
+- **Owner.** A live or ended member of the task's squad, given by handle. The door resolves the handle to that
+  squad's newest `spawned_agents` row for it, which is the session, and stores `owner_session`. An unknown handle is
+  refused with `400`. Until stage 0 lands, the handle is the identity, with ROADMAP's reuse caveat.
+- **Assignment.** Filing a task with an owner, or changing its owner, makes the hub send the owner one message
+  from the caller: `"[T-12 assigned to you] <title>\n\n<body>\n\nFiles: <files>\nHand in with mesh_log(ref=\"T-12\",
+  status=\"in review\")"`. The message is journaled, and an `object_log` row (`kind = assign`, `message_id`)
+  links it. An owner that has ended gets the row and a journaled message, which is undelivered; the result says so
+  (`delivered: false`).
+- **Spawn paths.** Both `launch_squad` and `join_squad` file a T for a member that has a task: title is the first
+  line of the task (cut at 120 characters), body is the whole text, the owner is the new member, status is
+  `in progress`, and the creator is the caller (the operator, or the agent that called `mesh_spawn`). The ref goes
+  in the kickoff under "## Your Initial Assignment (`T-12`)". A member launched with only the mission gets no T.
+  **No assignment message is sent on this path**: the kickoff already carries the task, and a second prompt right
+  after it restarts the newcomer's turn (the join notice skips the newcomer for this reason, spawner.py:915).
+- **Charter protocol** (`build_mesh_charter`, every agent, about five lines): architects file each slice with
+  `mesh_file(kind="task", owner=..., files=...)` instead of describing it in a message; owners hand in with
+  `mesh_log(ref, status="in review", body=<files touched, test command and result, what is left>)`; log what
+  was learned, dead ends (`dead:` or `parked: retry when ...`) and what comes next as you go; reply about a task
+  with `mesh_send(..., re="T-12")`.
+- **Who may write.** An agent reads, files and logs only in its own squad; any member may do so. Anyone may change
+  status or owner in stage 1. The log records who did, and the view shows it. The operator names a squad
+  explicitly; see the default rule under the API contract.
+- **Status-change notice.** A status change, through `mesh_log` or `POST /api/mesh/object/log`, sends one hub
+  message to the task's creator: `"[T-12 <from> → <to> by <agent>] <title>\n\n<body of the entry>"`. It goes to
+  `operator` when the operator created the task, and it is not sent when the creator made the change. The notice is
+  not linked as a second log row.
+
+### API contract
+
+All routes are under `/api/mesh/`, so agent tokens reach them (web.py:257) and so does the operator. Errors use
+the existing shape: `400 {"error": ...}` for bad input, `404` for an unknown ref, `403` for another squad's
+object.
+
+**Squad default.** For an agent, the squad is its own (as in `/api/mesh/send`), and a `squad=` that differs is
+refused with `403`. For the operator, `squad` is required, except that with exactly one live squad it defaults to
+that squad (the `@squad` rule, door.py:746).
+
+**Refs.** A ref is the kind letter plus the row id (`T-12`). Routes accept the ref or the bare id; responses always
+carry both.
+
+`GET /api/mesh/objects?squad=&kind=&status=&owner=&q=&limit=`. `status` takes a comma list, and `owner` takes a
+handle or `none` for unowned tasks. `q` matches title and body with LIKE. `limit` defaults to 200, maximum 500.
+Rows come in tree order: parents before their children, siblings by `id`.
+
+```json
+{"objects": [{
+  "ref": "T-12", "id": 12, "kind": "task", "title": "...", "status": "in progress",
+  "squad_id": "alpha-squad-563100", "parent": "T-3",
+  "owner_name": "impl-claude", "owner_session": "8da9...", "owner_state": "busy",
+  "files": ["almanac/store.py"], "created_by_name": "arch-claude",
+  "created_ts": 1794415400.1, "updated_ts": 1794416200.5,
+  "children": {"total": 3, "accepted": 1},
+  "log_count": 4,
+  "last_log": {"ts": 1794416200.5, "agent_name": "impl-claude", "kind": "status",
+               "body": "first 200 characters", "status_to": "in review"}
+}], "rev": 4711}
+```
+
+Two additions to the architect's draft contract. `owner_state` (`busy` | `idle` | `ended` | `null` when unowned) is
+computed by the door from `mesh_peers()`; this keeps the view from joining against the roster, which lists live
+peers only, so an ended owner is absent from it. `children` is computed server-side for `accepted n/m`. `rev` is
+the newest `object_log.id`, for refresh (see the view).
+
+`GET /api/mesh/object?ref=T-12&log_limit=20` (log_limit maximum 500) returns
+`{"object": {...the row above, "body": "..."}, "log": [{"id", "ts", "agent_name", "role_id", "provider", "kind",
+"body", "status_from", "status_to", "owner_to", "message_id"}]}`, with the log newest first.
+
+`POST /api/mesh/object` takes `{kind, title, body, files?, owner?, parent?, status?, squad?}` and returns
+`{"object": {...}, "delivered": true | false | null}` (null: no owner). `title` is required, 1–120 characters;
+`body` is at most 8,000 characters, and an oversized one is refused with "trim". `files` is a list or one per
+line, repo-relative, stored with forward slashes, at most 50. The creation writes a `kind = create` log row.
+
+`POST /api/mesh/object/log` takes `{ref, body, kind?, status?, owner?}` and returns
+`{"object": {...}, "entry": {...}, "delivered": ...}`. `kind` defaults to `note`, and becomes `status` or
+`assign` when those change; the agent-facing kinds are `note`, `learned`, `dead`, `parked` and `next`. A body is
+required unless status or owner changes. `delivered` refers to the assignment message, if any.
+
+`POST /api/mesh/send` accepts `re` ("T-12"). The message is journaled as today, and one `object_log` row
+(`kind = message`, `message_id`, body = first 200 characters) is added to the task. An unknown or foreign `re`
+is refused with `400` before anything is sent.
+
+`GET /api/mesh` gains `objects_rev`: the newest `object_log.id`, or 0.
+
+**Tools** (mcp_mesh.py), one to one: `mesh_objects(squad?, kind?, status?, owner?, q?, limit?)` → GET objects;
+`mesh_object(ref, log_limit?)` → GET object; `mesh_file(kind, title, body, files?, owner?, parent?, status?)` →
+POST object; `mesh_log(ref, body, kind?, status?, owner?)` → POST object/log; `mesh_send` gains `re`. The `--cli`
+verbs gain `objects | object | file | log`. Agents alive across the restart that ships this keep their old tool
+list until respawned (ROADMAP "Left open"), so the CLI fallback is their route.
+
+**Storage (schema v10).**
+
+```sql
+create table if not exists objects (
+    id integer primary key autoincrement, kind text not null, project text not null, squad_id text,
+    title text not null, body text not null default '', status text not null,
+    owner_session text, parent_id integer references objects(id),
+    files text not null default '[]', sha text, branch text,
+    created_by text, created_by_name text not null, created_ts real not null, updated_ts real not null,
+    data text not null default '{}');
+create index if not exists objects_squad on objects(squad_id, kind, status);
+create table if not exists object_log (
+    id integer primary key autoincrement, object_id integer not null references objects(id), ts real not null,
+    session text, agent_name text not null, role_id text, provider text, kind text not null, body text not null,
+    status_from text, status_to text, owner_to text, message_id integer);
+create index if not exists object_log_object on object_log(object_id, id);
+```
+
+`created_by_name` and `agent_name` are stored as well as the session, because the view shows names, and an
+operator row has no session.
+
+### The view
+
+PLAN sits at the top of the MESH tab, for the selected squad (`meshState.squadFilter`).
+
+- **Header:** the squad's mission (its brief, collapsed to two lines with a toggle) and counts by status.
+- **Rows:** one per task, indented by depth. Each row shows the ref, the title, a status pill and an owner chip
+  coloured by `owner_state` (an `ended` owner is dimmed, and an unowned task says "unowned"). Then the file count,
+  and the last log line with its age ("impl-claude · in review · 4m"). A parent shows `accepted n/m` from
+  `children`.
+- **By owner:** a toggle regroups the same rows under one heading per owner, with "unowned" last. The tree's
+  indent is dropped in this mode and the parent ref is shown instead.
+- **Detail:** a click opens the task (body, files, full log) through `GET /api/mesh/object`, in the same detail pane
+  the peer context uses.
+- **Refresh:** **Code check:** MESH has no refresh separate from the 2-second poll. `loadMesh()` runs every 2
+  seconds on the MESH tab (app.js:2840), and the button calls it too. So PLAN loads when the tab opens and when the
+  `objects_rev` that `loadMesh()` already receives from `/api/mesh` changes; owner chips follow the roster on every
+  poll without a refetch. That is one integer per poll, plus a fetch only after a write.
+- **Empty state:** "No tasks filed. The architect files them with mesh_file."
+- **Operator actions:** none in stage 1. The view is read-only; the operator files and logs through the same
+  routes (curl or a later form). A file form is the first stage-1.5 candidate.
+
+### Order and parallel work
+
+1. **Stage 0, identity** (small, first). Agent tokens carry the session: `agent.<name>.<session>.<sig>`, and the
+   door's `self.agent_session`. **Code check:** `web.agent_token` is called at spawner.py:422, before the session
+   id is minted at :445, so move the uuid up. `agent_of` (web.py:78) takes the name as everything between the
+   first and last dot, so it would read `name.session` as the name: it must split three ways, and the signature
+   must cover `agent:<name>:<session>`. Names and uuids contain no dots, so the split is unambiguous. Old
+   two-part tokens keep parsing as handle-only until their agents end.
+2. **Backend A:** store (v10 tables, the queries above) and the routes, with tests through the door handler like
+   `test_squad_channel.py`.
+3. **Backend B** (after A's store methods): tools and CLI verbs, `mesh_send(re=)`, both spawn paths, the
+   charter lines.
+   **Code check:** `launch_squad` builds every member's kickoff before any spawn, and the session id is minted
+   inside `spawn_agent`. So the T is filed first, unowned (`queued`), with its ref in the kickoff. After a
+   successful spawn, its owner is set to the new session and its status to `in progress`, without the
+   assignment message. A spawn that fails leaves the T queued and unowned, which the plan shows honestly.
+   `join_squad` works the same way.
+4. **UI** in parallel with 2 and 3, against the JSON above. A fixture response is enough to start.
+
+`messages`, flag closing, the inbox and the topology are untouched: `object_log` is separate (D1).
 
 ## 5. Open questions for the operator
 
