@@ -226,6 +226,9 @@ can be indexed after the fact with a model pass over the saved transcripts, less
 - Headless `agy` denies `read_file` outside the workspace; a Gemini role's `add_dirs` passes `--add-dir` per
   folder, which makes each part of the agent's workspace (edits included, as its mode allows), not read-only.
   `read_file(<target>)` allow rules through `--settings` (beside the command rules) were not tried.
+- Gemini shell calls are recorded without their command: ingest reads `input.command` (store.py:525), but Gemini's
+  `run_command` carries `CommandLine` (fleet.py:266), so `family`, `head` and the adoption scores are empty for
+  them. Found by reading (rev-gemini), not reproduced on a transcript; not fixed.
 - An agent token can read any session's context stream (`/api/mesh/context?peer=<any session id>` falls back to
   any stored transcript, the operator's own chats included) and any squad's messages, the operator's inbox among
   them. Same advisory model as the tokens; restricting agents to their own squad's peers is the fix if this ever

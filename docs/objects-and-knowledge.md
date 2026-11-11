@@ -1,18 +1,19 @@
 # Work objects and the Almanac Engram
 
-Covers ROADMAP items 9 (task ledger), 10 (Engram for Almanac) and 14 (findings ledger). They share one primitive:
-an addressable record that agents hold a reference to, look up, and log to.
+This doc covers ROADMAP items 9 (task ledger), 10 (Engram for Almanac) and 14 (findings ledger). All three need
+the same primitive: an addressable record that agents hold a reference to, look up, and log to.
 
 ## 1. Status (2026-11-11)
 
-**No work object exists yet.** The plans for tasks-as-objects and an Almanac Engram, sent for planning on
-2026-11-10, did not land. Nothing for them is on this machine, on origin (`main` and `cross-model-mesh`), or in the
-mesh journal, and `~/.claude/plans/` holds nothing related. Almanac stores what it observes (session, call, turn,
-usage) and what it coordinates (message, flag, squad, role). It does not store work.
+**No work object exists yet.** The plans for tasks-as-objects and an Almanac Engram were sent for planning on
+2026-11-10 and did not land. Nothing for them is on this machine, on origin (`main` and `cross-model-mesh`), or in
+the mesh journal, and `~/.claude/plans/` holds nothing related. Almanac stores what it observes (session, call,
+turn, usage) and what it coordinates (message, flag, squad, role). It does not store work.
 
 ### Object inventory
 
-How close each concept is to an object an agent can hold a reference to. Paths are under `almanac/`.
+How close each concept is to an object an agent can hold a reference to. Paths are under `almanac/` as of
+b3bbabb.
 
 | Concept | Stored | Id | Agent receives the id | Agent can look it up | Agent can append | Lifecycle |
 |---|---|---|---|---|---|---|
@@ -30,7 +31,7 @@ How close each concept is to an object an agent can hold a reference to. Paths a
 | spawn task | **not a field anywhere**; see the trace below | none | its own text, in the kickoff | no | no | none |
 | finding | prose in message bodies | none | | | | |
 | journal note | not stored; native Engram was not installed (ROADMAP §10) | | | | | |
-| experiment | not stored; ROADMAP §7 proposes `experiments` | | | | | |
+| experiment | not stored; ROADMAP §5 proposes `experiments` | | | | | |
 
 ### Where a spawn task's text goes
 
@@ -41,84 +42,86 @@ How close each concept is to an object an agent can hold a reference to. Paths a
 3. Transport: Claude gets the kickoff as an argv item or a stream-json stdin frame (spawner.py:535–545). Gemini gets
    it as `.almanac/spawns/<name>-<sid8>/initial_prompt.md` (spawner.py:605).
 4. What outlives the session: `sessions.first_prompt` keeps the first **200 characters**, whitespace-collapsed
-   (store.py:507), which is the "## Squad Mission" header, not the task. A `mesh_spawn` join notice to `@squad` keeps
-   `task[:300]` (spawner.py:911); `actions.detail` says only "X joined S as R". `record_spawn` (store.py:1344) has no
-   task column. The full text survives only in the raw transcript (and its archive copy).
+   (store.py:507). That is the "## Squad Mission" header, not the task. A `mesh_spawn` join notice to `@squad` keeps
+   `task[:300]` (spawner.py:911); `actions.detail` says only "X joined S as R". `record_spawn` (store.py:1344) has
+   no task column. The full text survives only in the raw transcript and its archive copy.
 
-## 2. Design draft v1
+## 2. Design v2
 
-> **Draft, under review by rev-gemini.** Their findings will be folded in as a follow-up edit. Where the draft and
-> the code disagree today, the disagreement is marked **Code check**.
+v1 was reviewed by rev-gemini, and the architect ruled on each finding. The decisions below are v2.
 
-**D1 One primitive.** A new `objects` table. Its log is the existing `messages` table with a nullable `object_id`
-and an entry `kind`, not a second log table: attribution, journaling, the stream UI and its filters already exist
-there. A ref is a kind letter plus the row id: `T-12` task, `F-13` finding, `N-14` note.
+**D1 One primitive, its own log.** A new `objects` table and a separate `object_log` table, with an optional
+`message_id` when an entry came in through `mesh_send`. A ref is a kind letter plus the row id: `T-12` task,
+`F-13` finding, `N-14` note.
 
 **D2 Scope.** Tasks and findings belong to a squad. Notes belong to a project (the main checkout root, so every
 worktree shares one set) and outlive squads.
 
-**D3 Columns.** `id, kind, project, squad_id, title, status, owner_session, parent_id` (finding → task, note →
-the note it supersedes), `paths` (globs), `sha, branch, created_by` (session), `created_ts, updated_ts`, `data` (JSON
-for kind-specific fields). The status vocabulary per kind lives in code.
+**D3 Columns.** `objects`: `id, kind, project, squad_id, title, status, owner_session, parent_id` (finding → task,
+note → the note it supersedes), `files` (repo-relative paths or globs, canonicalized to forward slashes relative to
+the checkout root), `sha, branch, created_by` (session), `created_ts, updated_ts`, and `data` (JSON for
+kind-specific fields). `object_log`: `id, object_id, ts, session, agent_name, role_id, provider, kind, body,
+status_from, status_to, sha, message_id`. The status vocabulary per kind lives in code. A task is created with
+`files`, which ROADMAP item 9 always had. When none are given, repo paths named in the task text are the
+fallback.
 
-**D4 Agent surface: four tools.**
-- `mesh_object(ref)`: the object, its log tail and derived stats.
+**D4 Agent surface: four tools, explicit links only.**
+- `mesh_object(ref)`: the object and its log tail.
 - `mesh_objects(kind, status, owner, path, q)`: list and search (LIKE first, FTS5 when that falls short).
 - `mesh_log(ref, body, kind, status?)`: append, optionally changing status.
-- `mesh_file(kind, title, body, paths?, parent?)`: create.
+- `mesh_file(kind, title, body, files?, parent?)`: create.
 
-`mesh_send` gains `re="T-12"`, and a message body that names a ref is linked to it. A slice report is then one act:
-the report is the task's log entry and is delivered to the architect and reviewer.
-*Code check:* body-scan linking will also catch refs quoted in prose ("unlike T-12…"). Treat `re=` as the link and
-body mentions as soft links, or link a body mention only when the ref is in the sender's squad.
+`mesh_send` gains `re="T-12"`, which logs the message on that object. Nothing else links: no scanning bodies for
+refs. A status change made through `mesh_log` makes the hub send one notice to the object's creator. A plain
+log entry notifies nobody.
 
-**D5 Derived, never written.** For a task with an owner session and in-progress intervals, Almanac joins calls
-(edits, errors), usage (tokens, cost), turns (worktime), linked messages and the worktree branch's commits. Agents
-write only what cannot be derived: what was learned, dead ends (`dead`, or `parked: retry when X`), and what comes
-next.
-*Code check, edited files:* `calls` stores **no file path**. `cmd` is recorded only for shell tools, and then only
-its `head` (leading word) and length (store.py:525, 561–565); Edit/Write inputs are dropped. "Files a task touched"
-needs a new `calls.path` column filled from `input.file_path`, plus a one-time transcript re-read (the v6 pattern:
-`delete from files`). The alternative is the branch diff below, which covers worktree agents only.
-*Code check, branch commits:* the snapshot a worktree was cut from is not stored. `ensure_worktree` passes
-`snapshot_commit()` straight to `git worktree add` (spawner.py:268). When the checkout was dirty, that snapshot is an
-extra "almanac: uncommitted work at spawn" commit, so `git log <base>..<branch>` from any stored ref would
-include it. Listing the branch's commits is cheap (one `git log`) once `spawned_agents` gets a `base_sha` column
-written at spawn. Shared-checkout agents have no branch; for them, only `calls.path` works.
+**D5 Derived stats, stage 4.** Agents write only what cannot be derived: what was learned, dead ends (`dead`, or
+`parked: retry when X`), and what comes next. Joining calls, usage, turns and commits onto a task waits until
+stage 4. It needs three things that do not exist yet:
+- `calls.path`: `calls` stores **no file path**. `cmd` is recorded only for shell tools, and then only its `head`
+  and length (store.py:525, 561–565). Edit and Write inputs are dropped.
+- `spawned_agents.base_sha`: the snapshot a worktree was cut from is not stored. `ensure_worktree` passes
+  `snapshot_commit()` straight to `git worktree add` (spawner.py:268), and when the checkout was dirty, an extra
+  "almanac: uncommitted work at spawn" commit sits under the agent's work.
+- **One in-progress task per session**, so a call or a turn belongs to exactly one task. Gemini usage is written
+  after the whole `agy` turn ends (gemini_host.py), so attribution by time is approximate for Gemini.
 
-**D6 Read path.** Both kickoff builders add a brief: your task ref and its log tail (a respawn with the same ref is
-item 13's handoff), the squad's open tasks as one-liners, and up to N notes whose paths intersect the task's paths,
-dead ends first, each with a freshness marker. Hard cap about 40 lines; everything else is pulled with the tools.
-Works for Gemini; needs no hook.
-*Code check:* Claude's kickoff travels as one argv item (spawner.py:545), so a brief has to stay well under
-Windows' 32,767-character command line together with the charter and other arguments. 40 lines fits; the cap
-should be in characters, not only lines.
+**D6 Read path.** Both kickoff builders add a brief. It holds your task ref and its log tail (a respawn with the
+same ref is item 13's handoff), and the squad's open tasks as one-liners. From stage 3 it also holds up to N
+notes that match the task's `files`, ranked exact file > glob > project scope, with project-scope notes held to
+at most 2 slots. Each note carries a freshness marker. Notes are wrapped in the brief as data, not instructions.
+The cap is about 40 lines **and** a character budget: Claude's kickoff is one argv item (spawner.py:545) and
+shares Windows' 32,767-character command line with the charter. Everything else is pulled with the tools. This
+works for Gemini and needs no hook.
 
-**D7 Trust.** A note is born a `claim`, signed with session, role, model, sha and branch. `verified` requires a
-different session to re-check it against the code. Anyone may log a contest, which makes it `contested`. Then
-`superseded` or `retracted`. Operator notes are born `directive`. Trust order: code > directive > verified and
-fresh > claim. A brief carries directives and verified notes, plus claims from the reader's own squad only.
-*Code check:* "a different session" is enforceable only after D11. Today the door knows the handle, and handles
-repeat across squads.
+**D7 Trust.** A note is born a `claim`. The door stamps it with session, role, provider, model, sha and branch;
+the client sends none of them. `verified` requires a verifier of a different role class than the author: the
+reviewer role or the operator. The provider is recorded and shown. Anyone may log a contest, which makes the note
+`contested`. A note ends as `superseded` or `retracted`. Operator notes are born `directive`, and directives are
+minted only on an `/api/operator/*` route, never on `/api/mesh/*`, so the token-file fallback in `mcp_mesh` cannot
+mint one. Trust order: code > directive > verified and fresh > claim. A brief carries directives and verified
+notes, plus claims from the reader's own squad only. A dead end leads the brief only once verified.
 
-**D8 Freshness.** Computed on read (brief build, `mesh_object`), never on the 2-second poll:
-`git log <sha>..HEAD -- <paths>` in the main checkout gives fresh, or drifted with the files named. A sha that is
-not an ancestor of the main checkout's HEAD makes the note `pending on <branch>`, visible only to its squad until
-merged. No manifest sidecar in v1.
-*Code check, two problems:*
-1. "Merged" never happens today. Worktree work is integrated with `git apply` of `git diff <snapshot>..HEAD`
-   (ROADMAP §12), so the agent's commits never become ancestors of the main checkout's HEAD, and a note signed in a
-   worktree would stay `pending` forever. Either integration becomes a real merge or cherry-pick (item 12), or the
-   integrator re-stamps pending notes to the integration commit, or freshness is checked with
-   `git diff <sha> HEAD -- <paths>` (content, not ancestry), which works across `apply`.
-2. The main checkout is not on `main`: it is on `cross-model-mesh` (local `main` is at 97a7c44). Use the
-   checkout's HEAD, never a branch name.
+**D8 Freshness.** Computed on read (brief build, `mesh_object`), never on the 2-second poll. A note is `fresh`
+when its sha is an ancestor of the main checkout's HEAD (`git merge-base --is-ancestor`) and
+`git diff --name-only <sha>..HEAD` names none of its files. If that diff names any of them, the note is `drifted`
+with those files named. If the sha is not an ancestor, the note is `pending on <branch>`, visible only to its
+squad. HEAD always means the checkout's HEAD, never a branch name: the checkout is on `cross-model-mesh`, and
+local `main` is stale. The git work is one `git diff --name-only` per distinct sha, cached by (sha, HEAD), with
+globs matched by `fnmatch`. Beside `fresh`, a note shows how many commits have landed since it was verified, to
+cover drift outside its files.
+**Verifying re-stamps.** Worktree work is integrated with `git apply` (ROADMAP §12), so an agent's commits never
+become ancestors of HEAD. A note signed on a branch therefore stays `pending` until someone verifies it. The door
+stamps the verifier's own HEAD as the note's sha, so a reviewer on the main checkout verifying after integration
+is what lifts `pending`. No separate mechanism.
 
-**D9 Budgets and anchoring.** A note body is capped, and the door refuses an oversized one with "trim". A note needs
-at least one path, or an explicit project scope. Corrections supersede; they do not append contradictions.
+**D9 Budgets and anchoring.** A note body is capped, and the door refuses an oversized one with "trim". A note
+needs at least one file, or an explicit project scope. Corrections supersede; they do not append contradictions.
 
-**D10 Portability.** Verified and directive notes are exported to markdown in the repo, written only by Almanac,
-on demand and at squad end. Knowledge then travels by git to another machine and is readable by sessions not
+**D10 Portability, stage 4, on the operator's action only.** Verified and directive notes can be exported to
+markdown in the repo. Only Almanac writes the files, each carries its sha, and an export runs only when no
+worktree in the squad is live, because writing into the checkout would break `git apply --3way` for any
+integration still pending. Knowledge then travels by git to another machine and is readable by sessions not
 launched from Almanac. Tasks, findings and logs stay in the database.
 
 **D11 Prerequisite.** Agent tokens carry the session id (ROADMAP "identity at the door is its handle"). Attribution
@@ -129,35 +132,58 @@ of log entries depends on it.
 **Cut from Engram for v1:** metrics events and the scorecard, architecture diagrams, manifests, the status line,
 monthly digests, wikilinks (refs replace them), skills and hooks.
 
+### Changed after review
+
+- **D1 overturned.** v1 logged into `messages` with an `object_id`, because attribution, journaling and the stream
+  UI already exist there. But `messages` feeds topology nodes, flag closing, `mesh_wait` wakeups, the operator
+  inbox and more than 20 queries in store.py. Log entries would have appeared as phantom messages in all of
+  them, and `to_name` is `not null`. The smaller diff was in the wrong place, so v2 uses a separate `object_log`.
+- **D4 body scanning cut.** `[TFN]-\d+` also matches `UTF-8` and refs quoted in prose. Only `re=` links. Report
+  fan-out became one notice to the creator on a status change.
+- **D5 moved to stage 4.** Edit paths are not recorded, the worktree base is not stored, and one session can hold
+  two tasks or one turn can span two. Gemini usage also lags a whole turn.
+- **D7 "a different session" replaced.** A second session of the same role proves nothing, so the verifier must
+  hold a different role class. The door stamps every sha; clients never send one. Directives come only from an
+  operator route.
+- **D8 kept ancestry and dropped the content-diff idea.** Comparing content alone would call an unmerged
+  branch's note on an untouched file `fresh`, leaking it across squads. It would also call integrated notes
+  `drifted` once HEAD moves. Instead of a separate re-stamp step at integration, verification re-stamps.
+- **D6 ranking added.** Wildcard and project-scope notes would starve file-specific ones. Tasks had no files to
+  match against, so `files` was added.
+- **D10 restricted.** An export dirties the checkout and breaks `apply --3way`, so it runs only on the operator's
+  action with no live worktree.
+- **Kept as v1:** stage 1 is tasks only. The review proposed bringing the notes brief forward; the architect
+  rejected that, because the operator's ask is a reference an agent can look up and log to.
+
 ## 3. Seams
 
 Where the work attaches in today's code:
 
-- **Store.** `_migrate` (store.py:265); additive DDL goes in `SCHEMA` (store.py:29). The stamp
-  `insert or replace into meta values ('schema', '8')` is near the end of `_migrate`, so this is **v9**. Follow the
-  existing pattern: `create table if not exists`, `pragma table_info` checks before `alter table`, and a
-  `version < 9` block for backfill.
+- **Store.** `_migrate` (store.py:265), with additive DDL in `SCHEMA` (store.py:29). The add_dirs slice took schema
+  **v9**, so `objects` and `object_log` are **v10**. Follow the existing pattern: `create table if not exists`,
+  `pragma table_info` checks before `alter table`, and a `version < 10` block for backfill.
 - **Door.** The GET and POST branches of `make_handler._dispatch` (door.py:1246–1360). A route reachable by an
-  agent token must sit under `/api/mesh/` (`AGENT_PATHS`, web.py:64). The caller is `self.agent` (a handle, see
-  D11), and its squad is derived the way `/api/mesh/send` derives it.
+  agent token must sit under `/api/mesh/` (`AGENT_PATHS`, web.py:64); a route minting directives must not. The
+  caller is `self.agent` (a handle, see D11), and its squad is derived the way `/api/mesh/send` derives it.
 - **MCP.** The tool list in mcp_mesh.py (entries at :27–200), the `MeshClient` methods (:238–330), `handle_rpc`
   (:333), the `--cli` verbs, and charter line 6, which names those verbs (spawner.py:157).
 - **Kickoff and charter.** `build_mesh_charter` (spawner.py:~140–185) for the tool text. There are two kickoff
-  builders, `launch_squad` (spawner.py:728–738) and `join_squad` (spawner.py:876–890). Both create the T object and
-  put its ref under "## Your Initial Assignment".
-- **Messages.** A nullable `messages.object_id`, set by `re=`. A flag could also be closed by naming the message
-  it answers, which would fix the inferred closing at store.py:952.
-- **Spawns.** `spawned_agents.base_sha` (D5) and, later, the task ref.
+  builders, `launch_squad` (spawner.py:728–738) and `join_squad` (spawner.py:876–890). Both create the T object,
+  with `files` from the member spec or the `mesh_spawn` body, and put its ref under "## Your Initial Assignment".
+- **Messages.** `mesh_send(re=)` writes an `object_log` row with `message_id`. `messages` itself gets no new
+  column.
+- **Spawns (stage 4).** `spawned_agents.base_sha`, and `calls.path` filled from `input.file_path` with a one-time
+  transcript re-read (the v6 pattern: `delete from files`).
 
 ## 4. Stages
 
 | Stage | What | Size |
 |---|---|---|
-| 0 | Identity: agent tokens carry the session id | S |
-| 1 | Tasks: `objects`, `messages.object_id`, the four tools, both spawn paths create a T and put its ref in the kickoff, a board in MESH. Includes `calls.path` and `spawned_agents.base_sha` if D5's stats are wanted in v1 | M |
+| 0 | Identity: agent tokens carry the session id. `web.agent_token` is called at spawner.py:422, before the session id is minted at :445, so reorder those first | S |
+| 1 | Tasks only: `objects`, `object_log`, the four tools, `mesh_send(re=)`, status-change notice to the creator, both spawn paths create a T with `files` and put its ref and log tail in the kickoff, a board in MESH | M |
 | 2 | Findings as a kind with verdicts (item 14) | S–M |
-| 3 | Notes, trust states, freshness, the brief | M |
-| 4 | Export, librarian, respawn with handoff (item 13) | M |
+| 3 | Notes, trust states, freshness, the brief's notes section | M |
+| 4 | Derived stats (`calls.path`, `base_sha`, one in-progress task per session), export, librarian, respawn with handoff (item 13) | M |
 
 Carried over from the earlier ROADMAP text of items 9 and 14:
 
@@ -170,9 +196,9 @@ Carried over from the earlier ROADMAP text of items 9 and 14:
 
 ## 5. Open questions for the operator
 
-1. Should durable knowledge live in the database only, or also be exported to markdown in the repo? Export is recommended.
-2. Who may mark a claim verified: any other session (recommended), the reviewer role only, or only the operator?
+1. Should verified knowledge live in the database only, or also be exported to markdown in the repo on your
+   action? Export is recommended, with D10's restrictions.
+2. Who may mark a claim verified? The reviewer role or the operator is recommended; the alternative is the
+   operator only.
 3. Should notes be per project only (recommended), or shared across projects too?
 4. Should stages 0 and 1 be built now?
-5. (From the D8 check.) Should item 12 make integration a real merge, so that notes signed on a branch become
-   fresh once integrated? Or should freshness compare content (`git diff`) instead of ancestry?
