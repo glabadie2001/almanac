@@ -147,10 +147,12 @@ MCP_TOOLS = [
     {
         "name": "mesh_spawn",
         "description": (
-            "Add one member to your squad, if your role may add members. The role it gets (with its model, "
-            "workspace and permission mode) and how many may be added are the operator's choice, shown in mesh_roster "
-            "as the squad's spawn_role, spawn_limit and spawn_used; you only give the task. Refused with the reason "
-            "when the limit is used up. The squad is told who joined."
+            "Add one member to your squad, if your role may add members. The role it gets (with its workspace and "
+            "permission mode) and how many may be added are the operator's choice, shown in mesh_roster as the squad's "
+            "spawn_role, spawn_limit and spawn_used. You give the task, and the model and effort: both are required when "
+            "the role offers more than one (its model plus `models`, its effort plus `efforts`, in mesh_roster's roles), "
+            "optional when it offers one. Refused with the reason when the limit is used up or a pick is missing or "
+            "not allowed. The squad is told who joined."
         ),
         "inputSchema": {
             "type": "object",
@@ -170,8 +172,10 @@ MCP_TOOLS = [
                 },
                 "files": {"type": "array", "items": {"type": "string"},
                           "description": "Repo-relative paths or globs the new member's task may touch (filed on its T)."},
-                "model": {"type": "string", "description": "One of the role's `models` (mesh_roster); default: the role's model."},
-                "effort": {"type": "string", "description": "One of the role's `efforts`; default: the role's effort."},
+                "model": {"type": "string", "description": ("The role's model or one of its `models` (mesh_roster). Required "
+                                                            "when the role offers more than one; else optional.")},
+                "effort": {"type": "string", "description": ("The role's effort or one of its `efforts`. Required when the "
+                                                             "role offers more than one; else optional.")},
                 "why": {"type": "string", "description": "One line: why this model and effort fit the slice."},
             },
             "required": ["task"],

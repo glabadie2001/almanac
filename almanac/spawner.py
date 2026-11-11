@@ -178,8 +178,9 @@ def build_mesh_charter(
         lines.append(
             f"8. **Grow the squad**: {what} to this squad, up to {grow['limit']} in total "
             "(the operator sets it; `mesh_roster` shows what is left). Use it for slices that can run in parallel on separate "
-            "files; give each a named slice and its files; you stay responsible for integrating their branches. Pick the cheapest model that fits the slice and "
-            "say why (`mesh_spawn(..., model=, effort=, why=)`, from the role's `models` / `efforts` in `mesh_roster`): "
+            "files; give each a named slice and its files; you stay responsible for integrating their branches. When the role offers more than one model or "
+            "effort (`models` / `efforts` in `mesh_roster`) you must name both, or the spawn is refused: pick the cheapest "
+            "model that fits the slice and say why (`mesh_spawn(..., model=, effort=, why=)`): "
             "Haiku for mechanical work that fails loudly (renames, moves, rote edits); Sonnet for well-specified "
             "multi-file work in existing idioms; Opus for work that fails subtly (concurrency, migrations, auth, the spawn "
             "path). Raise effort before raising the model."

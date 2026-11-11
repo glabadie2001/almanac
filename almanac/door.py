@@ -1238,7 +1238,9 @@ def _why(raw) -> str | None:
 
 def elastic_choice(role: dict, body: dict) -> dict:
     """The model and effort an agent picked for a member of `role`, each checked against what the role allows: its own
-    default plus its `models` / `efforts` (additional choices). Absent: the role's default. 400 naming what is allowed."""
+    default plus its `models` / `efforts` (additional choices). An agent must pick when the role offers more than one;
+    with a single option, leaving it out means that one. 400 naming what is allowed. (The operator's own paths never
+    come here: they fall back to the role's model and effort.)"""
     from almanac.spawner import split_model_effort
     raw_m, raw_e = str(body.get("model") or "").strip(), str(body.get("effort") or "").strip()
     # an effort written into the model (`claude-haiku-5-5-low`, `sonnet-max`) is a pick too, checked like `effort`
@@ -1247,9 +1249,14 @@ def elastic_choice(role: dict, body: dict) -> dict:
     effort = (split_model_effort(role["provider"], None, raw_e)[1] or raw_e) if raw_e else embedded
     out = {}
     for key, raw, value in (("model", raw_m, model or raw_m), ("effort", raw_e or raw_m, effort)):
-        if not value:
-            continue
         allowed = list(dict.fromkeys(([role[key]] if role.get(key) else []) + list(role.get(key + "s") or [])))
+        if not value:
+            if len(allowed) > 1:
+                raise ValueError(f"pick {'a model' if key == 'model' else 'an effort'}: role {role['id']} allows "
+                                 + ", ".join(allowed) + f" (mesh_spawn(..., {key}=...))")
+            if allowed:
+                out[key] = allowed[0]           # the one option, even when the role's own default is blank
+            continue
         if value not in allowed:
             raise ValueError(f"{key} {raw!r}: role {role['id']} allows "
                              + (", ".join(allowed) if allowed else f"no {key} choice (it runs the runner's default)"))

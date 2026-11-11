@@ -13,7 +13,16 @@ from almanac.store import Store
 HAIKU, SONNET, OPUS = "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"
 
 
-class RoleSetTests(ElasticRig):
+class SeededRig(ElasticRig):
+    """ElasticRig with the implementer's seeded choices put back (ElasticRig fixes it at one model and effort)."""
+
+    def setUp(self):
+        super().setUp()
+        self.store.upsert_role(dict(self.store.role("implementer-claude"), models=[HAIKU, SONNET, OPUS],
+                                    efforts=["low", "medium", "high"]))
+
+
+class RoleSetTests(SeededRig):
     def test_seeded_sets_round_trip_and_alternatives_only(self):
         impl = self.store.role("implementer-claude")
         self.assertEqual((impl["model"], impl["models"], impl["efforts"]), ("sonnet", [HAIKU, SONNET, OPUS], ["low", "medium", "high"]))
@@ -40,7 +49,7 @@ class RoleSetTests(ElasticRig):
         self.assertEqual(s.role("implementer-claude")["models"], [], "the operator's roles are not reseeded")
 
 
-class AgentChoiceTests(ElasticRig):
+class AgentChoiceTests(SeededRig):
     def spawn_as_arch(self, **body):
         return self.request(self.handler, "/api/mesh/spawn", token=web.agent_token(TOKEN, "arch", "sess-arch"),
                             method="POST", body={"task": TASK, **body})
@@ -69,10 +78,10 @@ class AgentChoiceTests(ElasticRig):
         self.assertEqual((self.flag("--model"), self.flag("--effort")), (OPUS, "medium"))
 
     def test_outside_the_sets_it_is_refused_naming_what_is_allowed(self):
-        status, _, res = self.spawn_as_arch(model="claude-mythos-9")
+        status, _, res = self.spawn_as_arch(model="claude-mythos-9", effort="low")
         self.assertEqual(status, 400)
         self.assertIn(f"sonnet, {HAIKU}, {SONNET}, {OPUS}", res["error"])
-        status, _, res = self.spawn_as_arch(effort="max")
+        status, _, res = self.spawn_as_arch(model=HAIKU, effort="max")
         self.assertEqual(status, 400)
         self.assertIn("allows high, low, medium", res["error"])
         self.assertEqual((self.argv, self.used(), self.store.objects_rev()), ([], 0, 0), "nothing started, nothing filed")
@@ -93,6 +102,51 @@ class AgentChoiceTests(ElasticRig):
         self.assertEqual(res["choice"], dict(model=HAIKU, effort="medium", why=None))
         data = json.loads(self.store.db.execute("select data from objects order by id desc limit 1").fetchone()[0])
         self.assertEqual(data, dict(model=HAIKU, effort="medium"))
+
+    def test_a_role_with_several_options_makes_the_agent_pick(self):              # T-16
+        status, _, res = self.spawn_as_arch(effort="low")
+        self.assertEqual(status, 400)
+        self.assertEqual(res["error"], f"pick a model: role implementer-claude allows sonnet, {HAIKU}, {SONNET}, {OPUS} "
+                                       "(mesh_spawn(..., model=...))")
+        status, _, res = self.spawn_as_arch(model=HAIKU)
+        self.assertEqual(status, 400)
+        self.assertIn("pick an effort: role implementer-claude allows high, low, medium", res["error"])
+        status, _, res = self.spawn_as_arch()
+        self.assertIn("pick a model", res["error"])
+        self.assertEqual((self.argv, self.used(), self.store.objects_rev()), ([], 0, 0), "nothing started, nothing filed")
+        self.assertEqual(self.spawn_as_arch(model="claude-haiku-5-5-low")[0], 200, "an effort in the model name is a pick")
+
+    def test_a_single_option_need_not_be_named(self):                              # T-16
+        self.store.upsert_role(dict(self.store.role("implementer-claude"), models=[], efforts=["high"]))
+        status, _, res = self.spawn_as_arch()
+        self.assertEqual(status, 200, res)
+        self.assertEqual((self.flag("--model"), self.flag("--effort")), ("sonnet", "high"))
+        self.store.upsert_role(dict(self.store.role("implementer-claude"), models=["sonnet"], efforts=[]))
+        self.assertEqual(self.spawn_as_arch()[0], 200, "a list that only repeats the default is one option")
+
+    def test_a_single_option_with_a_blank_default_runs_that_option(self):          # T-16 review
+        self.store.upsert_role(dict(self.store.role("implementer-claude"), model="", effort="", models=[OPUS],
+                                    efforts=["medium"]))
+        status, _, res = self.spawn_as_arch()
+        self.assertEqual(status, 200, res)
+        self.assertEqual((self.flag("--model"), self.flag("--effort")), (OPUS, "medium"))
+
+    def test_the_tool_description_says_a_pick_may_be_required(self):               # T-16 review
+        spawn = next(t for t in mcp_mesh.MCP_TOOLS if t["name"] == "mesh_spawn")
+        self.assertIn("both are required when the role offers more than one", spawn["description"])
+        self.assertNotIn("you only give the task", spawn["description"])
+        self.assertIn("Required when the role offers more than one", spawn["inputSchema"]["properties"]["model"]["description"])
+
+    def test_the_operators_paths_still_fall_back_to_the_role(self):               # T-16
+        status, _, res = self.request(self.handler, "/api/squad/member", method="POST", body={
+            "squad_id": "sq-1", "role_id": "implementer-claude", "task": TASK})
+        self.assertEqual(status, 200, res)
+        self.assertEqual((self.flag("--model"), self.flag("--effort")), ("sonnet", "high"))
+        status, _, res = self.request(self.handler, "/api/squads", method="POST", body={
+            "name": "gamma", "cwd": str(self.ws), "brief": "b", "members": [
+                {"role_id": "implementer-claude", "agent_name": "doer", "workspace_mode": "shared", "task": "Do it."}]})
+        self.assertEqual(status, 200, res)
+        self.assertEqual((self.flag("--model"), self.flag("--effort")), ("sonnet", "high"))
 
     def test_empty_sets_run_the_role_as_before(self):
         self.store.upsert_role(dict(self.store.role("implementer-claude"), models=[], efforts=[]))
