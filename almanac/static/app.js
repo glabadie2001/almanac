@@ -62,6 +62,8 @@ const meshState = {
   peers: [], messages: [], selPeer: null, ctxKinds: "", msgScope: "all", channelFilter: "",
   seenMsgIds: new Set(), ctxSig: "", squadFilter: "", open: [], pair: null, squadChosen: false,
 };
+// MESH plan: the selected squad's tasks (GET /api/mesh/objects), refetched only when objects_rev or the squad changes
+const planState = { key: null, rev: undefined, rows: [], note: "", stale: true, sig: "", seq: 0, group: get("plan-group", "tree") };
 // feed filters shared by FLEET, GALLERY and the MESH context stream: [kinds= value, label]
 const KIND_SETS = [["", "all"], ["you,claude,gemini,peer_in,peer_out", "dialog"], ["peer_in,peer_out", "contacts"], ["tool,result,error", "tools"]];
 function fillKindSeg(id, current) {
@@ -71,6 +73,12 @@ function pressKindSeg(id, current) {
   document.querySelectorAll(`#${id} button`).forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.v === current)));
 }
 const OPERATOR = new Set(["operator", "almanac-hub"]);
+// a hub notice (transport "system", e.g. an escalation "[stalled] impl-x ...") is sent as almanac-hub but is not the
+// operator's own: it comes from the system, about the agent its body names. Rows without the field read as before.
+const isSystem = (m) => m.transport === "system";
+const sysAgent = (m) => (isSystem(m) && /^\[stalled\]\s+(\S+)/.exec(m.body || "")?.[1]) || null;
+const isMine = (m) => OPERATOR.has(m.from_name) && !isSystem(m);
+const msgFrom = (m) => (isSystem(m) ? sysAgent(m) || "system" : m.from_name);   // who a message is about, for a label
 const ANY_ROLE_NOTE = "any role the operator has defined, including ones that may page you or add members themselves "
   + "(an architect); every member added still counts against this one limit";
 const hhmm = (ts) => new Date(ts * 1000).toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit" });
@@ -155,6 +163,286 @@ async function api(path, opts = {}) {
 }
 const post = (path, body) => api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 const del = (path) => api(path, { method: "DELETE" });
+
+// ------------------------------------------------------------------ markdown (what agents write), as DOM nodes
+// md:begin. A pure parser, text to a small tree: no DOM and no globals, so tests/test_md.py runs this part under node.
+// ponytail: a hand-written subset (fenced code, inline code, # to ####, bold, italic, lists nested by indent, pipe
+// tables, quotes, rules, http(s) links, paragraphs, a newline as a line break). Not handled, shown as literal text:
+// raw HTML, setext headings, reference links, bare URLs, code inside a list item, table alignment, lazy quote lines.
+// Upgrade path: vendor a real parser (markdown-it) plus a sanitizer (DOMPurify) when agents' text outgrows this.
+// Every scan is linear: delimiters are found with indexOf, and a search that found nothing is not repeated.
+const MD_MAX_DEPTH = 8;                               // quotes, lists and emphasis nest this deep; deeper stays literal
+const MD_FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+const MD_HEAD = /^ {0,3}(#{1,4})[ \t]+(.*)$/;
+const MD_ITEM = /^([ \t]*)([-*+]|\d{1,9}[.)])[ \t]+(.*)$/;
+const MD_QUOTE = /^ {0,3}>/;
+const MD_PUNCT = "\\`*_{}[]()#+-.!|>~<";
+
+function mdIndent(s) {
+  let n = 0;
+  for (const ch of s) { if (ch === " ") n++; else if (ch === "\t") n += 4; else break; }
+  return n;
+}
+function mdIsRule(line) {                             // three or more of one of - * _, spaces allowed between
+  const s = line.replace(/[ \t]/g, "");
+  return s.length >= 3 && "-*_".includes(s[0]) && s === s[0].repeat(s.length);
+}
+function mdCells(line) {                              // a table row's cells; \| is a literal pipe, as is one in `code`
+  let s = line.trim();
+  if (s.startsWith("|")) s = s.slice(1);
+  if (s.endsWith("|") && !s.endsWith("\\|")) s = s.slice(0, -1);
+  const cells = [];
+  let cur = "", code = false;
+  for (let k = 0; k < s.length; k++) {
+    const ch = s[k];
+    if (ch === "\\" && s[k + 1] === "|") { cur += "|"; k++; continue; }
+    if (ch === "`") code = !code;
+    if (ch === "|" && !code) { cells.push(cur.trim()); cur = ""; continue; }
+    cur += ch;
+  }
+  cells.push(cur.trim());
+  return cells;
+}
+function mdTableAt(lines, i) {                        // a header row with a pipe, then a rule row of as many cells
+  if (!lines[i].includes("|") || i + 1 >= lines.length || !lines[i + 1].includes("-")) return false;
+  const rule = mdCells(lines[i + 1]);
+  return rule.every((c) => /^:?-+:?$/.test(c)) && rule.length === mdCells(lines[i]).length;
+}
+// only http(s), only what new URL() accepts, and no whitespace: a target with a space is not a link, so an unclosed
+// "[x](https://..." in prose cannot swallow the words up to some later ")"; the text then stays as written
+function mdHref(raw) {
+  const u = raw.trim().replace(/^<(.*)>$/, "$1");
+  if (!u || /\s/.test(u)) return null;
+  try {
+    const url = new URL(u);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.href : null;
+  } catch { return null; }
+}
+
+function mdParse(text, depth = 0) {
+  const lines = String(text ?? "").replace(/\r\n?/g, "\n").split("\n");
+  const out = [];
+  let para = [], i = 0, m;
+  const flush = () => { if (para.length) { out.push({ t: "p", c: mdInline(para.join("\n")) }); para = []; } };
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) { flush(); i++; continue; }
+    if ((m = MD_FENCE.exec(line))) {                  // runs to its closing fence, or to the end when there is none
+      flush();
+      const ch = m[1][0], body = [];
+      for (i++; i < lines.length; i++) {
+        const c = lines[i].trim();
+        if (c.length >= m[1].length && c === ch.repeat(c.length)) { i++; break; }
+        body.push(lines[i]);
+      }
+      out.push({ t: "code", lang: m[2].trim(), text: body.join("\n") });
+      continue;
+    }
+    if (mdIsRule(line)) { flush(); out.push({ t: "hr" }); i++; continue; }
+    if ((m = MD_HEAD.exec(line))) {
+      flush();
+      let h = m[2].trimEnd(), j = h.length;           // a closing run of # goes, when a space comes before it
+      while (j > 0 && h[j - 1] === "#") j--;
+      if (j === 0 || h[j - 1] === " " || h[j - 1] === "\t") h = h.slice(0, j).trimEnd();
+      out.push({ t: "h", level: m[1].length, c: mdInline(h) });
+      i++;
+      continue;
+    }
+    if (MD_QUOTE.test(line)) {
+      flush();
+      const inner = [];
+      for (; i < lines.length && MD_QUOTE.test(lines[i]); i++) inner.push(lines[i].replace(/^ {0,3}> ?/, ""));
+      out.push(depth >= MD_MAX_DEPTH ? { t: "p", c: mdInline(inner.join("\n")) } : { t: "quote", c: mdParse(inner.join("\n"), depth + 1) });
+      continue;
+    }
+    if (mdTableAt(lines, i)) {
+      flush();
+      const head = mdCells(lines[i]), rows = [];
+      for (i += 2; i < lines.length && lines[i].trim() && lines[i].includes("|"); i++) {
+        const cells = mdCells(lines[i]);
+        while (cells.length < head.length) cells.push("");   // a short row is padded; a long one keeps its extra cells
+        rows.push(cells.map((c) => mdInline(c)));
+      }
+      out.push({ t: "table", head: head.map((c) => mdInline(c)), rows });
+      continue;
+    }
+    if (MD_ITEM.test(line)) {
+      flush();
+      const [lists, next] = mdList(lines, i);
+      out.push(...lists);
+      i = next;
+      continue;
+    }
+    para.push(line);
+    i++;
+  }
+  flush();
+  return out;
+}
+
+// a run of list lines: items, lines indented under an item (its continuation), and blank lines between items
+function mdList(lines, i) {
+  const items = [];
+  while (i < lines.length) {
+    const line = lines[i], m = MD_ITEM.exec(line);
+    if (m && !mdIsRule(line)) { items.push({ indent: mdIndent(m[1]), ordered: /\d/.test(m[2]), marker: m[2], text: m[3] }); i++; continue; }
+    if (!line.trim()) {
+      let k = i + 1;
+      while (k < lines.length && !lines[k].trim()) k++;
+      if (k < lines.length && ((MD_ITEM.test(lines[k]) && !mdIsRule(lines[k])) || mdIndent(lines[k]) > items[items.length - 1].indent)) { i = k; continue; }
+      break;
+    }
+    if (mdIndent(line) > items[items.length - 1].indent) { items[items.length - 1].text += "\n" + line.trim(); i++; continue; }
+    break;
+  }
+  const root = { sub: [] }, stack = [{ indent: -1, node: root }];
+  for (const it of items) {
+    while (stack.length > 1 && stack[stack.length - 1].indent >= it.indent) stack.pop();
+    if (stack.length > MD_MAX_DEPTH) stack.length = MD_MAX_DEPTH;   // deeper items become siblings at the limit
+    const parent = stack[stack.length - 1].node;
+    let list = parent.sub[parent.sub.length - 1];
+    if (!list || list.ordered !== it.ordered) { list = { t: "list", ordered: it.ordered, items: [] }; parent.sub.push(list); }
+    const node = { marker: it.marker, c: mdInline(it.text), sub: [] };
+    list.items.push(node);
+    stack.push({ indent: it.indent, node });
+  }
+  return [root.sub, i];
+}
+
+// inline: `code`, **bold** / __bold__, *italic* / _italic_ (an underscore inside a word stays literal, for
+// snake_case paths), [text](http-url), ![alt](http-url) as a link, \-escapes, and a newline as a break
+function mdInline(s, depth = 0) {
+  const out = [], seen = new Map();
+  let buf = "", i = 0, badClose = -1;
+  const push = (node) => { if (buf) { out.push({ t: "text", v: buf }); buf = ""; } out.push(node); };
+  // `from` only grows for a given tok, so a miss stays a miss and a hit at or after `from` is still the first one:
+  // each tok's string is scanned once overall, however many openers ask (a run of "[" before one "]" stays linear)
+  const find = (tok, from) => {
+    let k = seen.get(tok);
+    if (k === -1) return -1;
+    if (k === undefined || k < from) { k = s.indexOf(tok, from); seen.set(tok, k); }
+    return k;
+  };
+  const word = (c) => !!c && /[A-Za-z0-9]/.test(c);
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch === "\\" && i + 1 < s.length && MD_PUNCT.includes(s[i + 1])) { buf += s[i + 1]; i += 2; continue; }
+    if (ch === "\n") { push({ t: "br" }); i++; continue; }
+    if (ch === "`") {
+      let n = 1;
+      while (s[i + n] === "`") n++;
+      const tick = "`".repeat(n);
+      let k = find(tick, i + n);
+      while (k >= 0 && s[k + n] === "`") {            // a longer run is not the closer: skip past it
+        let e = k;
+        while (s[e] === "`") e++;
+        k = s.indexOf(tick, e);
+      }
+      if (k >= 0) {
+        let v = s.slice(i + n, k).replace(/\n/g, " ");
+        if (v.length > 2 && v[0] === " " && v[v.length - 1] === " ") v = v.slice(1, -1);
+        push({ t: "code", v });
+        i = k + n;
+        continue;
+      }
+      buf += tick; i += n;
+      continue;
+    }
+    if (ch === "*" || ch === "_") {
+      const L = s[i + 1] === ch ? 2 : 1, tok = ch.repeat(L), after = s[i + L];
+      if (depth < MD_MAX_DEPTH && (ch === "*" || !word(s[i - 1])) && after && after !== " " && after !== "\n") {
+        const k = find(tok, i + L + 1);               // and the content is more than * and _ (a run of them is text)
+        if (k >= 0 && s[k - 1] !== " " && s[k - 1] !== "\n" && (ch === "*" || !word(s[k + L])) && /[^*_]/.test(s.slice(i + L, k))) {
+          push({ t: L === 2 ? "b" : "i", c: mdInline(s.slice(i + L, k), depth + 1) });
+          i = k + L;
+          continue;
+        }
+      }
+      buf += ch; i++;
+      continue;
+    }
+    if (ch === "[" || (ch === "!" && s[i + 1] === "[")) {
+      const o = ch === "!" ? i + 1 : i, close = find("]", o + 1);
+      if (close >= 0 && close !== badClose && s[close + 1] === "(") {   // a "](" already refused is not tried again
+        const end = find(")", close + 2);
+        const href = end >= 0 ? mdHref(s.slice(close + 2, end)) : null;
+        if (href && depth < MD_MAX_DEPTH) {           // an image is only ever a link: nothing is fetched
+          const label = s.slice(o + 1, close);
+          push({ t: "a", href, c: label ? mdInline(label, depth + 1) : [{ t: "text", v: href }] });
+          i = end + 1;
+          continue;
+        }
+        badClose = close;
+      }
+      buf += s.slice(i, o + 1); i = o + 1;
+      continue;
+    }
+    buf += ch; i++;
+  }
+  if (buf) out.push({ t: "text", v: buf });
+  return out;
+}
+// md:end
+
+// The DOM side: elements and text nodes only (el() sets textContent); the only attribute input reaches is a link's
+// href, after mdHref() allowed it. Rendered trees are cached by text and cloned, as the feeds repaint every 2 s.
+function mdInlineDom(nodes, parent) {
+  for (const n of nodes) {
+    if (n.t === "text") parent.append(n.v);
+    else if (n.t === "br") parent.append(el("br"));
+    else if (n.t === "code") parent.append(el("code", { text: n.v }));
+    else {
+      const node = n.t === "a" ? el("a", { href: n.href, rel: "noopener noreferrer", target: "_blank" }) : el(n.t === "b" ? "strong" : "em");
+      mdInlineDom(n.c, node);
+      parent.append(node);
+    }
+  }
+}
+function mdListDom(list) {
+  const l = el(list.ordered ? "ol" : "ul");
+  for (const it of list.items) {
+    const li = el("li");
+    if (list.ordered) li.append(el("span", { cls: "md-n", text: it.marker }));   // the number as written
+    mdInlineDom(it.c, li);
+    for (const sub of it.sub) li.append(mdListDom(sub));
+    l.append(li);
+  }
+  return l;
+}
+function mdBlockDom(blocks, parent) {
+  for (const b of blocks) {
+    let node;
+    if (b.t === "p" || b.t === "h") { node = el(b.t === "p" ? "p" : `h${b.level}`); mdInlineDom(b.c, node); }
+    else if (b.t === "code") node = el("pre", {}, el("code", { text: b.text }));
+    else if (b.t === "hr") node = el("hr");
+    else if (b.t === "quote") { node = el("blockquote"); mdBlockDom(b.c, node); }
+    else if (b.t === "list") node = mdListDom(b);
+    else if (b.t === "table") {
+      const row = (cells, tag) => el("tr", {}, ...cells.map((c) => { const td = el(tag); mdInlineDom(c, td); return td; }));
+      node = el("div", { cls: "md-table" }, el("table", {}, el("thead", {}, row(b.head, "th")), el("tbody", {}, ...b.rows.map((r) => row(r, "td")))));
+    }
+    if (node) parent.append(node);
+  }
+}
+const mdCache = new Map();
+// renderMd(text): a <div class="md"> holding the text as markdown
+function renderMd(text) {
+  const key = String(text ?? "");
+  let tpl = mdCache.get(key);
+  if (!tpl) {
+    if (mdCache.size >= 600) mdCache.clear();         // ponytail: drop-all cap; an LRU if repaints ever show it
+    tpl = el("div", { cls: "md" });
+    mdBlockDom(mdParse(key), tpl);
+    mdCache.set(key, tpl);
+  }
+  return tpl.cloneNode(true);
+}
+// transcript events: a person's or an agent's words render as markdown; tool calls, results and errors stay raw.
+// fleet.prose cuts at 4000 characters and saveGone at 2000, each ending in "…": a cut text stays plain, as a fence
+// cut in half would render as garbage.
+const cutText = (t, n) => (t.length > n ? `${t.slice(0, n - 1)}…` : t);
+const MD_KINDS = new Set(["you", "claude", "gemini", "peer_in", "peer_out"]);
+const proseNode = (kind, text) => (MD_KINDS.has(kind) && !(text.length >= 1999 && text.endsWith("…")) ? renderMd(text) : text);
 
 // ------------------------------------------------------------------ tooltip
 const tip = $("tip");
@@ -538,7 +826,8 @@ function syncRoleControls() {
     tbody.replaceChildren(...state.roles.map((r) => {
       const tr = el("tr", {},
         el("td", {}, r.id, r.may_page_operator ? el("span", { cls: "amber", text: " ✉", title: "may page the operator" }) : null,
-          r.may_spawn ? el("span", { cls: "cyan", text: " ⊕", title: "may add squad members" }) : null),
+          r.may_spawn ? el("span", { cls: "cyan", text: " ⊕", title: "may add squad members" }) : null,
+          r.may_restart ? el("span", { cls: "red", text: " ⟳", title: "may restart Almanac" }) : null),
         el("td", {}, providerBadge(r.provider)),
         el("td", { text: r.title }),
         el("td", { cls: "model", text: fmtModel(r.model) }),
@@ -736,6 +1025,12 @@ function rowName(p) {
 }
 function rowState(p) {
   if (p.role !== "session") return el("span", { cls: "dim", text: p.role === "desktop" ? "app" : p.role });
+  if (p.stall) {
+    // since / ts are the transcript's ISO timestamps (fleet.read_tail); epoch seconds are taken as well
+    const at = [p.stall.since, p.stall.ts].map((v) => (typeof v === "number" ? v : Date.parse(v) / 1000)).find(Number.isFinite);
+    return el("span", { cls: "flag stalled", text: `▲ STALLED${p.stall.error ? ` · ${p.stall.error}` : ""}`,
+      title: [p.stall.text, at ? `since ${age(at)} ago` : ""].filter(Boolean).join("\n") || "stopped on an API error" });
+  }
   if (active(p)) return el("span", { cls: "state-busy" }, el("span", { cls: "spin", "data-spin": "1", text: SPIN[state.frame % SPIN.length] }), ` ${p.status.toUpperCase()}`);
   return el("span", { cls: "state-idle", text: `· ${p.status || "starting"}` });
 }
@@ -984,7 +1279,7 @@ async function loadDetail() {
   else {
     const items = doc.events.map((e, i) => {
       const key = `${e.ts}|${e.kind}|${e.text.slice(0, 40)}|${i - doc.events.length}`;
-      const li = el("li", { cls: `${e.kind}${state.feedKeys.size && !state.feedKeys.has(key) && !reduced ? " new" : ""}`, text: e.text, title: e.ts ? new Date(e.ts).toLocaleString() : null });
+      const li = el("li", { cls: `${e.kind}${state.feedKeys.size && !state.feedKeys.has(key) && !reduced ? " new" : ""}`, title: e.ts ? new Date(e.ts).toLocaleString() : null }, proseNode(e.kind, e.text));
       li.dataset.key = key;
       return li;
     });
@@ -1118,7 +1413,7 @@ function folderLabel(p) {
 function saveGone() {
   const recs = [...state.tiles.values()].filter((t) => t.gone).sort((a, b) => a.gone - b.gone).map((t) => ({
     p: t.p, gone: t.gone,
-    events: (t.events || []).slice(-60).map((e) => ({ ts: e.ts, kind: e.kind, text: String(e.text ?? "").slice(0, 2000) })),
+    events: (t.events || []).slice(-60).map((e) => ({ ts: e.ts, kind: e.kind, text: cutText(String(e.text ?? ""), 2000) })),
   }));
   put("g-gone", JSON.stringify(recs));
 }
@@ -1292,7 +1587,7 @@ function paintTile(t, doc) {
   const prev = new Set([...t.feed.children].map((li) => li.dataset.k));
   t.feed.replaceChildren(...(events.length ? events.map((e) => {
     const k = `${e.ts}|${e.kind}|${e.text.slice(0, 40)}`;
-    const li = el("li", { cls: `${e.kind}${fresh && !prev.has(k) && !reduced ? " new" : ""}`, text: e.text, title: e.ts ? new Date(e.ts).toLocaleString() : null });
+    const li = el("li", { cls: `${e.kind}${fresh && !prev.has(k) && !reduced ? " new" : ""}`, title: e.ts ? new Date(e.ts).toLocaleString() : null }, proseNode(e.kind, e.text));
     li.dataset.k = k;
     return li;
   }) : [el("li", { cls: "result", text: "no transcript yet" })]));
@@ -1385,6 +1680,7 @@ function populateRoleForm(r) {
   $("role-prompt").value = r ? (r.system_prompt || "") : "";
   $("role-page").checked = !!r?.may_page_operator;
   $("role-grow").checked = !!r?.may_spawn;
+  $("role-restart").checked = !!r?.may_restart;
   $("role-channels").value = (r?.channels || []).join(", ");
   $("role-commands").value = (r?.allowed_commands || []).join("\n");
   $("role-dirs").value = (r?.add_dirs || []).join("\n");
@@ -1414,6 +1710,7 @@ $("role-save").closest("form").addEventListener("submit", async (e) => {
       system_prompt: $("role-prompt").value.trim(),
       may_page_operator: $("role-page").checked,
       may_spawn: $("role-grow").checked,
+      may_restart: $("role-restart").checked,          // a server without the flag ignores the key
       channels: $("role-channels").value.split(",").map((s) => s.trim()).filter(Boolean),
       allowed_commands: $("role-commands").value,
       add_dirs: $("role-dirs").value,
@@ -1442,7 +1739,7 @@ $("mesh-spawn-jump").addEventListener("click", () => {
   show("fleet");
   setDrawer("spawn-drawer", "toggle-spawn", true);
 });
-$("mesh-refresh").addEventListener("click", () => { loadMesh(); if (meshState.selPeer) loadPeerContext(); });
+$("mesh-refresh").addEventListener("click", () => { planState.stale = true; loadMesh(); if (meshState.selPeer) loadPeerContext(); });
 
 // The selected peer is held by session id when there is one (a handle can be reused across squads, and
 // /api/mesh/context?peer=<handle> opens the newest live session of that name); the handle is kept beside it
@@ -1460,6 +1757,7 @@ function selectPeer(name, sid, setTo = true) {
   meshState.selPeer = sid || name || null;
   meshState.selName = name || sid || null;
   meshState.ctxSig = "";
+  closeTask();
   if (setTo && name && document.activeElement !== $("mesh-to")) setMeshTo(name);
 }
 function pickPeer(name, sid) { selectPeer(name, sid); loadMesh(); loadPeerContext(); }
@@ -1474,6 +1772,7 @@ function setMeshSquad(id) {
   meshState.squadFilter = id || "";
   meshState.squadChosen = true;
   meshState.revalidate = true;
+  closeTask();
   setPairFilter(null, null);
 }
 function clearPeerContext() {
@@ -1601,12 +1900,14 @@ async function loadMesh() {
     return tr;
   }));
 
-  if (!meshState.selPeer && meshState.peers.length) {
+  if (!meshState.selPeer && !meshState.selTask && meshState.peers.length) {   // an open task keeps the pane
     const p0 = meshState.peers[0];
     selectPeer(p0.name || String(p0.pid), p0.session_id, false);
     loadPeerContext();
   }
   paintMeshMessages();
+  paintPlan();                 // owner chips follow the roster on every poll
+  loadPlan(doc.objects_rev);   // the rows are refetched only when objects_rev (or the squad) changes
   loadHeat();      // only when the scope changed; the 30 s loop refreshes it
   loadTopo(false, doc.latest_id);
 }
@@ -1686,8 +1987,8 @@ function paintSquadStrip() {
   const brief = (squad.brief || "").replace(/\s+/g, " ").trim();
   const waits = meshState.open.map((m) => {
     const toOp = OPERATOR.has(m.to_name);
-    const text = toOp && m.needs === "blocking" ? `${m.from_name} blocked on operator for ${age(m.ts)}`
-      : `${m.from_name} waits on ${toOp ? "operator" : m.to_name} ${age(m.ts)} (${m.needs})`;
+    const text = toOp && m.needs === "blocking" ? `${msgFrom(m)} blocked on operator for ${age(m.ts)}`
+      : `${msgFrom(m)} waits on ${toOp ? "operator" : m.to_name} ${age(m.ts)} (${m.needs})`;
     return el("span", { cls: m.needs === "blocking" ? "flag blocking" : "flag reply", text, title: m.body.slice(0, 400) });
   });
   paintStripTools(squad);
@@ -1731,7 +2032,7 @@ function paintMeshMessages() {
         el("span", { cls: "dim", text: `[${m.transport || "uds"}]` }),
         needsBadge(m),
       );
-      const body = el("div", { cls: "msg-body", text: m.body });
+      const body = el("div", { cls: "msg-body" }, renderMd(m.body));
       return el("li", { cls: fresh ? "new" : "", "data-id": m.id }, head, body);
     }));
   }
@@ -1741,16 +2042,16 @@ function paintMeshMessages() {
 
 async function loadPeerContext() {
   const want = meshState.selPeer;
-  if (!want) return;
+  if (!want || meshState.selTask) return;          // a task holds the pane until a peer is picked
   let doc;
   try {
     const kindsQ = meshState.ctxKinds ? `&kinds=${encodeURIComponent(meshState.ctxKinds)}` : "";
     doc = await api(`/api/mesh/context?peer=${encodeURIComponent(want)}&limit=60${kindsQ}`);
   } catch (err) {
-    if (meshState.selPeer === want) $("mesh-ctx-head").replaceChildren(el("span", { cls: "red", text: err.message }));
+    if (meshState.selPeer === want && !meshState.selTask) $("mesh-ctx-head").replaceChildren(el("span", { cls: "red", text: err.message }));
     return;
   }
-  if (meshState.selPeer !== want) return;          // another peer was picked meanwhile
+  if (meshState.selPeer !== want || meshState.selTask) return;   // another peer or a task was picked meanwhile
   const p = doc.peer, u = doc.usage;
   $("mesh-ctx-box").setAttribute("data-title", `CONTEXT STREAM // ${p.name}`.slice(0, 56));
   $("mesh-ctx-head").replaceChildren(...[    // replaceChildren would print a null as "null"
@@ -1769,9 +2070,198 @@ async function loadPeerContext() {
   const feed = $("mesh-ctx-feed");
   const atBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 40;
   feed.replaceChildren(...(events.length
-    ? events.map((e) => el("li", { cls: e.kind, text: e.text, title: e.ts ? new Date(e.ts).toLocaleString() : null }))
+    ? events.map((e) => el("li", { cls: e.kind, title: e.ts ? new Date(e.ts).toLocaleString() : null }, proseNode(e.kind, e.text)))
     : [el("li", { cls: "result", text: "no matching context events yet" })]));
   if (atBottom) feed.scrollTop = feed.scrollHeight;
+}
+
+// ------------------------------------------------------------------ mesh: plan (the squad's tasks, who owns which)
+// Read-only. Titles, bodies and log lines are written by agents: set with textContent only (el()).
+const PLAN_STATUSES = ["queued", "in progress", "in review", "accepted", "blocked"];
+const PLAN_EMPTY = "No tasks filed. The architect files them with mesh_file.";
+const slug = (s) => String(s || "").toLowerCase().replace(/[^a-z]+/g, "-");
+
+// fetch, not api(): a server older than the plan answers 404 for these routes, which must neither flag the LINK as down
+// nor be asked again every poll; it returns null and the plan says "this server predates tasks: restart Almanac"
+async function planGet(path) {
+  const res = await fetch(path, { credentials: "same-origin" });
+  const doc = await res.json().catch(() => ({}));
+  if (res.status === 404 && doc.error === "Not found") return null;
+  if (!res.ok) throw new Error(doc.error || `${res.status}`);
+  return doc;
+}
+
+async function loadPlan(rev) {
+  const sq = meshState.squadFilter;
+  if (!planState.stale && sq === planState.key && rev === planState.rev) return;
+  const seq = ++planState.seq;                         // only the newest fetch paints
+  if (sq !== planState.key) { planState.rows = []; planState.note = "loading plan…"; paintPlan(); }
+  planState.stale = false; planState.key = sq; planState.rev = rev;
+  if (!sq) { planState.note = "pick a squad above to see its plan"; paintPlan(); return; }
+  let doc;
+  try {
+    doc = await planGet(`/api/mesh/objects?squad=${encodeURIComponent(sq)}&kind=task&limit=500`);
+  } catch (err) {
+    if (seq !== planState.seq || sq !== meshState.squadFilter) return;
+    planState.stale = true;                            // retried on the next poll, only while it fails
+    planState.note = `plan unavailable: ${err.message}`;
+    paintPlan();
+    return;
+  }
+  if (seq !== planState.seq || sq !== meshState.squadFilter) return;   // a newer fetch or another squad
+  planState.rows = doc?.objects || [];
+  planState.note = doc ? "" : "this server predates tasks: restart Almanac";
+  paintPlan();
+  if (meshState.selTask) loadTask(meshState.selTask);
+}
+
+// the roster decides on every poll, as it is fresher than the fetched rows: a live owner is stalled (stopped on an API
+// error), busy or idle, and an absent one has ended. The rows are only fetched after a roster poll, so the door's own
+// owner_state is never needed here.
+function planOwnerState(o) {
+  if (!o.owner_name) return "none";
+  const p = meshState.peers.find((q) => (o.owner_session ? q.session_id === o.owner_session : q.name === o.owner_name));
+  return !p ? "ended" : p.stall ? "stalled" : active(p) ? "busy" : "idle";   // p.stall: {error, text, ts} while stopped
+}
+const statusPill = (s) => el("span", { cls: `flag st-${slug(s)}`, text: s || "–" });
+function ownerChip(o) {
+  const own = planOwnerState(o);
+  const plain = ["none", "busy", "idle", "ended"].includes(own);   // colour says these; any other state is spelled out
+  return el("span", { cls: `flag own-${slug(own)}`, text: plain ? o.owner_name || "unowned" : `${o.owner_name} · ${own}`,
+    title: own === "none" ? "nobody owns this task" : `${o.owner_name}: ${own}` });
+}
+function planLast(l) {
+  if (!l) return "";
+  const body = (l.body || "").replace(/\s+/g, " ").trim();
+  // a create or assign row has no body; a "dead" entry whose body already starts "dead:" is not prefixed twice
+  const what = l.kind === "status" && l.status_to ? l.status_to
+    : l.kind === "create" ? body || "filed" : l.kind === "assign" ? body || "assigned"
+    : l.kind === "note" || body.toLowerCase().startsWith(`${l.kind}:`) ? body : `${l.kind}: ${body}`;
+  return `${l.agent_name} · ${what} · ${age(l.ts)}`;
+}
+
+function planRow(o, depth, byOwner) {
+  const task = el("td", { cls: "task", title: o.title },
+    byOwner ? (o.parent ? el("span", { cls: "dim", text: `${o.parent} › ` }) : null) : (depth ? el("span", { cls: "dim", text: "└ " }) : null),
+    o.title,
+    o.children?.total ? el("span", { cls: "dim", text: ` · accepted ${o.children.accepted}/${o.children.total}` }) : null);
+  if (!byOwner && depth) task.style.paddingLeft = `${8 + Math.min(depth, 6) * 16}px`;   // CSSOM: the CSP allows no style attribute
+  const tr = el("tr", { tabindex: "0", "data-ref": o.ref, cls: meshState.selTask === o.ref ? "sel" : "" },
+    el("td", { cls: "cyan", text: o.ref }),
+    task,
+    el("td", {}, statusPill(o.status)),
+    el("td", {}, ownerChip(o)),
+    el("td", { cls: "r", text: String(o.files?.length || 0), title: (o.files || []).join("\n") }),
+    el("td", { cls: "last", text: planLast(o.last_log), title: o.last_log?.body || "" }),
+  );
+  tr.addEventListener("click", () => openTask(o.ref));
+  tr.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTask(o.ref); } });
+  return tr;
+}
+
+function paintPlan() {
+  const squad = state.squads.find((s) => s.id === meshState.squadFilter);
+  const brief = squad?.brief || "", mp = $("plan-mission"), tog = $("plan-mission-toggle");
+  $("plan-mission-row").hidden = !brief;
+  if (mp.textContent !== brief) {
+    mp.textContent = brief;
+    mp.classList.add("clamp"); tog.setAttribute("aria-expanded", "false"); tog.textContent = "[more]";
+  }
+  if (brief) tog.hidden = mp.classList.contains("clamp") && mp.scrollHeight <= mp.clientHeight + 1;   // fits in two lines
+
+  const rows = planState.rows, byOwner = planState.group === "owner";
+  const sig = JSON.stringify([planState.group, meshState.selTask, planState.note, rows, rows.map(planOwnerState), rows.map((o) => planLast(o.last_log))]);
+  if (sig === planState.sig) return;                   // polled: do not rebuild (and drop focus) when nothing changed
+  planState.sig = sig;
+  $("plan-counts").replaceChildren(
+    el("span", { cls: "hi", text: `${rows.length} task${rows.length === 1 ? "" : "s"}` }),
+    ...PLAN_STATUSES.flatMap((s) => {
+      const n = rows.filter((o) => o.status === s).length;
+      return n ? [" · ", el("span", { cls: `st-${slug(s)}`, text: `${n} ${s}` })] : [];
+    }));
+  $("plan-empty").hidden = rows.length > 0;
+  $("plan-empty").textContent = planState.note || PLAN_EMPTY;
+  $("plan-table").hidden = !rows.length;
+  let trs;
+  if (byOwner) {
+    const groups = new Map();
+    for (const o of rows) { const k = o.owner_name || ""; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(o); }
+    const keys = [...groups.keys()].filter(Boolean).sort();
+    if (groups.has("")) keys.push("");                 // unowned last
+    trs = keys.flatMap((k) => [
+      el("tr", { cls: "group" }, el("th", { colspan: "6", text: `${k || "unowned"} · ${groups.get(k).length}` })),
+      ...groups.get(k).map((o) => planRow(o, 0, true))]);
+  } else {
+    const depth = new Map();                           // rows arrive in tree order: a parent before its children
+    for (const o of rows) depth.set(o.ref, o.parent && depth.has(o.parent) ? depth.get(o.parent) + 1 : 0);
+    trs = rows.map((o) => planRow(o, depth.get(o.ref), false));
+  }
+  const focused = document.activeElement?.closest?.("#plan-table tr")?.dataset.ref;
+  $("plan-table").querySelector("tbody").replaceChildren(...trs);
+  if (focused) $("plan-table").querySelector(`tr[data-ref="${CSS.escape(focused)}"]`)?.focus();
+}
+
+$("plan-group").addEventListener("click", (e) => {
+  if (!e.target.dataset.v) return;
+  planState.group = e.target.dataset.v;
+  put("plan-group", planState.group);
+  pressKindSeg("plan-group", planState.group);
+  paintPlan();
+});
+pressKindSeg("plan-group", planState.group);
+$("plan-mission-toggle").addEventListener("click", (e) => {
+  const open = !$("plan-mission").classList.toggle("clamp");
+  e.target.setAttribute("aria-expanded", String(open));
+  e.target.textContent = open ? "[less]" : "[more]";
+});
+
+// a task opens in the peer context pane and holds it until a peer is picked or the squad changes
+function openTask(ref) {
+  meshState.selTask = ref;
+  paintPlan();
+  $("mesh-ctx-box").setAttribute("data-title", `TASK // ${ref}`.slice(0, 56));
+  $("mesh-ctx-kinds").hidden = true;
+  $("mesh-ctx-head").replaceChildren(el("span", { cls: "dim", text: `loading ${ref}…` }));
+  $("mesh-ctx-feed").replaceChildren();
+  loadTask(ref);
+}
+function closeTask() {
+  if (!meshState.selTask) return;
+  meshState.selTask = null;
+  meshState.ctxSig = "";
+  $("mesh-ctx-kinds").hidden = false;
+  clearPeerContext();                                  // the next loadPeerContext() repaints the peer
+  paintPlan();
+}
+
+async function loadTask(ref) {
+  let doc;
+  try {
+    doc = await planGet(`/api/mesh/object?ref=${encodeURIComponent(ref)}&log_limit=500`);
+  } catch (err) {
+    if (meshState.selTask === ref) $("mesh-ctx-head").replaceChildren(el("span", { cls: "red", text: `${ref}: ${err.message}` }));
+    return;
+  }
+  if (meshState.selTask !== ref) return;
+  if (!doc) { $("mesh-ctx-head").replaceChildren(el("span", { cls: "dim", text: "this server predates tasks: restart Almanac" })); return; }
+  const o = doc.object, log = doc.log || [];
+  $("mesh-ctx-head").replaceChildren(...[            // replaceChildren would print a null as "null"
+    el("span", { cls: "title", text: `${o.ref} ${o.title}` }), " ", statusPill(o.status), " ", ownerChip(o),
+    el("span", { cls: "dim", text: ` · filed by ${o.created_by_name} ${age(o.created_ts)} ago${o.parent ? ` · part of ${o.parent}` : ""}` }),
+    o.children?.total ? el("span", { cls: "dim", text: ` · accepted ${o.children.accepted}/${o.children.total}` }) : null,
+  ].filter((n) => n !== null));
+  const logHead = (l) => `${clock(l.ts)} ${l.agent_name} [${l.kind}]`
+    + `${!l.status_to ? "" : l.kind === "create" ? ` as ${l.status_to}` : ` ${l.status_from || "–"} → ${l.status_to}`}`
+    + `${l.owner_to ? ` owner → ${l.owner_to}` : ""}`;
+  const logCls = (k) => (k === "dead" ? "error" : k === "message" ? "peer_out" : k === "status" || k === "assign" ? "tool" : "claude");
+  $("mesh-ctx-feed").replaceChildren(
+    el("li", { cls: "you" }, o.body ? renderMd(o.body) : "(no body)"),
+    el("li", { cls: "result", text: o.files?.length ? `files: ${o.files.join(", ")}` : "files: none" }),
+    ...(log.length
+      ? log.map((l) => el("li", { cls: logCls(l.kind), title: new Date(l.ts * 1000).toLocaleString() }, logHead(l), l.body ? renderMd(l.body) : null))
+      : [el("li", { cls: "result", text: "no log entries yet" })]),
+  );
+  $("mesh-ctx-feed").scrollTop = 0;                    // the log is newest first
 }
 
 // ------------------------------------------------------------------ mesh: topology (who talks to whom)
@@ -2277,7 +2767,7 @@ async function openChat(id) {
   add("kept", null, el("dd", {}, kept(c), el("span", { cls: "dim", text: doc.read_from ? `  (reading the ${doc.read_from})` : "" })));
   $("chat-head").replaceChildren(el("div", { cls: "title", text: c.title }), kv);
   const feed = $("chat-feed");
-  feed.replaceChildren(...(doc.events.length ? doc.events.map((e) => el("li", { cls: e.kind, text: e.text, title: e.ts ? new Date(e.ts).toLocaleString() : null }))
+  feed.replaceChildren(...(doc.events.length ? doc.events.map((e) => el("li", { cls: e.kind, title: e.ts ? new Date(e.ts).toLocaleString() : null }, proseNode(e.kind, e.text)))
     : [el("li", { cls: "result", text: "nothing readable in this transcript" })]));
   feed.scrollTop = feed.scrollHeight;
   $("chat-actions").hidden = false;
@@ -2541,7 +3031,7 @@ async function notifyBlocking() {
   for (const m of doc.messages) {
     if (m.needs !== "blocking" || m.answered_ts || !OPERATOR.has(m.to_name) || inboxState.notified.has(m.id)) continue;
     inboxState.notified.add(m.id);
-    const n = new Notification(`${m.from_name} is blocked on you`, { body: m.body.slice(0, 200), tag: `almanac-${m.id}` });
+    const n = new Notification(isSystem(m) ? `${msgFrom(m)} is stalled` : `${m.from_name} is blocked on you`, { body: m.body.slice(0, 200), tag: `almanac-${m.id}` });
     n.onclick = () => { window.focus(); show("inbox"); selectThread(threadKey(m)); n.close(); };
   }
   put("notified", JSON.stringify([...inboxState.notified].slice(-500)));
@@ -2568,7 +3058,7 @@ $("inbox-notify").addEventListener("click", async () => {
 });
 
 // a thread is everything between the operator and one other party in one squad
-const threadKey = (m) => `${OPERATOR.has(m.from_name) ? m.to_name : m.from_name}\u0000${m.squad_id || ""}`;
+const threadKey = (m) => `${isMine(m) ? m.to_name : msgFrom(m)}\u0000${m.squad_id || ""}`;
 function buildThreads(messages) {
   const by = new Map();
   for (const m of messages) {
@@ -2577,7 +3067,7 @@ function buildThreads(messages) {
     const t = by.get(k) || { key: k, other, squad, session: null, msgs: [], unread: 0, open: [], last: 0 };
     t.msgs.push(m);
     // handles repeat across squads: address the other party by its newest session id, never by name alone
-    const sid = OPERATOR.has(m.from_name) ? m.to_session : m.from_session;
+    const sid = isMine(m) ? m.to_session : isSystem(m) ? null : m.from_session;   // a notice's session is the hub's
     if (sid && m.ts >= (t.sessionTs || 0)) { t.session = sid; t.sessionTs = m.ts; }
     t.last = Math.max(t.last, m.ts);
     if (OPERATOR.has(m.to_name) && !m.read_ts) t.unread += 1;
@@ -2637,14 +3127,14 @@ function paintThreads() {
     const last = t.msgs.at(-1);
     const btn = el("button", { type: "button", cls: `thread${t.key === inboxState.sel ? " sel" : ""}`, "aria-current": t.key === inboxState.sel ? "true" : null },
       el("span", { cls: "thread-head" },
-        el("span", { cls: OPERATOR.has(last.from_name) ? "cyan" : "hi", text: t.other }),
+        el("span", { cls: isMine(last) ? "cyan" : "hi", text: t.other }),
         t.squad ? el("span", { cls: "dim", text: ` · ${t.squad}` }) : null,
         el("span", { cls: "grow" }),
         t.unread ? el("span", { cls: "unread", text: `${t.unread} new` }) : null,
         blocking.length ? el("span", { cls: "flag blocking", text: `BLOCKING ${age(oldest)}` })
           : replying.length ? el("span", { cls: "flag reply", text: "REPLY" }) : null,
         el("span", { cls: "dim", text: ` ${when(last.ts)}` })),
-      el("span", { cls: "thread-last dim", text: `${OPERATOR.has(last.from_name) ? "you: " : ""}${last.body}`.replace(/\s+/g, " ").slice(0, 90) }));
+      el("span", { cls: "thread-last dim", text: `${isMine(last) ? "you: " : isSystem(last) ? "system: " : ""}${last.body}`.replace(/\s+/g, " ").slice(0, 90) }));
     btn.addEventListener("click", () => selectThread(t.key));
     return el("li", {}, btn);
   }));
@@ -2670,7 +3160,7 @@ async function markThreadRead(t) {
 function paintThread() {
   const t = inboxState.threads.find((x) => x.key === inboxState.sel);
   const form = $("inbox-form"), feed = $("inbox-feed");
-  form.hidden = !t;
+  form.hidden = !t || t.other === "system";             // a notice naming no agent has nobody to answer
   if (!t) {
     $("inbox-head").replaceChildren(el("span", { cls: "dim", text: inboxState.threads.length ? "select a thread on the left" : "" }));
     feed.replaceChildren();
@@ -2678,20 +3168,20 @@ function paintThread() {
   }
   $("inbox-thread-box").setAttribute("data-title", `THREAD // ${t.other}`.slice(0, 56));
   const peer = (meshState.peers || []).find((p) => t.session && p.session_id === t.session)
-    || (t.session ? null : (meshState.peers || []).find((p) => p.name === t.other));
+    || (t.session ? null : (meshState.peers || []).find((p) => p.name === t.other && (!t.squad || p.squad_id === t.squad)));
   $("inbox-head").replaceChildren(...[      // replaceChildren would print a null as "null"
     el("span", { cls: "title", text: t.other }),
     t.squad ? el("span", { cls: "dim", text: ` · squad ${t.squad}` }) : null,
     t.session ? el("span", { cls: "dim", text: ` · session ${t.session.slice(0, 8)}`, title: t.session }) : null,
     el("span", { cls: "dim", text: ` · ${t.msgs.length} message${t.msgs.length === 1 ? "" : "s"}` }),
-    peer ? el("span", { cls: "dim", text: ` · ${peer.status || "idle"}` }) : null].filter(Boolean));
+    peer ? el("span", { cls: peer.stall ? "amber" : "dim", text: ` · ${peer.stall ? `stalled (${peer.stall.error || "API error"})` : peer.status || "idle"}` }) : null].filter(Boolean));
   $("inbox-to").textContent = t.session ? `${t.other} (${t.session.slice(0, 8)})` : t.other;
   const sig = JSON.stringify(t.msgs.map((m) => [m.id, m.answered_ts])) + Math.floor(Date.now() / 30000);
   if (sig !== inboxState.feedSig) {
     inboxState.feedSig = sig;
     const atBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 40;
     feed.replaceChildren(...t.msgs.map((m) => {
-      const mine = OPERATOR.has(m.from_name);
+      const mine = isMine(m), sys = isSystem(m);
       const resolve = m.needs && !m.answered_ts
         ? el("button", { type: "button", cls: "btn", text: "[RESOLVE ✓]", title: "close this flag by hand (no reply needed)" }) : null;
       resolve?.addEventListener("click", async () => {
@@ -2702,15 +3192,16 @@ function paintThread() {
         } catch (err) { $("inbox-msg").textContent = `failed: ${err.message}`; }
         inboxState.sig = ""; await loadInbox(); loadInboxCounts();
       });
-      return el("li", { cls: mine ? "from-op" : "" },
+      return el("li", { cls: mine ? "from-op" : sys ? "from-sys" : "" },
         el("div", { cls: "msg-head" },
           el("span", { cls: "dim", text: clock(m.ts) }),
-          el("span", { cls: mine ? "cyan" : "hi", text: mine ? "you" : m.from_name }),
+          el("span", { cls: mine ? "cyan" : sys ? "amber" : "hi", text: mine ? "you" : sys ? "system" : m.from_name,
+            title: sys ? "a notice from Almanac itself, not from you" : null }),
           el("span", { cls: "dim", text: "──▸" }),
           el("span", { cls: "dim", text: OPERATOR.has(m.to_name) ? "you" : m.to_name }),
           m.channel ? el("span", { cls: "violet", text: m.channel }) : null,
           needsBadge(m), resolve),
-        el("div", { cls: "msg-body", text: m.body }));
+        el("div", { cls: "msg-body" }, renderMd(m.body)));
     }));
     if (atBottom || feed.dataset.key !== t.key) feed.scrollTop = feed.scrollHeight;
     feed.dataset.key = t.key;
@@ -2763,7 +3254,7 @@ function show(tab) {
   if (tab === "inbox") { inboxState.sig = ""; inboxState.squadsStale = true; loadInbox(); paintNotifyToggle(); }
   if (tab === "fleet") loadFleet();
   if (tab === "gallery") loadFleet().then(loadGallery);
-  if (tab === "mesh") { loadMesh().then(() => { loadHeat(true); loadTopo(true); }); if (meshState.selPeer) loadPeerContext(); }
+  if (tab === "mesh") { planState.stale = true; loadMesh().then(() => { loadHeat(true); loadTopo(true); }); if (meshState.selPeer) loadPeerContext(); }
 }
 document.querySelectorAll(".tabs [role=tab]").forEach((b) => b.addEventListener("click", () => show(b.dataset.tab)));
 $("help-btn").addEventListener("click", () => { $("help").hidden = !$("help").hidden; });
