@@ -1,6 +1,7 @@
 """T-24: the operator assigns a queued backlog task to a running squad (`POST /api/squads/assign`), and `mesh_spawn(ref)`
 puts a fresh member on an existing queued, unowned task of the squad instead of filing a new T."""
 import threading
+from unittest import mock
 
 from support import TOKEN
 from test_dispatch import BacklogRig
@@ -42,6 +43,12 @@ class AssignTests(AssignRig):
             self.assertIn(text, told["body"])
         self.assertEqual(self.inbox["impl"], [], "only the lead")
         self.assertTrue(any(a["action"] == "squad" and a["ok"] and "assigned T-1" in a["detail"] for a in self.store.actions(5)))
+
+    def test_the_lead_lookup_cannot_refuse_a_move_that_happened(self):
+        with mock.patch.object(door, "_owner", side_effect=ValueError("retired")):   # T-23's refusal of a retired handle
+            status, _, res = self.assign()
+        self.assertEqual((status, res["lead"], res["delivered"]), (200, "arch", True), res)
+        self.assertEqual(self.row()["squad_id"], "sq-1")
 
     def test_the_lead_is_the_member_the_squad_was_launched_with_first(self):
         self.store.db.execute("update spawned_agents set created_ts = created_ts + 100 where agent_name = 'arch'")
@@ -138,6 +145,17 @@ class SpawnOnATaskTests(AssignRig):
         self.assertEqual([m for m in self.inbox["impl"] if "assigned to you" in m["body"]], [], "the kickoff is the assignment")
         heard = [m["body"] for m in self.inbox["impl"]]
         self.assertTrue(any("T-1 Tidy the store" in h for h in heard), "the squad hears who joined, and on what")
+
+    def test_the_choice_is_on_the_assign_entry_of_an_existing_task(self):
+        status, _, res = self.spawn_on(why="rote edits, fails loudly")
+        self.assertEqual(status, 200, res)
+        entry = self.store.object_log(1, 1)[0]
+        self.assertEqual(entry["kind"], "assign")
+        self.assertIn("on ", entry["body"])
+        self.assertIn(" at ", entry["body"])
+        self.assertTrue(entry["body"].endswith(": rote edits, fails loudly"), entry["body"])
+        model, effort = res["choice"]["model"], res["choice"]["effort"]
+        self.assertIn(f"on {model or 'the default model'} at {effort or 'the default effort'}", entry["body"])
 
     def test_task_is_extra_instructions_and_files_replace_the_tasks(self):
         status, _, res = self.spawn_on(task="Mind the Windows paths.", files=["almanac/spawner.py"])

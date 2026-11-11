@@ -941,13 +941,13 @@ def _spawner_identity(service, by: str | None, by_session: str | None) -> dict:
 
 
 def own_spawn_task(service, task_row: dict | None, res: dict, *, by: str | None = None,
-                   by_session: str | None = None) -> None:
+                   by_session: str | None = None, body: str = "") -> None:
     """After a successful spawn its T belongs to the new session and is in progress. No assignment message: the
     kickoff already carries the task, and a second prompt right after it would restart the newcomer's turn."""
     if task_row and res.get("ok") and res.get("session_id"):
         service.store.log_object(task_row["id"], who=_spawner_identity(service, by, by_session),
                                  kind="assign", status="in progress", owner_session=res["session_id"],
-                                 owner_name=res.get("agent_name"))
+                                 owner_name=res.get("agent_name"), body=body)
 
 
 def _ref(task_row: dict | None, fallback: str) -> str:
@@ -1105,7 +1105,10 @@ def join_squad(
         watch=watch,
         spawned_by=spawned_by,
     )
-    own_spawn_task(service, task_row, res, by=spawned_by, by_session=spawned_by_session)
+    # a new T carries the choice in its data; an existing task's data is not ours to change, so its assign entry says it
+    own_spawn_task(service, task_row, res, by=spawned_by, by_session=spawned_by_session,
+                   body=(f"on {choice['model'] or 'the default model'} at {choice['effort'] or 'the default effort'}"
+                         + (f": {why}" if why else "")) if existing else "")
     res["choice"] = choice
     if res.get("ok"):
         blurb = f"{_ref(task_row, name)} {task_row['title']} {task}".strip() if existing else task

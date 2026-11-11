@@ -1704,7 +1704,8 @@ def assign_task(service, ref, squad_id) -> dict:
                                  body=f"moved from the backlog into squad {squad['name']} ({squad['id']}) by operator")
     lead = next((a for a in squad["agents"] if not a["spawned_by"]), None)        # oldest first: launched first
     live = {p.get("session_id") for p in service.mesh_peers(squad_id=squad["id"])}
-    lead = lead and _owner(service, squad["id"], lead["agent_name"])               # its newest session
+    found = lead and service.store.spawned(squad_id=squad["id"], agent_name=lead["agent_name"], limit=1)
+    lead = found[0] if found else lead                                             # its newest session; the move is done: never refuse now
     out = dict(ok=True, ref=ref, squad_id=squad["id"], lead=lead and lead["agent_name"], lead_live=False, delivered=False)
     if lead and lead["session_id"] in live:
         out["delivered"], _ = _hub_tell(
