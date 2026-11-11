@@ -214,7 +214,7 @@
         <div>
           <div class="dim">click a role to inspect or edit; agents spawned with a role inherit its system prompt, provider, model, and workspace policy</div>
           <div class="scroll"><table class="fleet" id="roles-table" aria-label="Agent roles">
-            <thead><tr><th>ID</th><th>PROV</th><th>TITLE</th><th>MODEL</th><th>EFFORT</th><th>ISOLATION</th></tr></thead>
+            <thead><tr><th>ID</th><th>PROV</th><th>TITLE</th><th>MODEL</th><th>EFFORT</th><th>CONTEXT</th><th>ISOLATION</th></tr></thead>
             <tbody></tbody>
           </table></div>
         </div>
@@ -259,6 +259,18 @@
               <option value="shared">shared</option>
               <option value="worktree">worktree</option>
             </select>
+          </div>
+          <div class="field">
+            <label for="role-context">context at a task boundary</label>
+            <select id="role-context" name="context_policy">
+              <option value="none">none</option>
+              <option value="fresh-per-task">fresh per task</option>
+              <option value="compact">compact at</option>
+            </select>
+          </div>
+          <div class="field" id="role-context-n-field" hidden>
+            <label for="role-context-n">compact at (tokens, 300000 or 300k)</label>
+            <input id="role-context-n" name="context_compact_at" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="300000">
           </div>
           <div class="field check-field">
             <label for="role-page"><input type="checkbox" id="role-page" name="may_page_operator"> may page the operator ✉</label>

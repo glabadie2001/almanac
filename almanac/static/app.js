@@ -826,6 +826,21 @@ document.addEventListener("click", (e) => {             // a multi-pick closes o
 refillRoleModels([]);
 refillRoleEfforts(["high"]);
 
+// a role's context_policy: none | fresh-per-task | compact-at-<tokens>; the form splits it into a select and a token field
+const fmtContextPolicy = (p) => (p || "none") === "fresh-per-task" ? "fresh per task"
+  : /^compact-at-\d+$/.test(p || "") ? `compact at ${Number(p.slice(11)).toLocaleString("en-US")}` : "none";
+function setRoleContext(p) {
+  const compact = /^compact-at-/.test(p || "");
+  $("role-context").value = compact ? "compact" : p === "fresh-per-task" ? p : "none";
+  $("role-context-n").value = compact ? p.slice(11) : "";
+  $("role-context-n-field").hidden = !compact;
+}
+$("role-context").addEventListener("change", () => {
+  const compact = $("role-context").value === "compact";
+  $("role-context-n-field").hidden = !compact;
+  if (compact && !$("role-context-n").value) $("role-context-n").value = "300000";
+});
+
 async function loadRoles() {
   try {
     const doc = await api("/api/roles");
@@ -882,6 +897,7 @@ function syncRoleControls() {
         el("td", { cls: "model", text: roleOptions(r.models, r.model).map(fmtModel).join(", ") || "–" }),
         el("td", {}, effortBadge(r.effort), elasticAlt(r.efforts, r.effort).length
           ? el("span", { cls: "dim", text: `, ${elasticAlt(r.efforts, r.effort).map(fmtEffortLabel).join(", ")}` }) : null),
+        el("td", { cls: "dim", text: fmtContextPolicy(r.context_policy) }),
         el("td", { cls: "dim", text: r.workspace_mode || "shared" }),
       );
       tr.addEventListener("click", () => populateRoleForm(r));
@@ -1727,6 +1743,7 @@ function populateRoleForm(r) {
   refillRoleModels([...new Set([mod, ...(r?.models || [])])].filter(Boolean));
   refillRoleEfforts([...new Set([eff, ...(r?.efforts || [])])].filter(Boolean));
   $("role-workspace").value = r ? (r.workspace_mode || "shared") : "shared";
+  setRoleContext(r ? r.context_policy : "none");
   $("role-prompt").value = r ? (r.system_prompt || "") : "";
   $("role-page").checked = !!r?.may_page_operator;
   $("role-grow").checked = !!r?.may_spawn;
@@ -1766,6 +1783,7 @@ $("role-save").closest("form").addEventListener("submit", async (e) => {
       // every tick, most capable first; a single tick saves [] (the role is fixed at it, as before)
       models: models.length > 1 ? models : [],
       efforts: efforts.length > 1 ? efforts : [],
+      context_policy: $("role-context").value === "compact" ? `compact-at-${$("role-context-n").value.trim()}` : $("role-context").value,
       allowed_commands: $("role-commands").value,
       add_dirs: $("role-dirs").value,
     });

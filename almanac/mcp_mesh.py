@@ -405,7 +405,7 @@ class MeshClient:
                 "peers": doc.get("peers") or [],
                 "squads": doc.get("squads") or [],
                 "open": doc.get("open") or [],
-                "roles": [{k: r.get(k) for k in ("id", "title", "provider", "model", "effort", "models", "efforts")}
+                "roles": [{k: r.get(k) for k in ("id", "title", "provider", "model", "effort", "models", "efforts", "context_policy")}
                           for r in doc.get("roles") or []],
                 "hub_pipe": doc.get("hub_pipe"),
             }
