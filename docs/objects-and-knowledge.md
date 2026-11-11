@@ -46,6 +46,53 @@ b3bbabb.
    `task[:300]` (spawner.py:911); `actions.detail` says only "X joined S as R". `record_spawn` (store.py:1344) has
    no task column. The full text survives only in the raw transcript and its archive copy.
 
+## How this maps to Engram
+
+Source: Engram's `DESIGN.md` and `CONCEPTS.md` (`gskills-claude/engram`). Engram stores facts in files by how fast
+they change, and counters five ways a memory dies. Here is where each piece lands in Almanac.
+
+| Engram layer | Almanac object |
+|---|---|
+| `journal/` (append-only, what happened) | `object_log` entries on a task: learned, dead end, next. Engram's Did / Touched / Commits lines are derived in stage 4, not written |
+| `tasks.md` (Now / Next / Later / Done) | task objects `T`, with statuses (queued, in progress, in review, accepted, blocked) |
+| `gotchas.md` (dated bullets with file refs) | note `N`, kind gotcha, anchored to files |
+| `decisions/` ADRs (never edited, superseded by a new ADR) | note, kind decision; never edited, superseded through `parent_id`. The operator's are directives |
+| atlas cards (what the code is, sha-stamped, ≤60 lines) | note, kind card. The last kind to build. Like Engram's "judgment, not inventory" rule, it holds judgment, never a list `grep` could produce |
+| dead ends (`dead` / `parked`, first-class in the journal) | a log entry on the task; it becomes a note once verified, so it outlives the squad |
+| `MEMORY.md` (always loaded, 120-line cap) | the kickoff brief, built per agent and task instead of one static file (about 40 lines) |
+| bug-sweep module: `sweeps/` ledger | findings `F`, stage 2 |
+| bug-sweep module: `bug-classes.md` (taxonomy and hunt heuristics) | a note kind, not a finding: it describes a class, not one instance. Later than stage 3 |
+| `architecture.md` (Live vs Target diagrams) | not mapped; cut from v1 |
+| metrics events and scorecard | partly covered by Almanac's telemetry (tokens, calls, worktime per model). Engram's own measure, the recall **hit rate** (memory answered vs code explored), has no counterpart here, so whether the brief helps stays unmeasured |
+
+| Engram death mode | Counter here |
+|---|---|
+| 1. Write-nothing | Handing in a slice *is* the log entry (`mesh_log` with the status change; the hub notifies the creator). The librarian sweeps at squad end. A task in progress whose owner session ended with no entry is flagged |
+| 2. Stale-confident | The door stamps the sha. Freshness is computed on read, `pending` covers unmerged branches, and commits since verification are shown |
+| 3. Bloat | Body caps refused at the door, the brief's line and character caps, ranking; everything else is pulled |
+| 4. Write-only | The brief is in every kickoff, for both providers, with no hook; the tools serve pull |
+| 5. Fragmentation | One ref per fact; corrections supersede; a message links with `re=` instead of restating |
+| 6. Spread of a wrong note (only a shared base has this) | A claim versus verified by a different role class; claims stay in their squad; directives only from an operator route; notes wrapped as data. Engram has a write-path poisoning guard, but its one writer limits the spread |
+
+**What Almanac adds that file-based Engram cannot.** It has one writer. Engram's CONCEPTS.md entry
+"hub-and-spoke memory reconciliation" asks for a hub, a librarian and a pending overlay for unmerged code. Here
+the hub is Almanac's store, the librarian is D12, and the overlay is D8's `pending`. CONCEPTS.md argues for a git
+remote over a bespoke server, on the grounds that a server either syncs dumbly (last write wins) or is smart,
+and then the intelligence belongs in the reconciler. That holds here: the store never merges text, because each
+object has one owner and an append-only log, and judgment stays with the librarian and the verifier. Beyond that,
+attribution is stamped by the server rather than self-reported, verification crosses providers, and Gemini gets
+the same read path.
+
+**What it gives up.** Plain files in git that any session can grep and that travel with a clone, which D10's
+export only partly restores. Also Engram's post-compaction reminder: a kickoff brief arrives once, so a long-lived
+agent that compacts does not get it again (item 13's respawn with handoff is the answer). And content-addressed
+freshness: Engram's manifest counts a revert to verified content as current again, while D8's ancestry and
+file-diff check marks it `drifted`.
+
+**Trust order, side by side.** Engram: code > fresh atlas and decisions > journal, with user directives
+(`(per user, date)`) outranking inference. Almanac: code > directive > verified and fresh > claim. The directive is
+Engram's user directive, given a route only the operator can call.
+
 ## 2. Design v2
 
 v1 was reviewed by rev-gemini, and the architect ruled on each finding. The decisions below are v2.
