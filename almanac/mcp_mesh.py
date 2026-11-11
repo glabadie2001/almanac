@@ -9,7 +9,7 @@ CLI mode (usable from any agent shell or script):
     python -m almanac.mcp_mesh --cli context <peer> [--limit 30]
     python -m almanac.mcp_mesh --cli contacts [--peer <name>] [--channel <#chan>]
     python -m almanac.mcp_mesh --cli send <to> <message...> [--channel <#chan>]
-    python -m almanac.mcp_mesh --cli wait [--timeout 120]
+    python -m almanac.mcp_mesh --cli wait [--timeout 120]      (the operator's scripts; an agent ends its turn instead)
     python -m almanac.mcp_mesh --cli objects [--status <s,..>] [--owner <name|none>] [--q <text>]
     python -m almanac.mcp_mesh --cli object <ref> [--log-limit 20]
     python -m almanac.mcp_mesh --cli file <title> [--body <text>] [--files <path> ...] [--owner <name>] [--parent <ref>]
@@ -577,6 +577,8 @@ def handle_rpc(msg: dict, client: MeshClient) -> dict | None:
         tname = params.get("name")
         targs = params.get("arguments") or {}
         try:
+            if tname == "mesh_wait":    # not in MCP_TOOLS, but an agent may call it by name from habit
+                raise KeyError("mesh_wait is not an agent tool: end your turn; a message to you starts your next one")
             out = client.call_tool(tname, targs)
             return {
                 "jsonrpc": "2.0",

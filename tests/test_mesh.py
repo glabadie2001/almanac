@@ -308,6 +308,11 @@ class MeshDoorAndMcpTests(Fixture):
             ["mesh_roster", "mesh_context_stream", "mesh_contact_stream", "mesh_send", "mesh_spawn",
              "mesh_objects", "mesh_object", "mesh_file", "mesh_log", "mesh_amend", "mesh_respawn", "mesh_restart"],
         )
+        # mesh_wait is the CLI's: over MCP it is refused by name, with what to do instead
+        wait_rpc = mcp_mesh.handle_rpc({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                                        "params": {"name": "mesh_wait", "arguments": {}}}, client)
+        self.assertEqual(wait_rpc["error"]["code"], -32601)
+        self.assertIn("end your turn", wait_rpc["error"]["message"])
 
         # Call mesh_send via JSON-RPC tools/call
         send_rpc = mcp_mesh.handle_rpc(
