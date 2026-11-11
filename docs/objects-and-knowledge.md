@@ -264,8 +264,9 @@ Where the work attaches in today's code:
 | 4 | Derived stats (`calls.path` read from `file_path`, `Path` or `path`; `base_sha`; one in-progress task per session), librarian, respawn with handoff (item 13) | not built |
 
 **Stage 2's acceptance test (the operator's):** one query returns, per reviewer session and per model, findings by
-severity and verdict, with tokens and worked minutes. **Its first dataset:** this squad's 44 findings by rev-gemini
-(16 bug, 16 risk, 10 nit, 2 other; 43 accepted, 1 rejected), filed from the journal. Prerequisite: Gemini usage
+severity and verdict, with tokens and worked minutes. **Its first dataset:** this squad's findings by rev-gemini, filed
+from the journal: 44 at mid-build (16 bug, 16 risk, 10 nit, 2 other; 43 accepted, 1 rejected), about 65 across 14
+reviews by the end, all but one accepted and none wrong. Re-derive the exact tally from the journal when filing. Prerequisite: Gemini usage
 must be per turn, or tokens per finding are summed running totals; slice U (`3aa2fa9`) fixed that.
 
 Carried over from the earlier ROADMAP text of items 9 and 14:
