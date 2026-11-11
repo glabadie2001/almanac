@@ -771,7 +771,7 @@ class Service:
                                  "and there is not exactly one live squad")
             # Only @all reaches everyone. A squad post stays in the squad; a channel post goes to its subscribers in
             # the sender's squad (an agent in no squad reaches only peers in none; the operator in none, any squad).
-            # A peer in no channel hears no channel.
+            # A peer in no channel hears no channel, except #squad, which every member of a squad hears.
             recipients = []
             for p in all_peers:
                 if p["name"] == sender or (p.get("session_id") and p.get("session_id") == sender):
@@ -781,7 +781,8 @@ class Service:
                 if target == "@squad" and p.get("squad_id") != eff_squad:
                     continue
                 if target.startswith("#") and (
-                    target not in (p.get("channels") or [])
+                    # #squad reaches the whole squad, subscribed or not; never a session in no squad
+                    (target not in (p.get("channels") or []) if target != "#squad" else not p.get("squad_id"))
                     or ((eff_squad or sender != "operator") and p.get("squad_id") != eff_squad)
                 ):
                     continue

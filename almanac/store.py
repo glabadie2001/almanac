@@ -1188,6 +1188,12 @@ class Store:
         rid = str(doc.get("id") or "").strip().lower()
         if not _re.match(r"^[a-z0-9][a-z0-9_-]{0,62}$", rid):
             raise ValueError("role id must be 1..63 lowercase letters, digits, '-' or '_'")
+        old = self.role(rid)
+        if old:
+            # an update keeps every field the doc leaves out (the role form sends no channels and no permission
+            # mode); a key that is present, empty or null, still sets it. add_dirs keeps by its own coalesce, so a
+            # folder deleted since is not re-validated by a save that does not touch it.
+            doc = {**{k: v for k, v in old.items() if k != "add_dirs"}, **doc}
         provider = str(doc.get("provider") or "claude").strip().lower()
         if provider not in ("claude", "gemini"):
             raise ValueError("provider must be 'claude' or 'gemini'")
