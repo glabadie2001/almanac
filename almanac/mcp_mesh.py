@@ -13,7 +13,8 @@ CLI mode (usable from any agent shell or script):
     python -m almanac.mcp_mesh --cli objects [--status <s,..>] [--owner <name|none>] [--q <text>]
     python -m almanac.mcp_mesh --cli object <ref> [--log-limit 20]
     python -m almanac.mcp_mesh --cli file <title> [--body <text>] [--files <path> ...] [--owner <name>] [--parent <ref>]
-    python -m almanac.mcp_mesh --cli log <ref> [<body...>] [--kind <k>] [--status <s>] [--owner <name>]
+    python -m almanac.mcp_mesh --cli log <ref> [<body...>] [--kind <k>] [--status <s>] [--owner <name>] [--parent <ref>|""]
+    python -m almanac.mcp_mesh --cli amend <ref> [--title <t>] [--body <text>] [--files <path> ...]
     python -m almanac.mcp_mesh --cli respawn <ref> [--model <m>] [--effort <e>]
     python -m almanac.mcp_mesh --cli spawn [<task...>] [--ref <T-n>] [--role <r>] [--name <n>] [--model <m>] [--effort <e>]
     python -m almanac.mcp_mesh --cli restart
@@ -264,8 +265,9 @@ MCP_TOOLS = [
                 "status": {"type": "string", "enum": ["queued", "in progress", "in review", "accepted", "blocked"],
                            "description": "Default: in progress with an owner, queued without."},
                 "backlog": {"type": "boolean", "description": (
-                    "File follow-up work in the project's backlog instead of your squad: no owner, no parent, queued "
-                    "until the operator dispatches a squad on it.")},
+                    "File follow-up work in the project's backlog instead of your squad: no owner, queued until the "
+                    "operator dispatches a squad on it. `parent` is then another backlog task of the project (a "
+                    "feature and its slices).")},
                 "roster": {"type": "array", "description": "Backlog only: the squad to dispatch, lead first.",
                            "items": {"type": "object", "properties": {"role": {"type": "string"},
                                                                       "name": {"type": "string"}},
@@ -288,11 +290,33 @@ MCP_TOOLS = [
             "type": "object",
             "properties": {
                 "ref": {"type": "string", "description": "The task's ref, e.g. 'T-12'."},
-                "body": {"type": "string", "description": "The entry. Required unless status or owner changes."},
+                "body": {"type": "string", "description": "The entry. Required unless status, owner or parent changes."},
                 "kind": {"type": "string", "enum": ["note", "learned", "dead", "parked", "next"],
                          "description": "note (default), learned, dead (a dead end), parked ('retry when ...'), next."},
                 "status": {"type": "string", "enum": ["queued", "in progress", "in review", "accepted", "blocked"]},
                 "owner": {"type": "string", "description": "Hand the task to this squad member."},
+                "parent": {"type": "string", "description": (
+                    "A backlog task only: its new parent, a backlog task of the project ('T-7'); '' clears it. The "
+                    "entry says from what to what.")},
+            },
+            "required": ["ref"],
+        },
+    },
+    {
+        "name": "mesh_amend",
+        "description": (
+            "Change a task's title, body or files (send only what changes). The log entry (kind `amend`) keeps the old "
+            "title, body and files. A task in a squad: its lead (a role that may add members) or the operator; a "
+            "backlog task: any agent of its project."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "The task, e.g. 'T-12'."},
+                "title": {"type": "string", "description": "One line, at most 120 characters."},
+                "body": {"type": "string", "description": "At most 8,000 characters."},
+                "files": {"type": "array", "items": {"type": "string"},
+                          "description": "Repo-relative paths or globs (at most 50); replaces the list."},
             },
             "required": ["ref"],
         },
@@ -505,7 +529,15 @@ class MeshClient:
             return self._api("/api/mesh/object", method="POST", body=payload)
         if name == "mesh_log":
             payload = {k: args[k] for k in ("ref", "body", "kind", "status", "owner") if args.get(k)}
+            if args.get("parent") is not None:            # '' clears it
+                payload["parent"] = str(args["parent"])
             return self._api("/api/mesh/object/log", method="POST", body=payload)
+        if name == "mesh_amend":
+            ref = str(args.get("ref") or "").strip()
+            if not ref:
+                raise ValueError("ref is required")
+            payload = dict(ref=ref, **{k: args[k] for k in ("title", "body", "files") if args.get(k) is not None})
+            return self._api("/api/mesh/object/amend", method="POST", body=payload)
         if name == "mesh_respawn":
             ref = str(args.get("ref") or "").strip()
             if not ref:
@@ -675,6 +707,13 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
     p_log.add_argument("--kind")
     p_log.add_argument("--status")
     p_log.add_argument("--owner")
+    p_log.add_argument("--parent", help="a backlog task's parent; '' clears it")
+
+    p_amend = sp.add_parser("amend")
+    p_amend.add_argument("ref")
+    p_amend.add_argument("--title")
+    p_amend.add_argument("--body")
+    p_amend.add_argument("--files", nargs="*")
 
     sp.add_parser("restart")
 
@@ -721,7 +760,9 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
                                                         for m in ns.roster] if ns.roster is not None else None})
     elif ns.cmd == "log":
         res = client.call_tool("mesh_log", {"ref": ns.ref, "body": " ".join(ns.body), "kind": ns.kind,
-                                            "status": ns.status, "owner": ns.owner})
+                                            "status": ns.status, "owner": ns.owner, "parent": ns.parent})
+    elif ns.cmd == "amend":
+        res = client.call_tool("mesh_amend", {"ref": ns.ref, "title": ns.title, "body": ns.body, "files": ns.files})
     else:
         res = client.call_tool("mesh_wait", {"timeout_seconds": ns.timeout, "channel": ns.channel, "since_id": ns.since_id})
     print(json.dumps(res, indent=2))
