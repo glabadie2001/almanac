@@ -1025,8 +1025,12 @@ function rowName(p) {
 }
 function rowState(p) {
   if (p.role !== "session") return el("span", { cls: "dim", text: p.role === "desktop" ? "app" : p.role });
-  if (p.stall) return el("span", { cls: "flag stalled", text: `▲ STALLED${p.stall.error ? ` · ${p.stall.error}` : ""}`,
-    title: [p.stall.text, p.stall.since ? `since ${age(p.stall.since)} ago` : ""].filter(Boolean).join("\n") || "stopped on an API error" });
+  if (p.stall) {
+    // since / ts are the transcript's ISO timestamps (fleet.read_tail); epoch seconds are taken as well
+    const at = [p.stall.since, p.stall.ts].map((v) => (typeof v === "number" ? v : Date.parse(v) / 1000)).find(Number.isFinite);
+    return el("span", { cls: "flag stalled", text: `▲ STALLED${p.stall.error ? ` · ${p.stall.error}` : ""}`,
+      title: [p.stall.text, at ? `since ${age(at)} ago` : ""].filter(Boolean).join("\n") || "stopped on an API error" });
+  }
   if (active(p)) return el("span", { cls: "state-busy" }, el("span", { cls: "spin", "data-spin": "1", text: SPIN[state.frame % SPIN.length] }), ` ${p.status.toUpperCase()}`);
   return el("span", { cls: "state-idle", text: `· ${p.status || "starting"}` });
 }
@@ -3164,7 +3168,7 @@ function paintThread() {
   }
   $("inbox-thread-box").setAttribute("data-title", `THREAD // ${t.other}`.slice(0, 56));
   const peer = (meshState.peers || []).find((p) => t.session && p.session_id === t.session)
-    || (t.session ? null : (meshState.peers || []).find((p) => p.name === t.other));
+    || (t.session ? null : (meshState.peers || []).find((p) => p.name === t.other && (!t.squad || p.squad_id === t.squad)));
   $("inbox-head").replaceChildren(...[      // replaceChildren would print a null as "null"
     el("span", { cls: "title", text: t.other }),
     t.squad ? el("span", { cls: "dim", text: ` · squad ${t.squad}` }) : null,
