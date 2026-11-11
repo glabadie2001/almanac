@@ -5,7 +5,7 @@ Each spawned agent receives:
   1. A deterministic peer identity (`agent_name`) registered in `~/.claude/sessions/`;
   2. Its Role Charter + live Squad/Mesh roster and protocol instructions;
   3. Almanac's `almanac-mesh` MCP server (`mesh_roster`, `mesh_context_stream`, `mesh_contact_stream`,
-     `mesh_send`, `mesh_spawn`, `mesh_wait`) plus CLI fallback (`python -m almanac.mcp_mesh --cli ...`);
+     `mesh_send`, `mesh_spawn`) plus CLI fallback (`python -m almanac.mcp_mesh --cli ...`);
   4. Optional isolated Git worktree (`workspace_mode == "worktree"`) so parallel implementers never collide.
 """
 from __future__ import annotations
@@ -178,7 +178,7 @@ def build_mesh_charter(
         "3. **Read Contact Streams**: Call `mesh_contact_stream()` (or filter by `peer` / `channel`) to catch up on inter-agent decisions.",
         "4. **Communicate (`uds-messaging`)**: Call `mesh_send(to=\"<peer_name>|@squad|#channel\", message=\"...\")` (or Claude's native `SendMessage(to=\"<peer_name>\", ...)`). In Antigravity/Gemini, if `almanac-mesh` is lazy-loaded, call via `call_mcp_tool(ServerName=\"almanac-mesh_almanac-mesh\", ToolName=\"mesh_send\", Arguments={...})`. Inbound peer messages arrive wrapped in `<cross-session-message from-name=\"...\">`. "
         "When you need an answer, add `needs=\"reply\"` (wanted, not urgent) or `needs=\"blocking\"` (you cannot continue without it); the message arrives with a `[needs: ...]` line and stays open until its recipient replies to the sender directly. Answer any flagged message you receive with a direct `mesh_send` to its sender.",
-        "5. **Wait When Blocked**: Call `mesh_wait(timeout_seconds=120)` when waiting on a teammate's reply or review.",
+        "5. **When Blocked**: end your turn. A message to you (a reply, a review, an assignment) starts your next turn; never poll or sleep to wait for one.",
         "5a. **Tasks are objects** with refs like `T-12`; `mesh_objects()` lists your squad's plan and `mesh_object(ref)` "
         "reads one with its log. Architects file each slice with `mesh_file(kind=\"task\", title=..., body=..., owner=..., "
         "files=[...])` instead of describing it in a message: filing with an owner is the assignment. Owners hand in with "
@@ -190,7 +190,7 @@ def build_mesh_charter(
         "Work for later, outside this squad's mission, goes in the project backlog with `mesh_file(backlog=true, ...)` "
         "(`mesh_objects(backlog=true)` lists it); the operator dispatches a squad on it, or assigns it to a running "
         "squad, whose lead then puts a fresh member on it with `mesh_spawn(ref=\"T-n\")`.",
-        f"6. **Shell CLI Fallback**: You can also run `\"{python_exe}\" -P -m almanac.mcp_mesh --self {agent_name} --cli <roster|context|contacts|send|wait|spawn|respawn|objects|object|file|log|amend|restart> ...` (with `PYTHONPATH=\"{REPO_ROOT}\"`; your own token and Almanac's address come from the environment).",
+        f"6. **Shell CLI Fallback**: You can also run `\"{python_exe}\" -P -m almanac.mcp_mesh --self {agent_name} --cli <roster|context|contacts|send|spawn|respawn|objects|object|file|log|amend|restart> ...` (with `PYTHONPATH=\"{REPO_ROOT}\"`; your own token and Almanac's address come from the environment).",
         "7. **Operator**: `mesh_send(to=\"operator\", ...)` reaches the human running this squad; use it for decisions only they can make and for the final report; `needs=\"blocking\"` raises an alert on their screen, so use it only when the squad cannot proceed."
         if may_page_operator else
         "7. **Operator**: your role does not page the operator; route through a teammate whose role does. You may always answer a message the operator sends you.",
@@ -387,7 +387,7 @@ def stage_agy_mesh_bundle(
     }
     rules_md = (
         "---\nname: almanac-mesh\ndescription: Cross-model peer context/contact streams and uds-messaging.\n---\n\n"
-        "Use `mesh_roster`, `mesh_context_stream`, `mesh_contact_stream`, `mesh_send`, and `mesh_wait`, and for tasks "
+        "Use `mesh_roster`, `mesh_context_stream`, `mesh_contact_stream`, and `mesh_send`, and for tasks "
         "(refs like `T-12`) `mesh_objects`, `mesh_object`, `mesh_file`, `mesh_log` and `mesh_amend` "
         "(via `call_mcp_tool` with `ServerName=\"almanac-mesh_almanac-mesh\"` or `python -m almanac.mcp_mesh --cli`) "
         "to inspect Claude and Gemini teammates' live streams and coordinate over `uds-messaging`.\n"
