@@ -1,6 +1,8 @@
 """T-32: the backlog as a feature map. A backlog task takes a backlog parent (`mesh_file(backlog, parent)`,
 `mesh_log(ref, parent)`), any task is amended with its old text kept (`POST /api/mesh/object/amend`), and a parent's
 queued backlog children move with it on dispatch and assign."""
+from unittest import mock
+
 from support import TOKEN
 from test_dispatch import ROSTER, BacklogRig
 
@@ -111,6 +113,24 @@ class ReparentTests(TreeRig):
         status, _, res = self.log("T-1", parent="T-3")
         self.assertEqual(status, 400, res)
         self.assertIn("itself", res["error"])
+
+    def test_a_task_that_joined_a_squad_since_it_was_read_is_refused(self):
+        real = door.load_object
+        self.assertEqual(self.post("/api/squads/assign", ref="T-3", squad_id="sq-1")[0], 200)
+        # the call read T-3 while it was still in the backlog; by the time it writes, it is a squad's
+        with mock.patch.object(door, "load_object", side_effect=lambda *a, **k: dict(real(*a, **k), squad_id=None)):
+            status, _, res = self.log("T-3", parent="T-1")
+        self.assertEqual(status, 400, res)
+        self.assertIn("only a backlog task", res["error"])
+        self.assertIsNone(self.parent_of(3))
+        self.assertEqual([e["kind"] for e in self.store.object_log(3, 5)], ["assign", "create"])
+
+    def test_two_crossing_re_parents_leave_no_loop(self):
+        self.assertEqual(self.log("T-1", parent="T-2")[0], 200)
+        status, _, res = self.log("T-2", parent="T-1")
+        self.assertEqual(status, 400, res)
+        self.assertEqual((self.parent_of(1), self.parent_of(2)), (2, None))
+        self.assertEqual(self.listed(), ["T-2", "T-1", "T-3"], "nothing vanished from the list")
 
     def test_the_tool_and_the_cli_send_an_empty_parent(self):
         seen = []
@@ -225,6 +245,9 @@ class MoveTests(TreeRig):
         status, _, res = self.dispatch("T-1")
         self.assertEqual(status, 200, res)
         self.check_moved(res["children"], res["squad"]["id"])
+        self.assertEqual(res["object"]["last_log"]["body"][:25], "its slices moved with it:", "read after the move")
+        self.assertTrue(any("Its slices T-2, T-4 are already filed" in a for argv in self.argv for a in argv),
+                        "the lead is told, not asked to file them again")
         _, _, plan = self.request(self.handler, f"/api/mesh/objects?squad={res['squad']['id']}", token=TOKEN)
         self.assertEqual([(o["ref"], o["parent"]) for o in plan["objects"]],
                          [("T-1", None), ("T-2", "T-1"), ("T-4", "T-2")], "the plan shows the feature with its slices")

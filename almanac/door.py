@@ -1696,10 +1696,13 @@ def log_to_object(service, agent, caller, body: dict, *, after: list | None = No
     who = log_identity(agent, caller)
     delivered = mid = entry = None
     if reparent:
-        old = f"T-{row['parent_id']}" if row["parent_id"] else "(none)"
-        entry = service.store.reparent_object(
-            row["id"], new_parent and new_parent["id"], who=who,
-            body=f"parent {old} → {ref_of(new_parent) if new_parent else '(none)'}")
+        with _DISPATCH_LOCK:             # the lock dispatch and assign hold: checked again and written as one step, so
+            fresh = service.store.object_row(row["id"])       # two crossing re-parents cannot both pass the cycle check
+            new_parent = _new_parent(service, fresh, body["parent"])      # and a task that just joined a squad is refused
+            old = f"T-{fresh['parent_id']}" if fresh["parent_id"] else "(none)"
+            entry = service.store.reparent_object(
+                row["id"], new_parent and new_parent["id"], who=who,
+                body=f"parent {old} → {ref_of(new_parent) if new_parent else '(none)'}")
     if text or status or owner:
         if owner:
             delivered, mid = _assign(service, dict(row, owner_session=owner["session_id"]), owner, agent, caller)
@@ -1879,11 +1882,11 @@ def _compact(service, row: dict, sp: dict, n: int) -> None:
 _DISPATCH_LOCK, _DISPATCHING = threading.Lock(), set()
 
 
-def _move_children(service, row: dict, squad: dict) -> dict:
+def _move_children(service, row: dict, squad: dict | None, *, dry: bool = False) -> dict:
     """Under _DISPATCH_LOCK, `row` (a backlog parent) just joined `squad`: bring its queued backlog children (and theirs,
     the same way) into the squad too, queued and unowned as they are. A child that is not queued, is being
     dispatched, is already in a squad or is of another project stays where it is. {moved: [ref], left: [{ref, why}]};
-    each moved child's log says so, and the parent's log says which."""
+    each moved child's log says so, and the parent's log says which. `dry`: only say what would move (no squad yet)."""
     moved, left, stack = [], [], [row["id"]]
     while stack:
         for kid in service.store.children(stack.pop()):
@@ -1897,15 +1900,16 @@ def _move_children(service, row: dict, squad: dict) -> dict:
             elif kid["status"] != "queued":
                 why = kid["status"]
             else:
-                service.store.log_object(
-                    kid["id"], who=dict(agent_name="operator"), kind="assign", squad_id=squad["id"],
-                    body=f"moved from the backlog into squad {squad['name']} ({squad['id']}) with its parent "
-                         f"T-{kid['parent_id']} by operator")
+                if not dry:
+                    service.store.log_object(
+                        kid["id"], who=dict(agent_name="operator"), kind="assign", squad_id=squad["id"],
+                        body=f"moved from the backlog into squad {squad['name']} ({squad['id']}) with its parent "
+                             f"T-{kid['parent_id']} by operator")
                 moved.append(kref)
                 stack.append(kid["id"])
                 continue
             left.append(dict(ref=kref, why=why))
-    if moved or left:
+    if (moved or left) and not dry:
         service.store.log_object(row["id"], who=HUB, kind="note", body=(
             ("its slices moved with it: " + ", ".join(moved) if moved else "no slice moved with it")
             + ("; left where they are: " + ", ".join(f"{x['ref']} ({x['why']})" for x in left) if left else "")))
@@ -1923,9 +1927,13 @@ def dispatch_task(service, ref, *, almanac_url: str, token: str) -> dict:
     spawn_role, spawn_limit = service.store._spawn_settings(data.get("spawn_role") or DEFAULT_SPAWN[0],
                                                             data.get("spawn_limit", DEFAULT_SPAWN[1]))
     members = [dict(role_id=m["role"], **({"agent_name": m["name"]} if m.get("name") else {})) for m in roster]
+    slices = _move_children(service, row, None, dry=True)["moved"]        # what will join with it, as it reads now
+    plan = (f"Its slices {', '.join(slices)} are already filed and join your plan with it, queued and unowned: read "
+            "mesh_objects() first, put members on them with mesh_spawn(ref=...), and file only what is missing"
+            if slices else "Plan it, file each slice with mesh_file")
     members[0].update(files=row["files"], task=(
-        f"{row['title']}\n\nYou lead this squad on backlog task {ref}: the mission above is its body. Plan it, file "
-        f"each slice with mesh_file, and hand in with mesh_log(ref=\"{ref}\", status=\"in review\")."))
+        f"{row['title']}\n\nYou lead this squad on backlog task {ref}: the mission above is its body. {plan}, and "
+        f"hand in with mesh_log(ref=\"{ref}\", status=\"in review\")."))
     with _DISPATCH_LOCK:                 # a double click launches one squad
         current = service.store.object_row(row["id"])
         if current["squad_id"] or row["id"] in _DISPATCHING:
@@ -1946,6 +1954,7 @@ def dispatch_task(service, ref, *, almanac_url: str, token: str) -> dict:
     if res["dispatched"]:
         with _DISPATCH_LOCK:             # its queued slices go where it went
             res["children"] = _move_children(service, after, res["squad"])
+        after = service.store.object_row(row["id"])                # read again: the move wrote to its log
     res["object"] = object_docs(service, [after], body=True)[0]
     return res
 

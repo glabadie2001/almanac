@@ -290,7 +290,7 @@ MCP_TOOLS = [
             "type": "object",
             "properties": {
                 "ref": {"type": "string", "description": "The task's ref, e.g. 'T-12'."},
-                "body": {"type": "string", "description": "The entry. Required unless status or owner changes."},
+                "body": {"type": "string", "description": "The entry. Required unless status, owner or parent changes."},
                 "kind": {"type": "string", "enum": ["note", "learned", "dead", "parked", "next"],
                          "description": "note (default), learned, dead (a dead end), parked ('retry when ...'), next."},
                 "status": {"type": "string", "enum": ["queued", "in progress", "in review", "accepted", "blocked"]},
