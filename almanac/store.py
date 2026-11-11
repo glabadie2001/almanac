@@ -478,6 +478,8 @@ class Store:
         they carry on across a relaunch with `--conversation` (measured 2026-11-11: inputs 10,439, 12,598, then
         14,884 after a kill and relaunch). The previous totals per session live in `meta`; a file read from the top
         starts the session over, and any count below the previous one is a reset, taken as it is."""
+        if not any(totals):
+            return totals                 # a failed turn reports zeros: no turn's usage, and not a reset of the totals
         key = f"gemini_usage:{session}"
         prev = None
         if not (getattr(self, "_from_top", False) and session not in self._totals_reset):
@@ -564,7 +566,7 @@ class Store:
                     "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens"))
                 if prov == "gemini" and session:
                     counts = self._gemini_turn(session, counts)
-            if main and session and usage and msg.get("model") not in (None, "<synthetic>"):
+            if main and session and usage and any(counts) and msg.get("model") not in (None, "<synthetic>"):
                 self.db.execute("update sessions set model = ?, context = ? where id = ?", (
                     msg.get("model"), counts[0] + counts[1] + counts[2], session))
             if usage and msg.get("id"):

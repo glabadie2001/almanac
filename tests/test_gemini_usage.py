@@ -65,6 +65,14 @@ class GeminiUsageTests(Fixture):
         self.store.ingest(self.gem, provider="gemini")
         self.assertEqual(self.rows(), [(1000, 10, 0), (500, 10, 0), (300, 5, 0), (400, 4, 0)])
 
+    def test_a_failed_turn_with_zero_usage_is_not_a_reset(self):
+        self.write([MEASURED[0], (0, 0, 0), MEASURED[1]])           # agy's error result carries no usage
+        self.store.ingest(self.gem, provider="gemini")
+        self.assertEqual(self.rows(), [(10439, 28, 0), (0, 0, 0), (2159, 28, 8385)])
+        self.assertEqual(self.store.session_usage("g1")["input"], MEASURED[1][0], "not counted twice")
+        [(context,)] = self.store.db.execute("select context from sessions where id = 'g1'").fetchall()
+        self.assertEqual(context, 2159 + 8385, "the last real turn's, not zeroed by the failed one")
+
     def test_a_claude_transcript_is_untouched(self):
         claude = self.root / "claude" / "projects"
         self.write([(100, 10, 0), (150, 20, 0)], session="c1", path=claude / "D--x" / "c1.jsonl", provider="claude")

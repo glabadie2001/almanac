@@ -226,7 +226,7 @@ def parse_agy_stream_event(event: dict) -> dict:
                 cache_creation_input_tokens=int(usage_raw.get("cache_creation_input_tokens") or 0),
                 cache_read_input_tokens=int(usage_raw.get("cache_read_tokens") or usage_raw.get("cache_read_input_tokens") or 0),
                 output_tokens=int(usage_raw.get("output_tokens") or usage_raw.get("completion_tokens") or 0),
-            ),
+            ) if usage_raw else None,             # a failed turn that reports no usage writes none, not zeros
         )
     return dict(kind="other")
 
@@ -456,7 +456,7 @@ class GeminiHost:
         final_text = ""
         tool_events: list[dict] = []
         seen_tool_starts: set[str] = set()
-        usage = {"input_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 0}
+        usage = None                    # agy's running totals for the conversation, when its result carries them
         seen_model = self.model
 
         while not self.stop_event.is_set():
