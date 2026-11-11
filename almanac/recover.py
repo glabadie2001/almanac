@@ -48,29 +48,34 @@ class Recover:
             self.state.clear()
             return []
         now, done, stalled = self.clock(), [], set()
-        spawns = {s["session_id"]: s for s in service.store.spawned(limit=1000) if s.get("session_id")}
         flagged = _open_escalations(service)              # agent -> its open escalation, across restarts
         for row in service.fleet_now().get("processes", []):
             sid = row.get("session_id")
-            sp = spawns.get(sid or "")
-            if row.get("role") != "session" or sp is None or not sp.get("squad_id"):
+            sp = _spawn(service, sid) if sid and row.get("role") == "session" else None
+            if sp is None or not sp.get("squad_id"):
                 continue                                  # not ours to type into
             stall = service.fleet.view(sid)[2].get("stall")
-            esc = flagged.get((sp["agent_name"], sp["squad_id"]))
+            escs = flagged.get((sp["agent_name"], sp["squad_id"]), [])
             if not stall:
-                if esc:                                   # working again: the operator's alert closes itself
-                    service.store.resolve_message(esc)
+                if escs:                                  # working again: the operator's alert closes itself
+                    _resolve(service, [i for i, _ in escs])
                     done.append(dict(action="resolved", agent=sp["agent_name"]))
                 continue                                  # its state is dropped below
             squad = service.store.squad(sp["squad_id"])
             if not squad or squad.get("status") != "active":
                 continue
             stalled.add(sid)
+            # one stall is one unbroken run of errors (fleet's `since`): a reply in between, even inside one tick,
+            # makes a new stall with fresh tries, and an escalation from before it began belonged to the old one
+            since = _epoch(stall.get("since") or stall.get("ts"), now)
+            _resolve(service, [i for i, ts in escs if ts < since])
+            current = [i for i, ts in escs if ts >= since]
+            st = self.state.get(sid)
+            if st is None or st["start"] != since:
+                # a stall already escalated before a restart is not tried or escalated again
+                st = self.state[sid] = dict(start=since, tries=0, last=None, escalated=bool(current))
             if row.get("status") != "idle":
                 continue                                  # a try in flight
-            # a stall already escalated before a restart is not tried or escalated again
-            st = self.state.setdefault(sid, dict(start=_epoch(stall.get("ts"), now), tries=0, last=None,
-                                                 escalated=esc is not None))
             if st["escalated"]:
                 continue
             error = stall.get("error") or "unknown"
@@ -88,7 +93,7 @@ class Recover:
     def _continue(self, service, row, sp, stall, st, now) -> dict:
         st["tries"] += 1
         st["last"] = now
-        ok, message = _deliver(service, sp["agent_name"], TEXT, sp["squad_id"], row)
+        ok, message = _deliver(service, sp["agent_name"], TEXT, sp["squad_id"], row, ts=now)
         service.store.log_action("continue", row["pid"], dict(session_id=row.get("session_id"), name=sp["agent_name"]),
                                  ok, f"try {st['tries']}/{len(DELAYS)} after {stall.get('error')}: {message}", HUB)
         return dict(action="continue", agent=sp["agent_name"], try_=st["tries"], ok=ok)
@@ -102,27 +107,41 @@ class Recover:
         boss = sp.get("spawned_by")
         if boss:
             peers = {p.get("name"): p for p in service.mesh_peers(squad_id=squad)}
-            if boss in peers and not peers[boss].get("stall") and _deliver(service, boss, text, squad, peers[boss])[0]:
+            if boss in peers and not peers[boss].get("stall") and _deliver(service, boss, text, squad, peers[boss], ts=self.clock())[0]:
                 told.append(boss)
         # flagged blocking, so it raises the operator's alert (header badge, "blocked on operator") like an agent's
         # blocking question; it closes when the agent works again, or by hand
-        if _deliver(service, "operator", text, squad, needs="blocking")[0]:
+        if _deliver(service, "operator", text, squad, needs="blocking", ts=self.clock())[0]:
             told.append("operator")
         service.store.log_action("escalate", row["pid"], dict(session_id=row.get("session_id"), name=name), bool(told),
                                  f"{reason}; told {', '.join(told) or 'nobody'}", HUB)
         return dict(action="escalate", agent=name, told=told)
 
 
-def _open_escalations(service) -> dict[tuple[str, str], int]:
-    """(agent, squad) -> id of its unanswered escalation to the operator."""
-    out = {}
+def _open_escalations(service) -> dict[tuple[str, str], list[tuple[int, float]]]:
+    """(agent, squad) -> [(id, ts)] of its unanswered escalations to the operator."""
+    out: dict = {}
     for m in service.store.open_needs(to_name="operator"):
         if m["from_name"] == HUB and m["transport"] == "system" and m["body"].startswith(PREFIX):
-            out[(m["body"][len(PREFIX):].split(" ", 1)[0], m["squad_id"])] = m["id"]
+            out.setdefault((m["body"][len(PREFIX):].split(" ", 1)[0], m["squad_id"]), []).append((m["id"], m["ts"]))
     return out
 
 
-def _deliver(service, to: str, text: str, squad: str, row: dict | None = None, needs: str | None = None) -> tuple[bool, str]:
+def _spawn(service, session_id: str) -> dict | None:
+    """The spawn row of one live session, however many spawns came after it (`spawned` returns the newest 500)."""
+    by_session = getattr(service.store, "spawn_by_session", None)   # ponytail: the backend branch adds it; drop the
+    if by_session is not None:                                        # fallback when that branch is merged in
+        return by_session(session_id)
+    return next((s for s in service.store.spawned(limit=500) if s.get("session_id") == session_id), None)
+
+
+def _resolve(service, ids) -> None:
+    for i in ids:
+        service.store.resolve_message(i)
+
+
+def _deliver(service, to: str, text: str, squad: str, row: dict | None = None, needs: str | None = None,
+             ts: float | None = None) -> tuple[bool, str]:
     """Send `text` to a live session (`row`: pid, created) through the fleet's send, as `/api/send` does, and journal
     it as a system notice that closes no flag. Without a row (the operator), journaling is the delivery."""
     ok, message = True, "journaled"
@@ -133,7 +152,8 @@ def _deliver(service, to: str, text: str, squad: str, row: dict | None = None, n
         except Exception as exc:                          # noqa: BLE001  a failed send still counts as a try
             ok, message = False, str(exc)
     if ok:
-        service.store.record_message(from_name=HUB, to_name=to, to_session=(row or {}).get("session_id"),
+        # stamped with recover's clock: an escalation is matched to its stall by comparing this with the stall's start
+        service.store.record_message(from_name=HUB, to_name=to, to_session=(row or {}).get("session_id"), ts=ts,
                                      squad_id=squad, body=text, transport="system", needs=needs, closes=False)
     else:
         log.warning("recover: could not reach %s: %s", to, message)

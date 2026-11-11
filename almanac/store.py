@@ -672,7 +672,8 @@ class Store:
             rows = self.db.execute(
                 "select from_name, to_name, count(*), max(ts), "
                 "sum(needs = 'reply' and answered_ts is null), sum(needs = 'blocking' and answered_ts is null) "
-                "from messages where squad_id = ? group by from_name, to_name", (squad_id,)).fetchall()
+                "from messages where squad_id = ? and transport != 'system' group by from_name, to_name",
+                (squad_id,)).fetchall()
         edges: dict[tuple, dict] = {}
         for frm, to, count, last, reply, blocking in rows:
             key = ("operator" if frm in OPERATOR_NAMES else frm, "operator" if to in OPERATOR_NAMES else to)
@@ -699,7 +700,7 @@ class Store:
         with self.lock:
             rows = self.db.execute(
                 f"select id, ts, from_name, to_name, needs, answered_ts, channel, body from messages where {where} "
-                "and ts between ? and ? order by ts desc limit ?", (*params, start, end, int(limit))).fetchall()
+                "and transport != 'system' and ts between ? and ? order by ts desc limit ?", (*params, start, end, int(limit))).fetchall()
         return [{"id": r[0], "ts": r[1], "from": "operator" if r[2] in OPERATOR_NAMES else r[2],
                  "to": "operator" if r[3] in OPERATOR_NAMES else r[3], "needs": r[4], "answered_ts": r[5],
                  "channel": r[6], "preview": " ".join(str(r[7] or "").split())[:120]} for r in reversed(rows)]
@@ -1088,7 +1089,8 @@ class Store:
             marks = ",".join("?" * len(OPERATOR_NAMES))
             # what the operator broadcast (launch notices, joins, @squad / #channel posts) stays in the contact stream:
             # it is no conversation, and a reply there would broadcast again
-            clauses = ["id > ?", f"(to_name in ({marks}) or (from_name in ({marks}) and substr(to_name, 1, 1) not in ('@', '#')))"]
+            clauses = ["id > ?", f"(to_name in ({marks}) or (from_name in ({marks}) and substr(to_name, 1, 1) not in ('@', '#') "
+                                 "and transport != 'system'))"]
             params: list = [max(0, int(since_id)), *OPERATOR_NAMES, *OPERATOR_NAMES]
             if squad_id:
                 clauses.append("squad_id = ?")
@@ -1120,6 +1122,7 @@ class Store:
             row = self.db.execute(
                 f"select {MESSAGE_COLUMNS} from messages where ((from_name in ({marks}) and to_name = ?) "
                 f"or (from_name = ? and to_name in ({marks}))) and (squad_id is null or ? is null or squad_id = ?) "
+                "and transport != 'system' "                 # Almanac's own `continue` is not the operator writing
                 "order by id desc limit 1",
                 (*OPERATOR_NAMES, agent, agent, *OPERATOR_NAMES, squad_id, squad_id)).fetchone()
         return _message(row) if row else None

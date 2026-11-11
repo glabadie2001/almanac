@@ -47,6 +47,12 @@ class DetectTests(Fixture):
         _, meta = self.tail(api_error(T0), prompt(T0 + 20), said(T0 + 25))
         self.assertIsNone(meta["stall"])
 
+    def test_an_unbroken_run_of_errors_keeps_its_start(self):
+        _, meta = self.tail(api_error(T0), prompt(T0 + 20), api_error(T0 + 25))
+        self.assertEqual((meta["stall"]["since"], meta["stall"]["ts"]), (iso(T0), iso(T0 + 25)))
+        _, meta = self.tail(api_error(T0), said(T0 + 10), api_error(T0 + 25))
+        self.assertEqual(meta["stall"]["since"], iso(T0 + 25), "a reply in between starts a new stall")
+
     def test_a_sidechain_error_is_not_a_stall(self):
         _, meta = self.tail(said(T0), dict(api_error(T0 + 1), isSidechain=True))
         self.assertIsNone(meta["stall"])
@@ -225,6 +231,41 @@ class RecoverTests(Fixture):
                 raise RuntimeError("scan failed")
         self.assertEqual(recover.tick(Broken(self.store)), [])
 
+    def test_a_new_stall_inside_one_tick_starts_over_and_closes_the_old_alert(self):
+        self.stall("impl", error="authentication_failed")
+        self.at(T0)                                                  # escalated
+        self.assertEqual(len(self.store.open_needs(to_name="operator")), 1)
+        # between two ticks it worked again (a reply), then failed anew: fleet gives a new `since`
+        self.svc.fleet.stalls["s-impl"] = dict(error="server_error", text="x", ts=iso(T0 + 300), since=iso(T0 + 300))
+        self.at(T0 + 310)
+        self.assertEqual(self.store.open_needs(to_name="operator"), [], "the old stall's alert is closed")
+        self.at(T0 + 320)
+        self.assertEqual(len(self.tries()), 1, "the new stall gets its own tries")
+
+    def test_a_continue_that_fails_again_is_the_same_stall(self):
+        self.svc.fleet.stalls["s-impl"] = dict(error="server_error", text="x", ts=iso(T0), since=iso(T0))
+        self.at(T0 + 20)
+        self.svc.fleet.stalls["s-impl"] = dict(error="server_error", text="x", ts=iso(T0 + 25), since=iso(T0))
+        for ts in (T0 + 80, T0 + 260, T0 + 280, T0 + 900):
+            self.at(ts)
+        self.assertEqual((len(self.tries()), self.told), (3, ["arch", "operator"]), "no fresh tries, no loop")
+
+    def test_every_open_escalation_of_an_agent_closes_on_recovery(self):
+        for _ in range(2):
+            self.store.record_message(from_name="almanac-hub", to_name="operator", squad_id="sq-1", ts=T0,
+                                      body="[stalled] impl (squad sq-1) ...", transport="system", needs="blocking", closes=False)
+        self.at(T0 + 1)
+        self.assertEqual(self.store.open_needs(to_name="operator"), [])
+
+    def test_a_live_session_is_found_by_session_however_old_its_spawn(self):
+        rows = {f"s-{n}": self.store.spawn_of(n) for n in ("arch", "impl")}
+        scan = mock.patch.object(self.store, "spawned", side_effect=AssertionError("no scan of the newest 500"))
+        lookup = mock.patch.object(self.store, "spawn_by_session", create=True, side_effect=rows.get)
+        with scan, lookup:
+            self.stall("impl", at=T0)
+            self.at(T0 + 20)
+        self.assertEqual(len(self.tries()), 1)
+
     def test_an_open_escalation_survives_a_restart_and_closes_on_recovery(self):
         self.stall("impl", error="authentication_failed")
         self.at(T0)
@@ -267,6 +308,22 @@ class OperatorSeesItTests(MeshRig):
         rec.tick(svc)
         _, _, doc = self.request(self.handler, "/api/operator/inbox?limit=0", token=TOKEN)
         self.assertEqual(doc["open"]["blocking"], 0, "recovered: the alert clears itself")
+
+    def test_a_continue_is_not_the_operator_writing(self):
+        self.store.create_squad("sq-1", "alpha", str(self.root), "Ship it.")
+        self.store.record_spawn(agent_name="impl", session_id="s-impl", squad_id="sq-1", role_id="implementer-claude",
+                                provider="claude", model=None, effort=None, cwd=str(self.root), worktree_path=None, pid=900)
+        self.assertFalse(self.service.may_page_operator("impl")[0])
+        svc = FakeService(self.store)
+        svc.fleet.rows.append(dict(pid=900, created="1", role="session", session_id="s-impl", status="idle"))
+        svc.fleet.stalls["s-impl"] = dict(error="server_error", text="x", ts=iso(T0))
+        recover.Recover(clock=lambda: T0 + 20).tick(svc)
+        self.assertEqual(len(svc.fleet.sent), 1)
+        self.assertFalse(self.service.may_page_operator("impl")[0], "no paging pass from an automatic continue")
+        _, _, doc = self.request(self.handler, "/api/operator/inbox", token=TOKEN)
+        self.assertEqual([m for m in doc["messages"] if m["body"] == "continue"], [], "not the operator's outgoing mail")
+        self.assertEqual(self.store.message_graph("sq-1"), [], "no operator edge in the topology")
+        self.assertEqual(self.store.timeline_messages(squad_id="sq-1", start=0, end=T0 + 100), [], "nor in the swimlane")
 
 
 import io                                                            # noqa: E402
@@ -311,6 +368,24 @@ class GeminiTests(Fixture):
         self.assertEqual(meta["stall"]["error"], gemini_host.RUNNER_EXITED)
         self.assertNotIn(gemini_host.RUNNER_EXITED, recover.TRANSIENT)
         self.assertNotIn("gemini_error", recover.TRANSIENT)
+
+    def test_a_runner_that_cannot_start_leaves_the_same_error_record(self):
+        h = self.host()
+        with mock.patch.object(h, "_ensure_stream_proc", side_effect=FileNotFoundError("agy")):
+            h.run_one_turn(dict(raw_content="go", prompt_text="go"))
+        events, meta = fl.read_tail(self.tx)
+        self.assertEqual(meta["stall"]["error"], gemini_host.RUNNER_ERROR)
+        self.assertIn("Gemini runner not found", meta["stall"]["text"])
+        self.assertEqual(events[-1]["kind"], "error")
+        self.assertNotIn(gemini_host.RUNNER_ERROR, recover.TRANSIENT)
+
+    def test_a_cancelled_turn_writes_no_completed_reply(self):
+        h = self.host()
+        _, before = self.turn(h, {"type": "result", "is_error": True, "error": "boom"})
+        h.stop_event.set()                                       # shutting down: agy's output ends with no result
+        events, meta = self.turn(h)
+        self.assertEqual(meta["stall"], before["stall"], "the earlier stall is not cleared by a fake reply")
+        self.assertNotIn("(completed)", [e["text"] for e in events])
 
     def test_continue_reaches_a_gemini_agent_through_fleet_send(self):
         h = self.host()

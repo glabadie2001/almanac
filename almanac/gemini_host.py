@@ -232,6 +232,7 @@ def parse_agy_stream_event(event: dict) -> dict:
 
 
 RUNNER_EXITED = "runner_exited"     # agy's stdout closed before a `result`: the process died; not retried
+RUNNER_ERROR = "runner_error"       # the turn raised (agy missing, a pipe that will not take the prompt); not retried
 
 
 def turn_error(err, finished_reason=None) -> dict:
@@ -549,7 +550,8 @@ class GeminiHost:
                     usage = ev["usage"]
                 break
 
-        if not ended and not self.stop_event.is_set():
+        self._turn_cancelled = not ended and self.stop_event.is_set()
+        if not ended and not self._turn_cancelled:
             self._turn_error = dict(error=RUNNER_EXITED, text="agy's output closed before the turn ended")
         reply = final_text.strip() or "".join(text_chunks).strip()
         return reply, tool_events, usage, seen_model
@@ -569,13 +571,15 @@ class GeminiHost:
         )
         full_prompt = self._build_turn_prompt(item["prompt_text"])
         self._turn_index += 1
-        self._turn_error = None
+        self._turn_error, self._turn_cancelled = None, False
         try:
             reply, _, usage, seen_model = self._run_agy_turn(full_prompt)
             if seen_model:
                 self.model, self.effort = split_agy_model_effort(seen_model, self.effort)
             if reply:
                 self._log(f"\n✦ [{self.name}] {reply}\n")
+            if self._turn_cancelled:
+                return                                    # shutting down mid-turn: no reply, and no fake "(completed)"
             err = self._turn_error
             if err and not reply:
                 reply = f"[error] {err['text']}"
@@ -603,18 +607,18 @@ class GeminiHost:
                 err_msg = (f"Gemini runner not found at {self.agy_bin}: install agy or set \"gemini\" in Almanac's "
                            f"config.json, then relaunch this agent ({exc})")
             self._log(f"\n✕ {err_msg}\n")
+            # the same record a failed turn leaves, so a runner that cannot start is seen as stalled and escalated
             self._append_record(
                 {
-                    "type": "user",
+                    "isApiErrorMessage": True,
+                    "error": RUNNER_ERROR,
+                    "type": "assistant",
                     "provider": "gemini",
                     "sessionId": self.session_id,
                     "timestamp": iso_now(),
                     "cwd": self.cwd,
-                    "message": {
-                        "content": [
-                            {"type": "tool_result", "tool_use_id": "runner", "is_error": True, "content": err_msg}
-                        ]
-                    },
+                    "message": {"id": f"msg_{secrets.token_hex(8)}", "model": "<synthetic>",
+                                "content": [{"type": "text", "text": err_msg}]},
                 }
             )
         finally:

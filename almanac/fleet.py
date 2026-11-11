@@ -291,7 +291,12 @@ def read_tail(path: Path, window: int = 600_000, keep: int | None = None) -> tup
             if eff_rec:
                 meta["effort"] = eff_rec
             meta["last_ts"] = ts or meta["last_ts"]
-            meta["stall"] = _stall(rec, ts)
+            # `since`: the first error of an unbroken run, so a `continue` that fails again is the same stall, and
+            # a reply in between (even within one recover tick) starts a new one
+            stall = _stall(rec, ts)
+            if stall:
+                stall["since"] = (meta["stall"] or {}).get("since") or ts
+            meta["stall"] = stall
         if kind == "user":
             if isinstance(content, str):
                 parsed = uds.parse_cross_session(content)
