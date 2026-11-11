@@ -26,6 +26,7 @@ def build_service(settings: dict, state: Path, store) -> Service:
                       fleet=Fleet(Path(settings["transcripts"]).parent, extra_projects=[gemini_projects]),
                       state=state, claude=settings["claude_configured"], gemini=settings["gemini_configured"],
                       prices=Prices(settings["prices"]), namer=namer)
+    service.context_warn = settings["context_warn"]
     service.auto_continue = settings["auto_continue"]      # recover.py: continue a squad agent stalled on an API error
     return service
 

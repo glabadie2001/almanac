@@ -626,7 +626,7 @@ class Store:
                     counts = self._gemini_turn(session, counts)
             if main and session and usage and any(counts) and msg.get("model") not in (None, "<synthetic>"):
                 self.db.execute("update sessions set model = ?, context = ? where id = ?", (
-                    msg.get("model"), counts[0] + counts[1] + counts[2], session))
+                    msg.get("model"), int(rec.get("context_tokens") or 0) or counts[0] + counts[1] + counts[2], session))
             if usage and msg.get("id"):
                 self.db.execute("insert or replace into usage values (?, ?, ?, ?, ?, ?, ?, ?)",
                                 (msg["id"], session, ts, msg.get("model"), *counts))
@@ -987,6 +987,11 @@ class Store:
             self.db.execute("update sessions set name = coalesce(?, name), name_usd = coalesce(name_usd, 0) + ?, "
                             "named_at = ?, name_error = ? where id = ?", (name, usd, time.time(), error, session))
             self.db.commit()
+
+    def session_context(self, session_id: str) -> int | None:
+        with self.lock:
+            row = self.db.execute("select context from sessions where id = ?", (session_id,)).fetchone()
+        return (row[0] or None) if row else None
 
     def chat(self, session_id: str) -> dict | None:
         found = [c for c in self.chats(session_id, 5) if c["id"] == session_id]

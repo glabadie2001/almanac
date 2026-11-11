@@ -15,6 +15,7 @@ DEFAULTS = dict(
     naming_model="haiku",                   # any --model value the CLI accepts
     prices={},                              # {"claude-opus-5-5": 5.0}: USD per million input tokens, for resume estimates
     hosts=[],                               # extra Host values to accept, e.g. a reverse proxy name "box.example:443"
+    context_warn=300000,                    # tokens an agent re-reads per step at which FLEET and PLAN show a warning
     auto_continue=True,                     # send `continue` to a squad agent stalled on a transient API error (recover.py)
 )
 
@@ -31,6 +32,8 @@ def load(path):
         out[key] = value
     if not 1 <= out["port"] <= 65535:
         raise ValueError("Invalid port")
+    if out["context_warn"] < 1:
+        raise ValueError("context_warn is at least 1 token")
     if out["interval"] < 30:
         raise ValueError("interval is at least 30 seconds")
     out["transcripts"] = str(Path(out["transcripts"]).expanduser())

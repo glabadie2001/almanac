@@ -1231,6 +1231,7 @@ async function loadFleet() {
   let doc;
   try { doc = await api("/api/fleet"); } catch (err) { $("fleet-summary").textContent = `fleet unavailable: ${err.message}`; return; }
   state.fleet = doc;
+  if (doc.context_warn) state.ctxWarn = doc.context_warn;
   trackSessions();       // before any early return: every fleet refresh notices sessions leaving, whatever the tab
   const s = doc.summary || {};
   const byProv = s.providers || {};
@@ -1291,6 +1292,7 @@ async function loadFleet() {
       el("td", { cls: "role-tag", text: p.role === "session" ? (p.agent_role || "–").slice(0, 18) : "" }),
       modelCell,
       effortCell,
+      el("td", { cls: `r${ctxWarn(p.context)}`, text: p.role === "session" ? ctxText(p.context, p.context_total) : "", title: p.context ? `${ctxTitle(p.context_total)} (${p.context})` : null }),
       el("td", {}, rowState(p)), el("td", { cls: "r", text: p.cpu === null ? "–" : `${num(p.cpu)}%` }),
       el("td", { cls: "spark", text: spark(state.cpu.get(key), Math.max(5, ...state.cpu.get(key))) }),
       el("td", { cls: "r", text: `${p.mem_mb}M` }), el("td", { cls: "r", text: age(p.started) }));
@@ -1886,6 +1888,7 @@ async function loadMesh() {
   }
   if (sq !== meshState.squadFilter) return;       // the squad changed while this was in flight: the newer call paints
   meshState.peers = doc.peers || [];
+  if (doc.context_warn) state.ctxWarn = doc.context_warn;
   meshState.messages = doc.messages || [];
   meshState.open = doc.open || [];
   if (doc.roles?.length) { state.roles = doc.roles; syncRoleControls(); }
@@ -2192,6 +2195,14 @@ async function loadPlan(rev) {
 // the roster decides on every poll, as it is fresher than the fetched rows: a live owner is stalled (stopped on an API
 // error), busy or idle, and an absent one has ended. The rows are only fetched after a roster poll, so the door's own
 // owner_state is never needed here.
+// A step's re-read, in k. Σ: only agy's running total for the conversation is known (a Gemini record without its own step figure).
+const ctxText = (n, total) => n ? `${ktok(n)}${total ? "Σ" : ""}` : "";
+const ctxWarn = (n) => n && state.ctxWarn && n >= state.ctxWarn ? " ctx-warn" : "";
+const ctxTitle = (total) => total ? "tokens agy reports for the whole conversation so far (not one step's re-read)" : "tokens its last step re-read";
+function planOwnerCtx(o) {      // the live peer's, else what the doc carried (an ended owner's last stored)
+  const peer = meshState.peers.find((q) => o.owner_session && q.session_id === o.owner_session);
+  return peer ? [peer.context, !!peer.context_total] : [o.owner_context, !!o.owner_context_total];
+}
 function planOwnerState(o) {
   if (!o.owner_name) return "none";
   const p = meshState.peers.find((q) => (o.owner_session ? q.session_id === o.owner_session : q.name === o.owner_name));
@@ -2201,8 +2212,11 @@ const statusPill = (s) => el("span", { cls: `flag st-${slug(s)}`, text: s || "�
 function ownerChip(o) {
   const own = planOwnerState(o);
   const plain = ["none", "busy", "idle", "ended"].includes(own);   // colour says these; any other state is spelled out
-  return el("span", { cls: `flag own-${slug(own)}`, text: plain ? o.owner_name || "unowned" : `${o.owner_name} · ${own}`,
-    title: own === "none" ? "nobody owns this task" : `${o.owner_name}: ${own}` });
+  const [n, total] = planOwnerCtx(o);
+  const ctx = ctxText(n, total);
+  const base = plain ? o.owner_name || "unowned" : `${o.owner_name} · ${own}`;
+  return el("span", { cls: `flag own-${slug(own)}${ctxWarn(n)}`, text: ctx && own !== "none" ? `${base} · ${ctx}` : base,
+    title: own === "none" ? "nobody owns this task" : `${o.owner_name}: ${own}${ctx ? ` · context ${ctx}: ${ctxTitle(total)}` : ""}` });
 }
 function planLast(l) {
   if (!l) return "";
@@ -2245,8 +2259,16 @@ function paintPlan() {
 
   const rows = planState.rows, byOwner = planState.group === "owner";
   const sig = JSON.stringify([planState.group, meshState.selTask, planState.note, rows, rows.map(planOwnerState), rows.map((o) => planLast(o.last_log))]);
-  if (sig === planState.sig) return;                   // polled: do not rebuild (and drop focus) when nothing changed
-  planState.sig = sig;
+  // what the owner chips show (rounded k and the warn class), not the raw count: that moves on every step
+  const ctxSig = JSON.stringify(rows.map((o) => { const [n, t] = planOwnerCtx(o); return [ctxText(n, t), ctxWarn(n)]; }));
+  if (sig === planState.sig) {                         // polled: do not rebuild (and drop focus) when nothing changed
+    if (ctxSig !== planState.ctxSig) {                 // only a chip's size or warning moved: swap the chips, leave the rows
+      planState.ctxSig = ctxSig;
+      for (const o of rows) $("plan-table").querySelector(`tr[data-ref="${CSS.escape(o.ref)}"] td:nth-child(4)`)?.replaceChildren(ownerChip(o));
+    }
+    return;
+  }
+  planState.sig = sig; planState.ctxSig = ctxSig;
   $("plan-counts").replaceChildren(
     el("span", { cls: "hi", text: `${rows.length} task${rows.length === 1 ? "" : "s"}` }),
     ...PLAN_STATUSES.flatMap((s) => {
