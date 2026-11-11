@@ -38,6 +38,11 @@ live, and without a launcher.
 across a relaunch with `--conversation`); ingest stores each turn's own counts, and one re-read repaired history.
 rev-gemini's session read 19.3M input, 336M cache-read and 2.26M output; it is 1.08M, 20.3M and 134k.
 
+**Elastic model and effort.** A role may list other allowed models and efforts besides its default (the role
+form's "also allowed"); an agent adding a member through `mesh_spawn` may pick from the default plus those lists and
+gives a reason (`why`), and the choice is kept on the new member's task. The operator's own spawns keep their free
+overrides.
+
 **Also:** a Gemini role's `add_dirs` (extra workspace folders, `--add-dir`); `#squad` reaches every member of the
 sender's squad (role-form saves had wiped every role's channels, so it reached nobody); a role saved from the form
 keeps what the form does not send (`permission_mode` was reset too); the role form edits channels, allowed
@@ -77,8 +82,9 @@ PARALLEL row; FLEET, GALLERY and the MESH context head show `31m work`.
 
 **Elastic squads.** Schema v7: a squad's `spawn_role` (one role, or `*` for any defined role) and `spawn_limit`
 (0 to 20) let an agent whose role has `may_spawn` (architects by default) add members through `mesh_spawn` /
-`POST /api/mesh/spawn`. Model, effort, workspace and permission mode always come from the role's definition, never
-from the agent. The limit check and the spawn hold one lock. The operator sets both at launch or in the squad strip
+`POST /api/mesh/spawn`. Workspace and permission mode always come from the role's definition, never from the
+agent; so did model and effort until 2026-11-11, when a role may list other allowed ones (see that build). The limit
+check and the spawn hold one lock. The operator sets both at launch or in the squad strip
 and adds members freely with **[+ ADD MEMBER]**. The newcomer's kickoff carries the brief, its task, who added it,
 and for a worktree its branch; the squad hears who joined.
 

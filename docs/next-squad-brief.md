@@ -61,4 +61,6 @@ architect's ruling recorded in `docs/objects-and-knowledge.md`.
 
 - A task's previous owner is not told when the task is reassigned.
 - After a save, the role form keeps the channel text as typed instead of the normalized list.
+- `normalize_model` (`spawner.py`) returns a Gemini model id as given when it is not an alias, so a differently
+  cased id (`Gemini-4-Carbon`) is not lowercased.
 - `T-6` in this squad's PLAN is the stage 2 placeholder. It does not carry over: tasks belong to their squad.
