@@ -300,6 +300,9 @@ class Store:
         # v8: exact shell command lines a role's runner may run (agy's allow rules; informational for Claude)
         if "allowed_commands" not in {r[1] for r in self.db.execute("pragma table_info(roles)")}:
             self.db.execute("alter table roles add column allowed_commands text default '[]'")
+        # v9: folders outside its workspace a Gemini role's runner may read (agy `--add-dir`)
+        if "add_dirs" not in {r[1] for r in self.db.execute("pragma table_info(roles)")}:
+            self.db.execute("alter table roles add column add_dirs text default '[]'")
         self.db.execute("create index if not exists spawned_agents_name on spawned_agents(agent_name, created_ts)")
         row = self.db.execute("select value from meta where key = 'schema'").fetchone()
         version = int(row[0]) if row else 0
@@ -346,7 +349,7 @@ class Store:
                 if r.get("allowed_commands"):
                     self.db.execute("update roles set allowed_commands = ? where id = ? and coalesce(allowed_commands, '[]') = '[]'",
                                     (json.dumps(r["allowed_commands"]), r["id"]))
-        self.db.execute("insert or replace into meta values ('schema', '8')")
+        self.db.execute("insert or replace into meta values ('schema', '9')")
         if self.db.execute("select count(*) from roles").fetchone()[0] == 0:
             now = time.time()
             for r in DEFAULT_ROLES:
@@ -1149,7 +1152,7 @@ class Store:
         with self.lock:
             rows = self.db.execute(
                 "select id, title, provider, model, effort, workspace_mode, permission_mode, system_prompt, channels, updated_ts, "
-                "may_page_operator, may_spawn, allowed_commands from roles order by id"
+                "may_page_operator, may_spawn, allowed_commands, add_dirs from roles order by id"
             ).fetchall()
         out = []
         for r in rows:
@@ -1172,6 +1175,7 @@ class Store:
                     may_page_operator=bool(r[10]),
                     may_spawn=bool(r[11]),
                     allowed_commands=[str(c) for c in _json_list(r[12])],
+                    add_dirs=[str(d) for d in _json_list(r[13])],
                 )
             )
         return out
@@ -1218,18 +1222,27 @@ class Store:
         if isinstance(cmds, str):
             cmds = cmds.splitlines()
         cmds = None if cmds is None else json.dumps([str(c).strip() for c in cmds if str(c).strip()][:40])
+        dirs = doc.get("add_dirs")                      # likewise: a list, or one folder per line
+        if isinstance(dirs, str):
+            dirs = dirs.splitlines()
+        if dirs is not None:
+            dirs = [str(d).strip() for d in dirs if str(d).strip()][:20]
+            bad = [d for d in dirs if not (Path(d).is_absolute() and Path(d).is_dir())]
+            if bad:
+                raise ValueError("add_dirs must be absolute paths of existing folders; not: " + ", ".join(bad))
+            dirs = json.dumps(list(dict.fromkeys(str(Path(d).resolve()) for d in dirs)))   # `C:\a` and `C:\a\` once
         now = time.time()
         with self.lock:
             self.db.execute(
                 "insert into roles (id, title, provider, model, effort, workspace_mode, permission_mode, system_prompt, channels, "
-                "updated_ts, may_page_operator, may_spawn, allowed_commands) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "updated_ts, may_page_operator, may_spawn, allowed_commands, add_dirs) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "on conflict(id) do update set title=excluded.title, provider=excluded.provider, model=excluded.model, "
                 "effort=excluded.effort, workspace_mode=excluded.workspace_mode, permission_mode=excluded.permission_mode, "
                 "system_prompt=excluded.system_prompt, channels=excluded.channels, updated_ts=excluded.updated_ts, "
                 "may_page_operator=coalesce(?, roles.may_page_operator), may_spawn=coalesce(?, roles.may_spawn), "
-                "allowed_commands=coalesce(?, roles.allowed_commands)",
+                "allowed_commands=coalesce(?, roles.allowed_commands), add_dirs=coalesce(?, roles.add_dirs)",
                 (rid, title, provider, model, effort, wmode, pmode, prompt, json.dumps(channels), now, page or 0, grow or 0,
-                 cmds or "[]", page, grow, cmds),
+                 cmds or "[]", dirs or "[]", page, grow, cmds, dirs),
             )
             self.db.commit()
         return self.role(rid)

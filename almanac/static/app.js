@@ -1385,6 +1385,8 @@ function populateRoleForm(r) {
   $("role-prompt").value = r ? (r.system_prompt || "") : "";
   $("role-page").checked = !!r?.may_page_operator;
   $("role-grow").checked = !!r?.may_spawn;
+  $("role-commands").value = (r?.allowed_commands || []).join("\n");
+  $("role-dirs").value = (r?.add_dirs || []).join("\n");
   $("role-msg").textContent = r ? `editing ${r.id}` : "";
 }
 
@@ -1411,6 +1413,8 @@ $("role-save").closest("form").addEventListener("submit", async (e) => {
       system_prompt: $("role-prompt").value.trim(),
       may_page_operator: $("role-page").checked,
       may_spawn: $("role-grow").checked,
+      allowed_commands: $("role-commands").value,
+      add_dirs: $("role-dirs").value,
     });
     msg.textContent = r.ok ? `saved role ${r.role.id} ✓` : "save failed";
     await loadRoles();

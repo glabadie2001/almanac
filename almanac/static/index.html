@@ -253,6 +253,14 @@
           <div class="field check-field">
             <label for="role-grow"><input type="checkbox" id="role-grow" name="may_spawn"> may add squad members ⊕</label>
           </div>
+          <div class="field">
+            <label for="role-commands">allowed commands (Gemini only, one per line)</label>
+            <textarea id="role-commands" name="allowed_commands" rows="3" placeholder="git diff"></textarea>
+          </div>
+          <div class="field">
+            <label for="role-dirs">readable folders (Gemini only, one absolute path per line)</label>
+            <textarea id="role-dirs" name="add_dirs" rows="3" placeholder="C:\path\to\folder"></textarea>
+          </div>
           <div class="field span-all">
             <label for="role-prompt">role system prompt *</label>
             <textarea id="role-prompt" name="system_prompt" rows="3" required placeholder="Responsibilities, boundaries, verification standards, and how this role collaborates with peers…"></textarea>

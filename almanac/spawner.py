@@ -130,6 +130,7 @@ def build_mesh_charter(
     may_page_operator: bool = False,
     grow: dict | None = None,
     allowed_commands: list[str] | None = None,
+    add_dirs: list[str] | None = None,
 ) -> str:
     """System charter giving every Claude and Gemini agent shared stream awareness and uds-messaging etiquette."""
     # no --state in the CLI line: with it, a CLI that lacks a token falls back to the door's master token file.
@@ -172,6 +173,9 @@ def build_mesh_charter(
     if allowed_commands and provider == "gemini":     # agy's allow rules; for Claude the role field is informational
         lines.append("- **Shell**: your runner only permits these exact command lines, typed character for character: "
                      + ", ".join(f"`{c}`" for c in allowed_commands) + "; anything else is denied, so do not try variants.")
+    if add_dirs and provider == "gemini":             # agy `--add-dir`; Claude agents already read outside their cwd
+        lines.append("- **Folders**: besides your workspace you may read these folders: "
+                     + ", ".join(f"`{d}`" for d in add_dirs) + ".")
     if teammates:
         lines += ["", "## Initial Squad Roster"]
         for tm in teammates:
@@ -457,6 +461,7 @@ def spawn_agent(
         may_page_operator=bool(role is None or role.get("may_page_operator")),   # role-less agents may page (door.may_page_operator)
         grow=_grow_line(service, role, squad_id),
         allowed_commands=(role or {}).get("allowed_commands") or [],
+        add_dirs=(role or {}).get("add_dirs") or [],
     )
     charter_file = spawn_dir / "charter.md"
     charter_file.write_text(charter, encoding="utf-8")
@@ -589,6 +594,8 @@ def spawn_agent(
             "--add-dir",
             str(bundle_dir),
         ]
+        for folder in (role or {}).get("add_dirs") or []:
+            argv += ["--add-dir", folder]
         if eff_model:
             argv += ["--model", eff_model]
         if eff_effort:

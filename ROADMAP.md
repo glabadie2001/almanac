@@ -222,6 +222,8 @@ can be indexed after the fact with a model pass over the saved transcripts, less
 - Gemini agents cannot run arbitrary shell commands on this account: `--mode auto` is refused and the default mode
   denies every shell command, so a role's `allowed_commands` (exact command lines, agy allow rules) is the only
   way; `--dangerously-skip-permissions` (role permission mode `bypass`) is the other route.
+- Headless `agy` denies `read_file` outside the workspace; a Gemini role's `add_dirs` passes `--add-dir` per
+  folder. `read_file(<target>)` allow rules through `--settings` (beside the command rules) were not tried.
 - An agent token can read any session's context stream (`/api/mesh/context?peer=<any session id>` falls back to
   any stored transcript, the operator's own chats included) and any squad's messages, the operator's inbox among
   them. Same advisory model as the tokens; restricting agents to their own squad's peers is the fix if this ever
