@@ -112,7 +112,8 @@ create table if not exists spawned_agents (
     pid integer,
     created_ts real not null,
     channels text,
-    spawned_by text
+    spawned_by text,
+    retired_ts real
 );
 """
 SPAWNED_COLUMNS = "session_id, agent_name, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, created_ts, channels, spawned_by"
@@ -343,6 +344,9 @@ class Store:
         # each spawn row says who added it (null: the operator)
         if "spawned_by" not in {r[1] for r in self.db.execute("pragma table_info(spawned_agents)")}:
             self.db.execute("alter table spawned_agents add column spawned_by text")
+        # v11: a member retired by its role's fresh-per-task policy (door.context_boundary) gives its slot back
+        if "retired_ts" not in {r[1] for r in self.db.execute("pragma table_info(spawned_agents)")}:
+            self.db.execute("alter table spawned_agents add column retired_ts real")
         have = {r[1] for r in self.db.execute("pragma table_info(squads)")}
         for column, kind in (("spawn_role", "text"), ("spawn_limit", "integer default 0")):
             if column not in have:
@@ -1472,9 +1476,11 @@ class Store:
         with self.lock:
             rows = self.db.execute(
                 "select id, name, cwd, brief, created_ts, status, spawn_role, coalesce(spawn_limit, 0), "
-                # members, not sessions: a respawn (door.respawn_task) reuses its handle and takes no slot
+                # members, not sessions: a respawn (door.respawn_task) reuses its handle and takes no slot; a handle
+                # whose newest row was retired (fresh-per-task) gives its slot back
                 "(select count(distinct a.agent_name) from spawned_agents a where a.squad_id = squads.id "
-                "and a.spawned_by is not null) "
+                "and a.spawned_by is not null and (select n.retired_ts from spawned_agents n where n.squad_id = a.squad_id "
+                "and n.agent_name = a.agent_name order by n.created_ts desc limit 1) is null) "
                 f"from squads {where}order by created_ts desc limit ?",
                 (*params, max(1, min(200, int(limit)))),
             ).fetchall()
@@ -1615,7 +1621,7 @@ class Store:
         with self.lock:
             rows = self.db.execute(
                 "select agent_name, session_id, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, created_ts, "
-                f"channels, spawned_by from spawned_agents {where}order by created_ts desc limit ?",
+                f"channels, spawned_by, retired_ts from spawned_agents {where}order by created_ts desc limit ?",
                 (*params, limit),
             ).fetchall()
         return [
@@ -1633,6 +1639,7 @@ class Store:
                 created_ts=a[10],
                 channels=_json_list(a[11]),
                 spawned_by=a[12],
+                retired_ts=a[13],
             )
             for a in rows
         ]
@@ -1758,9 +1765,16 @@ class Store:
 
     def spawn_by_session(self, session_id: str) -> dict | None:
         with self.lock:
-            a = self.db.execute(f"select {SPAWNED_COLUMNS} from spawned_agents where session_id = ?",
+            a = self.db.execute(f"select {SPAWNED_COLUMNS}, retired_ts from spawned_agents where session_id = ?",
                                 (session_id,)).fetchone()
-        return dict(zip(SPAWNED_COLUMNS.split(", "), a), channels=_json_list(a[11])) if a else None
+        return dict(zip(SPAWNED_COLUMNS.split(", ") + ["retired_ts"], a), channels=_json_list(a[11])) if a else None
+
+    def retire_spawn(self, session_id: str) -> None:
+        """Mark a spawn row retired (fresh-per-task): its handle no longer counts toward the squad's spawn_used."""
+        with self.lock:
+            self.db.execute("update spawned_agents set retired_ts = ? where session_id = ? and retired_ts is null",
+                            (time.time(), session_id))
+            self.db.commit()
 
 
 CONTEXT_POLICY_FORMS = "none, fresh-per-task, or compact-at-<tokens> (compact-at-300000 or compact-at-300k)"

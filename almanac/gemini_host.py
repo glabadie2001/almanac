@@ -372,6 +372,10 @@ class GeminiHost:
             if isinstance(cmd, dict) and cmd.get("op") == "set_model":
                 self.set_model(cmd.get("model"), cmd.get("effort"))
                 self._log(f"\n⚙ [model -> {self.model or 'default'} · effort -> {self.effort or 'default'}]")
+            elif isinstance(cmd, dict) and cmd.get("op") == "compact":
+                # door.context_boundary: agy's own /compact as a raw user turn, queued behind any turn in flight
+                self._log("\n⚙ [compact]")
+                self.turns.put({"kind": "compact", "raw_content": "/compact", "prompt_text": "/compact"})
             return
         wrapped = uds.format_cross_session(
             msg["body"],
@@ -586,8 +590,12 @@ class GeminiHost:
                 "message": {"role": "user", "content": item["raw_content"]},
             }
         )
-        full_prompt = self._build_turn_prompt(item["prompt_text"])
-        self._turn_index += 1
+        compact = item.get("kind") == "compact"
+        if compact:     # exactly `/compact`: no role wrap, and it is not a turn the system prompt still waits for
+            full_prompt = item["prompt_text"]
+        else:
+            full_prompt = self._build_turn_prompt(item["prompt_text"])
+            self._turn_index += 1
         self._turn_error, self._turn_cancelled = None, False
         try:
             reply, _, usage, seen_model = self._run_agy_turn(full_prompt)
@@ -613,7 +621,8 @@ class GeminiHost:
                     "message": {
                         "id": f"msg_{secrets.token_hex(8)}",
                         "model": self.model or "gemini",
-                        "content": [{"type": "text", "text": reply or "(completed)"}],
+                        # agy answers /compact with a checkpoint step and an empty SUCCESS result: not a failure
+                        "content": [{"type": "text", "text": reply or ("(compacted)" if compact else "(completed)")}],
                         "usage": usage,
                     },
                     # one step's re-read, beside the running totals in `usage` (which store._gemini_turn needs)
