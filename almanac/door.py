@@ -1254,6 +1254,8 @@ def elastic_choice(role: dict, body: dict) -> dict:
             if len(allowed) > 1:
                 raise ValueError(f"pick {'a model' if key == 'model' else 'an effort'}: role {role['id']} allows "
                                  + ", ".join(allowed) + f" (mesh_spawn(..., {key}=...))")
+            if allowed:
+                out[key] = allowed[0]           # the one option, even when the role's own default is blank
             continue
         if value not in allowed:
             raise ValueError(f"{key} {raw!r}: role {role['id']} allows "

@@ -124,6 +124,19 @@ class AgentChoiceTests(SeededRig):
         self.store.upsert_role(dict(self.store.role("implementer-claude"), models=["sonnet"], efforts=[]))
         self.assertEqual(self.spawn_as_arch()[0], 200, "a list that only repeats the default is one option")
 
+    def test_a_single_option_with_a_blank_default_runs_that_option(self):          # T-16 review
+        self.store.upsert_role(dict(self.store.role("implementer-claude"), model="", effort="", models=[OPUS],
+                                    efforts=["medium"]))
+        status, _, res = self.spawn_as_arch()
+        self.assertEqual(status, 200, res)
+        self.assertEqual((self.flag("--model"), self.flag("--effort")), (OPUS, "medium"))
+
+    def test_the_tool_description_says_a_pick_may_be_required(self):               # T-16 review
+        spawn = next(t for t in mcp_mesh.MCP_TOOLS if t["name"] == "mesh_spawn")
+        self.assertIn("both are required when the role offers more than one", spawn["description"])
+        self.assertNotIn("you only give the task", spawn["description"])
+        self.assertIn("Required when the role offers more than one", spawn["inputSchema"]["properties"]["model"]["description"])
+
     def test_the_operators_paths_still_fall_back_to_the_role(self):               # T-16
         status, _, res = self.request(self.handler, "/api/squad/member", method="POST", body={
             "squad_id": "sq-1", "role_id": "implementer-claude", "task": TASK})
