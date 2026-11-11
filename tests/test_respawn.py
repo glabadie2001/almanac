@@ -187,6 +187,17 @@ class RespawnTests(RespawnRig):
         self.assertEqual((self.argv, self.owner()), ([], "sess-impl"))
         self.assertNotEqual(self.store.object_log(self.task["id"], 1)[0]["kind"], "respawn")
 
+    def test_the_context_is_read_live_from_the_fleet_row_first(self):
+        self.store.db.execute("insert into sessions (id, first_ts, last_ts, cwd, context) values (?, 1, 2, ?, ?)",
+                              ("sess-impl", str(self.ws), 1000))          # the last ingest's, stale
+        self.store.db.commit()
+        meta = dict(model=None, effort=None, last_ts=None, stall=None, context=250_000, context_total=False)
+        with mock.patch.object(self.fleet, "view", return_value=(None, [], meta)):
+            status, _, res = self.respawn()
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["context"], 250_000)
+        self.assertIn("250,000 tokens", self.store.object_log(self.task["id"], 1)[0]["body"])
+
     def test_its_own_handle_is_not_in_its_roster(self):
         status, _, res = self.respawn()
         self.assertEqual(status, 200, res)
