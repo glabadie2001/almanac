@@ -2272,7 +2272,7 @@ function paintPlan() {
   }
   const focused = document.activeElement?.closest?.("#plan-table tr")?.dataset.ref;
   $("plan-table").querySelector("tbody").replaceChildren(...trs);
-  if (focused) $("plan-table").querySelector(`tr[data-ref="${CSS.escape(focused)}"]`)?.focus();
+  if (focused) $("plan-table").querySelector(`tr[data-ref="${CSS.escape(focused)}"]`)?.focus({ preventScroll: true });   // a polled repaint must not scroll the page back to the row
 }
 
 $("plan-group").addEventListener("click", (e) => {
@@ -2403,7 +2403,7 @@ function paintBacklog() {
   $("backlog-msg").textContent = backlogState.msg || backlogState.note || (rows.length ? "" : BACKLOG_EMPTY);
   const focused = document.activeElement?.closest?.("#backlog-table tr")?.dataset.ref;
   $("backlog-table").querySelector("tbody").replaceChildren(...rows.map(backlogRow));
-  if (focused) $("backlog-table").querySelector(`tr[data-ref="${CSS.escape(focused)}"]`)?.focus();
+  if (focused) $("backlog-table").querySelector(`tr[data-ref="${CSS.escape(focused)}"]`)?.focus({ preventScroll: true });   // a polled repaint must not scroll the page back to the row
 }
 
 async function dispatchBacklog(o) {
