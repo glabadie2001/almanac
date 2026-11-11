@@ -237,7 +237,8 @@ class MigrationV7Tests(Fixture):
         old = s.squad("old")
         self.assertEqual((old["spawn_role"], old["spawn_limit"], old["spawn_used"]), (None, 0, 0))
         self.assertIsNone(s.spawned()[0]["spawned_by"])
-        self.assertEqual({r["id"] for r in s.roles() if r["may_spawn"]}, {"architect-claude", "architect-gemini"})
+        self.assertEqual({r["id"] for r in s.roles() if r["may_spawn"]},
+                         {"architect-claude", "architect-gemini", "orchestrator-claude"})   # v10 adds the orchestrator
         base = dict(id="scribe", provider="claude", system_prompt="write")
         self.assertTrue(s.upsert_role(dict(base, may_spawn=True))["may_spawn"])
         self.assertTrue(s.upsert_role(base)["may_spawn"], "left out keeps it")

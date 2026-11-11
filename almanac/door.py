@@ -84,6 +84,9 @@ def _discover_claude_bin_models(claude_bin_str: str | None) -> list[str]:
         return []
 
 
+RESTART_CODE = 75            # Almanac's exit code for "start me again": the launchers loop on it (EX_TEMPFAIL)
+LAUNCHER_ENV = "ALMANAC_LAUNCHER"     # set by run.ps1 / run.sh: something will bring Almanac back after it exits
+PREFLIGHT_TIMEOUT = 180
 SPAWN_ROW_WAIT = 5.0          # seconds the door waits for a just-launched agent's spawn row (spawner's watch is < 1 s)
 
 
@@ -120,6 +123,34 @@ class Service:
         self.fleet_lock = threading.Lock()
         self.spawn_lock = threading.Lock()            # an agent's limit check and its spawn are one step
         self.error = ""
+        self.exit_code = 0                            # what `python -m almanac` returns when the door stops
+        self.on_exit = None                           # set by __main__: stops the server; tests inject their own
+
+    def exit(self, code: int) -> None:
+        """Stop the door, so that `python -m almanac` returns `code` (RESTART_CODE: the launcher starts it again)."""
+        self.exit_code = code
+        if self.on_exit is not None:
+            self.on_exit()
+
+    def preflight(self) -> tuple[bool, str]:
+        """Run `python -m almanac --check` on the code now on disk, in a subprocess: (passed, its output)."""
+        import subprocess as _sp
+        import sys as _sys
+        root = Path(__file__).resolve().parents[1]
+        try:
+            proc = _sp.run([_sys.executable, "-m", "almanac", "--check", "--state", str(self.state)], cwd=str(root),
+                           capture_output=True, timeout=PREFLIGHT_TIMEOUT, creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0))
+        except (OSError, _sp.TimeoutExpired) as exc:
+            return False, f"preflight could not run: {exc}"
+        out = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip()
+        return proc.returncode == 0, out[-4000:]
+
+    def headless_live(self) -> list[str]:
+        """Handles of the headless Claude agents still running: their stdin is a pipe Almanac holds, so they end
+        when Almanac exits."""
+        procs = self.__dict__.get("headless_procs") or {}
+        live = [sid for sid, proc in procs.items() if proc.poll() is None]
+        return sorted((self.store.spawn_by_session(sid) or {}).get("agent_name") or sid[:8] for sid in live)
 
     def runners(self, fresh: bool = False) -> dict:
         """{claude|gemini: {path, ok, searched}}, probed at most every RUNNER_TTL seconds. `path` is the configured
@@ -1668,6 +1699,8 @@ def make_handler(service, token, *, hosts=()):
                     service.store.log_object(task["id"], who=log_identity(self.agent, caller), kind="message",
                                              body=msg["body"][:200], message_id=msg["id"])
                 return self._send(200 if res.get("ok") else 409, res)
+            if method == "POST" and path == "/api/mesh/restart":
+                return self._restart()
             if method == "POST" and path == "/api/mesh/object":
                 return self._send(200, file_object(service, self.agent, service.caller(self.agent, self.agent_session),
                                                    self._body()))
@@ -1908,6 +1941,40 @@ def make_handler(service, token, *, hosts=()):
                     service.fleet.last["at"] = 0        # the next look rescans
                 return self._send(200 if ok else 409, dict(entry, error=None if ok else message))
             return self._send(405, {"error": "Method not allowed"})
+
+        def _restart(self):
+            """POST /api/mesh/restart: the operator, or an agent whose role may_restart. Refused unless a launcher will
+            bring Almanac back, no headless Claude agent would die with it, and the code on disk passes a preflight.
+            Then logged, told to every live squad, answered, and only then does the door stop."""
+            who = self._who()
+            if self.agent:
+                caller = service.caller(self.agent, self.agent_session)
+                role = service.store.role(caller["role_id"]) if caller and caller.get("role_id") else None
+                if not role or not role.get("may_restart"):
+                    return self._send(403, dict(ok=False, error=f"{self.agent}'s role may not restart Almanac"))
+            if os.environ.get(LAUNCHER_ENV) != "1":
+                return self._send(409, dict(ok=False, error="Almanac was not started by run.ps1, run.cmd or run.sh, so "
+                                                            "nothing would start it again; restart it by hand"))
+            headless = service.headless_live()
+            if headless:
+                return self._send(409, dict(ok=False, error="headless Claude agents would end with Almanac: "
+                                                            + ", ".join(headless)))
+            ok, output = service.preflight()
+            if not ok:
+                service.store.log_action("restart", 0, None, False, "preflight failed", who)
+                return self._send(409, dict(ok=False, error="preflight failed: nothing restarted", output=output))
+            service.store.log_action("restart", os.getpid(), None, True, f"restart asked by {who}", who)
+            for squad in sorted({p["squad_id"] for p in service.mesh_peers() if p.get("squad_id")}):
+                try:
+                    service.mesh_send(to="@squad", squad_id=squad, from_name="almanac-hub", answers=False,
+                                      text=f"Almanac is restarting, asked by {who}; back in a few seconds. "
+                                           "Mesh tools retry while it is down.")
+                except (ValueError, OSError):
+                    pass
+            self._send(200, dict(ok=True, restarting=True, code=RESTART_CODE, preflight=output))
+            self.close_connection = True
+            service.exit(RESTART_CODE)
+            return None
 
         def _handle(self):
             try:

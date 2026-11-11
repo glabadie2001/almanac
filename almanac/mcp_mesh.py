@@ -14,6 +14,7 @@ CLI mode (usable from any agent shell or script):
     python -m almanac.mcp_mesh --cli object <ref> [--log-limit 20]
     python -m almanac.mcp_mesh --cli file <title> [--body <text>] [--files <path> ...] [--owner <name>] [--parent <ref>]
     python -m almanac.mcp_mesh --cli log <ref> [<body...>] [--kind <k>] [--status <s>] [--owner <name>]
+    python -m almanac.mcp_mesh --cli restart
 """
 from __future__ import annotations
 
@@ -21,10 +22,13 @@ import argparse
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+PREFLIGHT_WAIT = 200.0  # the door's preflight may take up to 180 s
 
 MCP_TOOLS = [
     {
@@ -266,6 +270,15 @@ MCP_TOOLS = [
             "required": ["ref"],
         },
     },
+    {
+        "name": "mesh_restart",
+        "description": (
+            "Restart Almanac, if your role may: only after a merge that changed Python code, never with a failing "
+            "suite (static files need no restart). Almanac first runs a preflight on the code on disk and refuses, "
+            "with its output, if that fails; it also refuses unless a launcher will bring it back."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
 
 
@@ -314,6 +327,27 @@ def http_api(base_url: str, token: str, path: str, *, method: str = "GET", body:
         raise RuntimeError(doc.get("error") or f"HTTP {exc.code}") from exc
 
 
+RETRY_S = 30.0          # how long a call waits out a door that is down (a restart), refused or reset connections only
+
+
+def _down(exc: BaseException) -> bool:
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    return isinstance(reason, (ConnectionRefusedError, ConnectionResetError))
+
+
+def http_api_retrying(base_url: str, token: str, path: str, **kw) -> dict:
+    """`http_api`, but a refused or reset connection is retried for about RETRY_S seconds: a `mesh_wait` in flight
+    across Almanac's restart must not end an agent's turn with a tool error. A 4xx or 5xx is never retried."""
+    deadline = time.monotonic() + RETRY_S
+    while True:
+        try:
+            return http_api(base_url, token, path, **kw)
+        except (urllib.error.URLError, ConnectionError) as exc:
+            if isinstance(exc, urllib.error.HTTPError) or not _down(exc) or time.monotonic() >= deadline:
+                raise
+        time.sleep(1.0)
+
+
 class MeshClient:
     """Executes mesh operations against Almanac's HTTP API (or an injected callable in tests)."""
 
@@ -322,7 +356,8 @@ class MeshClient:
         self.token = token
         self.self_name = infer_self_name(self_name)
         self.squad_id = squad_id or os.environ.get("ALMANAC_SQUAD_ID") or None
-        self._api = api_fn or (lambda path, method="GET", body=None, timeout=30.0: http_api(self.url, self.token, path, method=method, body=body, timeout=timeout))
+        self._api = api_fn or (lambda path, method="GET", body=None, timeout=30.0: http_api_retrying(
+            self.url, self.token, path, method=method, body=body, timeout=timeout))
         self.cursor_id: int | None = None
 
     def _ensure_cursor(self) -> int:
@@ -388,6 +423,8 @@ class MeshClient:
             if args.get("re"):
                 payload["re"] = str(args["re"])
             return self._api("/api/mesh/send", method="POST", body=payload)
+        if name == "mesh_restart":
+            return self._api("/api/mesh/restart", method="POST", body={}, timeout=PREFLIGHT_WAIT)
         if name == "mesh_objects":
             params = {k: args[k] for k in ("status", "owner", "q", "kind", "limit") if args.get(k)}
             if args.get("squad") or self.squad_id:
@@ -553,6 +590,8 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
     p_log.add_argument("--status")
     p_log.add_argument("--owner")
 
+    sp.add_parser("restart")
+
     p_wait = sp.add_parser("wait")
     p_wait.add_argument("--timeout", type=float, default=120.0)
     p_wait.add_argument("--channel")
@@ -578,6 +617,8 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
             {"to": ns.to, "message": " ".join(ns.message), "channel": ns.channel, "from_name": ns.from_name,
              "needs": ns.needs, "re": ns.re},
         )
+    elif ns.cmd == "restart":
+        res = client.call_tool("mesh_restart", {})
     elif ns.cmd == "objects":
         res = client.call_tool("mesh_objects", {k: getattr(ns, k) for k in ("status", "owner", "q", "kind", "squad", "limit")})
     elif ns.cmd == "object":
