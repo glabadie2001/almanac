@@ -986,12 +986,15 @@ function addSquadMemberRow(roleId = "") {
       .map((x) => x.querySelector("input[data-field='agent_name']").value.trim());
     const d = memberDefaults(r, used);
     modelInp.placeholder = r.model ? `(role: ${r.model})` : "model (auto)";
-    if (nameInp.dataset.touched !== "1") nameInp.value = d.handle;
-    if (modelInp.dataset.touched !== "1") modelInp.value = d.model;
-    syncEffortSelect(effSel, r.provider || "claude", modelInp.value.trim() || r.model || "",
-      r.effort ? `(role: ${fmtEffortLabel(r.effort)})` : "(role)");
-    if (effSel.dataset.touched !== "1") effSel.value = [...effSel.options].some((o) => o.value === d.effort) ? d.effort : "";
-    if (wsSel.dataset.touched !== "1") wsSel.value = d.workspace_mode;
+    const free = (f) => f.dataset.touched !== "1" && document.activeElement !== f;   // never rewrite a field the operator is in
+    if (free(nameInp)) nameInp.value = d.handle;
+    if (free(modelInp)) modelInp.value = d.model;
+    if (document.activeElement !== effSel) {
+      syncEffortSelect(effSel, r.provider || "claude", modelInp.value.trim() || r.model || "",
+        r.effort ? `(role: ${fmtEffortLabel(r.effort)})` : "(role)");
+      if (free(effSel)) effSel.value = [...effSel.options].some((o) => o.value === d.effort) ? d.effort : "";
+    }
+    if (free(wsSel)) wsSel.value = d.workspace_mode;
   };
 
   const follow = (input, ev, after) => input.addEventListener(ev, () => {
