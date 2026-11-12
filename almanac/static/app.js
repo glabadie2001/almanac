@@ -860,22 +860,13 @@ function syncRoleControls() {
   else if (state.roles.length && !cur) spawnRole.value = state.roles[0].id;
   syncSpawnModelField();
 
-  // Refresh any squad member role selects while keeping each row's model & effort options aligned
-  document.querySelectorAll("#squad-members .member-row").forEach((row) => {
+  // Refresh any squad member role selects; each row then re-fills the fields the operator has not edited
+  if (state.roles.length) document.querySelectorAll("#squad-members .member-row").forEach((row) => {   // not before roles load: the fallback rows stay
     const sel = row.querySelector("select[data-field='role_id']");
-    const modelInp = row.querySelector("input[data-field='model']");
-    const effSel = row.querySelector("select[data-field='effort']");
-    if (!sel) return;
     const v = sel.value;
     sel.replaceChildren(...state.roles.map((r) => el("option", { value: r.id, text: roleOptionText(r, false) })));
     if (v && state.roles.some((r) => r.id === v)) sel.value = v;
-    const picked = state.roles.find((r) => r.id === sel.value);
-    if (modelInp && picked) {
-      modelInp.placeholder = picked.model ? `(role: ${picked.model})` : "model (auto)";
-    }
-    if (effSel && picked) {
-      syncEffortSelect(effSel, picked.provider, modelInp?.value || picked.model || "", picked.effort ? `(role: ${fmtEffortLabel(picked.effort)})` : "(role)");
-    }
+    row.syncFromRole();
   });
 
   // the launch form's "architect may add" choice
@@ -941,80 +932,99 @@ $("spawn-cancel").addEventListener("click", () => setDrawer("spawn-drawer", "tog
 $("toggle-squad").addEventListener("click", () => setDrawer("squad-drawer", "toggle-squad", $("squad-drawer").hidden));
 $("squad-cancel").addEventListener("click", () => setDrawer("squad-drawer", "toggle-squad", false));
 
-function addSquadMemberRow(presetRole = "", presetName = "", presetModel = "", presetEffort = "", presetWs = "") {
-  const roles = state.roles.length ? state.roles : [
-    { id: "architect-claude", provider: "claude", title: "System Architect (Claude)", model: "opus", effort: "high" },
-    { id: "implementer-gemini", provider: "gemini", title: "Implementer (Gemini)", model: "", effort: "high" },
-    { id: "reviewer-gemini", provider: "gemini", title: "Peer Reviewer (Gemini)", model: "", effort: "high" },
-  ];
+// member-defaults:begin. A pure function, no DOM: tests/test_member_defaults.py runs this part under node.
+const ROLE_SHORT = { architect: "arch", implementer: "impl", reviewer: "rev", orchestrator: "orch" };   // mirrors spawner.ROLE_SHORT
+function memberDefaults(role, usedHandles = []) {
+  const first = role.id.split("-")[0];
+  const base = `${ROLE_SHORT[first] || first.slice(0, 6) || "agent"}-${role.provider}`;
+  let handle = base;
+  for (let n = 2; usedHandles.includes(handle); n++) handle = `${base}-${n}`;
+  return {
+    handle,
+    model: role.model || "",
+    effort: role.effort === "med" ? "medium" : role.effort || "",
+    workspace_mode: role.workspace_mode || "shared",
+  };
+}
+// member-defaults:end
+
+const FALLBACK_ROLES = [
+  { id: "architect-claude", provider: "claude", title: "System Architect (Claude)", model: "opus", effort: "high" },
+  { id: "implementer-gemini", provider: "gemini", title: "Implementer (Gemini)", model: "", effort: "high", workspace_mode: "worktree" },
+  { id: "reviewer-gemini", provider: "gemini", title: "Peer Reviewer (Gemini)", model: "", effort: "high" },
+];
+
+// A row's handle / model / effort / isolation follow its role until the operator edits that field (dataset.touched).
+function addSquadMemberRow(roleId = "") {
+  const roles = state.roles.length ? state.roles : FALLBACK_ROLES;
   const roleSel = el("select", { "data-field": "role_id", "aria-label": "Member role" },
     ...roles.map((r) => el("option", { value: r.id, text: roleOptionText(r, false) })));
-  if (presetRole && roles.some((r) => r.id === presetRole)) roleSel.value = presetRole;
+  if (roleId && roles.some((r) => r.id === roleId)) roleSel.value = roleId;
   const getRole = () => (state.roles.length ? state.roles : roles).find((x) => x.id === roleSel.value) || roles[0];
-  const activeRole = getRole();
 
   const nameInp = el("input", {
-    "data-field": "agent_name", placeholder: "handle (auto)", value: presetName,
+    "data-field": "agent_name", placeholder: "handle (auto)",
     autocorrect: "off", autocapitalize: "none", spellcheck: "false", "aria-label": "Member handle",
   });
   const modelInp = el("input", {
-    "data-field": "model",
-    placeholder: activeRole?.model ? `(role: ${activeRole.model})` : "model (auto)",
-    value: presetModel,
+    "data-field": "model", placeholder: "model (auto)",
     autocorrect: "off", autocapitalize: "none", spellcheck: "false", "aria-label": "Member model",
   });
   const effSel = el("select", { "data-field": "effort", "aria-label": "Reasoning effort" });
-  const refreshRowEfforts = () => {
-    const r = getRole();
-    syncEffortSelect(
-      effSel,
-      r?.provider || "claude",
-      modelInp.value.trim() || r?.model || "",
-      r?.effort ? `(role: ${fmtEffortLabel(r.effort)})` : "(role)",
-    );
-  };
-  refreshRowEfforts();
-  if (presetEffort) {
-    const normPreset = presetEffort === "med" ? "medium" : presetEffort;
-    if ([...effSel.options].some((o) => o.value === normPreset)) effSel.value = normPreset;
-  }
-
-  if (presetModel) modelInp.dataset.touched = "1";
-  modelInp.addEventListener("input", () => {
-    modelInp.dataset.touched = modelInp.value.trim() ? "1" : "";
-    refreshRowEfforts();
-  });
-  attachModelPicker(modelInp, {
-    getProvider: () => getRole()?.provider || "claude",
-    onPick: () => refreshRowEfforts(),
-  });
-  roleSel.addEventListener("change", () => {
-    const r = getRole();
-    modelInp.placeholder = r?.model ? `(role: ${r.model})` : "model (auto)";
-    if (modelInp.dataset.touched !== "1") modelInp.value = "";
-    refreshRowEfforts();
-  });
-
   const wsSel = el("select", { "data-field": "workspace_mode", "aria-label": "Workspace isolation" },
     el("option", { value: "", text: "(role default)" }),
     el("option", { value: "shared", text: "shared" }),
     el("option", { value: "worktree", text: "worktree" }),
   );
-  if (presetWs) wsSel.value = presetWs;
   const rmBtn = el("button", { type: "button", cls: "btn danger", text: "[✕]", title: "remove member" });
   const row = el("div", { cls: "member-row field" }, roleSel, nameInp, modelInp, effSel, wsSel, rmBtn);
+
+  row.syncFromRole = () => {
+    const r = getRole();
+    if (!r) return;
+    const used = [...document.querySelectorAll("#squad-members .member-row")].filter((x) => x !== row)
+      .map((x) => x.querySelector("input[data-field='agent_name']").value.trim());
+    const d = memberDefaults(r, used);
+    const prevProv = row.dataset.provider;
+    row.dataset.provider = r.provider;
+    if (prevProv && prevProv !== r.provider) modelInp.dataset.touched = effSel.dataset.touched = "";   // model and effort are per provider: the new role's replace the operator's
+    modelInp.placeholder = r.model ? `(role: ${r.model})` : "model (auto)";
+    const free = (f) => f.dataset.touched !== "1" && document.activeElement !== f;   // never rewrite a field the operator is in
+    if (free(nameInp)) nameInp.value = d.handle;
+    if (free(modelInp)) modelInp.value = d.model;
+    if (document.activeElement !== effSel) {
+      syncEffortSelect(effSel, r.provider || "claude", modelInp.value.trim() || r.model || "",
+        r.effort ? `(role: ${fmtEffortLabel(r.effort)})` : "(role)");
+      if (free(effSel)) effSel.value = [...effSel.options].some((o) => o.value === d.effort) ? d.effort : "";
+    }
+    if (free(wsSel)) wsSel.value = d.workspace_mode;
+  };
+
+  const follow = (input, ev, after) => input.addEventListener(ev, () => {
+    input.dataset.touched = input.value.trim() ? "1" : "";
+    after?.();
+  });
+  follow(nameInp, "input");
+  follow(modelInp, "input", () => row.syncFromRole());
+  for (const inp of [nameInp, modelInp]) inp.addEventListener("blur", () => { if (!inp.value.trim()) row.syncFromRole(); });   // a cleared field follows the role again once left
+  follow(effSel, "change");
+  follow(wsSel, "change");
+  attachModelPicker(modelInp, {
+    getProvider: () => getRole()?.provider || "claude",
+    onPick: () => { modelInp.dataset.touched = modelInp.value.trim() ? "1" : ""; row.syncFromRole(); },
+  });
+  roleSel.addEventListener("change", () => row.syncFromRole());
   rmBtn.addEventListener("click", () => { if ($("squad-members").children.length > 1) row.remove(); });
   $("squad-members").append(row);
+  row.syncFromRole();
 }
 
 function seedDefaultSquadMembers() {
   $("squad-members").replaceChildren();
-  addSquadMemberRow("architect-claude", "arch-claude", "opus-5-5", "high", "shared");
-  addSquadMemberRow("implementer-gemini", "impl-gemini", "gemini-4-carbon", "high", "worktree");
-  addSquadMemberRow("reviewer-gemini", "rev-gemini", "gemini-4-argon", "medium", "shared");
+  for (const id of ["architect-claude", "implementer-gemini", "reviewer-gemini"]) addSquadMemberRow(id);
 }
 
-$("squad-add-member").addEventListener("click", () => addSquadMemberRow("implementer-gemini", "", "gemini-4-carbon", "high", ""));
+$("squad-add-member").addEventListener("click", () => addSquadMemberRow("implementer-gemini"));
 
 $("spawn-form").addEventListener("submit", async (e) => {
   e.preventDefault();
