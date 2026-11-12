@@ -863,9 +863,9 @@ function syncRoleControls() {
   // Refresh any squad member role selects; each row then re-fills the fields the operator has not edited
   document.querySelectorAll("#squad-members .member-row").forEach((row) => {
     const sel = row.querySelector("select[data-field='role_id']");
-    const v = sel.value;
-    sel.replaceChildren(...state.roles.map((r) => el("option", { value: r.id, text: roleOptionText(r, false) })));
-    if (v && state.roles.some((r) => r.id === v)) sel.value = v;
+    const v = sel.value, roles = state.roles.length ? state.roles : FALLBACK_ROLES;   // roles not loaded yet: keep the rows
+    sel.replaceChildren(...roles.map((r) => el("option", { value: r.id, text: roleOptionText(r, false) })));
+    if (v && roles.some((r) => r.id === v)) sel.value = v;
     row.syncFromRole();
   });
 
@@ -950,7 +950,7 @@ function memberDefaults(role, usedHandles = []) {
 
 const FALLBACK_ROLES = [
   { id: "architect-claude", provider: "claude", title: "System Architect (Claude)", model: "opus", effort: "high" },
-  { id: "implementer-gemini", provider: "gemini", title: "Implementer (Gemini)", model: "", effort: "high" },
+  { id: "implementer-gemini", provider: "gemini", title: "Implementer (Gemini)", model: "", effort: "high", workspace_mode: "worktree" },
   { id: "reviewer-gemini", provider: "gemini", title: "Peer Reviewer (Gemini)", model: "", effort: "high" },
 ];
 
@@ -985,13 +985,18 @@ function addSquadMemberRow(roleId = "") {
     const used = [...document.querySelectorAll("#squad-members .member-row")].filter((x) => x !== row)
       .map((x) => x.querySelector("input[data-field='agent_name']").value.trim());
     const d = memberDefaults(r, used);
+    const prevProv = row.dataset.provider;
+    row.dataset.provider = r.provider;
+    if (prevProv && prevProv !== r.provider && !modelsForProvider(r.provider).includes(modelInp.value.trim())) modelInp.dataset.touched = "";   // another provider's model follows the role again
     modelInp.placeholder = r.model ? `(role: ${r.model})` : "model (auto)";
     const free = (f) => f.dataset.touched !== "1" && document.activeElement !== f;   // never rewrite a field the operator is in
     if (free(nameInp)) nameInp.value = d.handle;
     if (free(modelInp)) modelInp.value = d.model;
     if (document.activeElement !== effSel) {
+      const prevEff = effSel.value === "med" ? "medium" : effSel.value;
       syncEffortSelect(effSel, r.provider || "claude", modelInp.value.trim() || r.model || "",
         r.effort ? `(role: ${fmtEffortLabel(r.effort)})` : "(role)");
+      if (effSel.dataset.touched === "1" && ![...effSel.options].some((o) => o.value === prevEff)) effSel.dataset.touched = "";   // the effort it held is gone
       if (free(effSel)) effSel.value = [...effSel.options].some((o) => o.value === d.effort) ? d.effort : "";
     }
     if (free(wsSel)) wsSel.value = d.workspace_mode;
@@ -1003,6 +1008,7 @@ function addSquadMemberRow(roleId = "") {
   });
   follow(nameInp, "input");
   follow(modelInp, "input", () => row.syncFromRole());
+  for (const inp of [nameInp, modelInp]) inp.addEventListener("blur", () => { if (!inp.value.trim()) row.syncFromRole(); });   // a cleared field follows the role again once left
   follow(effSel, "change");
   follow(wsSel, "change");
   attachModelPicker(modelInp, {
