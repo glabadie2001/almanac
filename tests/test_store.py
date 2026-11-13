@@ -91,8 +91,8 @@ class BriefUpgradeTests(Fixture):
     """T-29: a stored brief equal to any earlier shipped text ends at the current one; an edited brief stays."""
     CASES = (("reviewer-claude", "REVIEWER", "PREV_REVIEWERS"),
              ("implementer-claude", "IMPLEMENTER", "PREV_IMPLEMENTERS"),
-             ("architect-claude", "ARCHITECT", None),
-             ("orchestrator-claude", "ORCHESTRATOR", None))
+             ("architect-claude", "ARCHITECT", "PREV_ARCHITECTS"),
+             ("orchestrator-claude", "ORCHESTRATOR", "PREV_ORCHESTRATORS"))
 
     def reopen(self, role_id, text):
         path = self.root / "state" / "almanac.db"
