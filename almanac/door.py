@@ -1400,7 +1400,8 @@ def merge_state(service, rows: list[dict]) -> dict:
     out = {}
     for squad_id, group in by_squad.items():
         cwd = (service.store.squad(squad_id) or {}).get("cwd")
-        ok, text = git_try(cwd, "rev-list", *sorted({r["sha"] for r in group}), "--not", "HEAD") if cwd else (False, "")
+        shas = sorted({r["sha"] for r in group})
+        ok, text = git_try(cwd, "rev-list", *shas, "--not", "HEAD", "--") if cwd else (False, "")
         if ok:
             unmerged = set(text.split())
             out.update({r["id"]: r["sha"] not in unmerged for r in group})
@@ -1418,6 +1419,8 @@ def handin_head(service, row: dict) -> tuple[dict | None, str]:
     if not where:
         return None, "almanac-hub: no commit recorded: the task has no folder to read"
     ok, sha = git_try(where, "rev-parse", "--verify", "HEAD")
+    if not ok and not wt and "not a git repository" in sha:
+        return None, ""                       # a squad folder outside git: nothing to record, nothing gone wrong
     if not ok:
         return None, f"almanac-hub: no commit recorded: {sha}"
     branch, base = (sp.get("branch"), sp.get("base")) if wt else (None, None)
@@ -1448,7 +1451,8 @@ def squad_branches(service, agent, caller, query: dict) -> dict:
         seen.add(wt)
         branch = sp.get("branch") or branch_and_base(wt)[0]
         doc = dict(agent_name=sp["agent_name"], branch=branch, worktree=wt, ahead=None)
-        ok, n = git_try(cwd, "rev-list", "--count", f"HEAD..{branch}") if branch else (False, "its branch is unknown")
+        ok, n = (git_try(cwd, "rev-list", "--count", f"HEAD..refs/heads/{branch}", "--") if branch
+                 else (False, "its branch is unknown"))
         if not ok:
             out.append(dict(doc, error=n))
         elif int(n):
@@ -1766,7 +1770,9 @@ def log_to_object(service, agent, caller, body: dict, *, after: list | None = No
     new_parent = _new_parent(service, row, body["parent"]) if reparent else None
     if not (text or status or owner or reparent or handin):
         raise ValueError("body is required unless status, owner or parent changes")
-    head, note = handin_head(service, row) if handin else (None, "")
+    # an owner set in the same call is the one whose worktree shipped it
+    head, note = (handin_head(service, dict(row, owner_session=owner["session_id"]) if owner else row) if handin
+                  else (None, ""))
     text = "\n\n".join(x for x in (text, note) if x)
     who = log_identity(agent, caller)
     delivered = mid = entry = None

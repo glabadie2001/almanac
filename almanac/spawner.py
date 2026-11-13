@@ -251,7 +251,8 @@ def _git(repo: Path, *args: str, env: dict | None = None) -> str:
 def git_try(repo, *args: str, timeout: float = 10) -> tuple[bool, str]:
     """A read-only git call that never raises: (True, stdout) or (False, why it failed or timed out)."""
     try:
-        proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, timeout=timeout,
+        # --no-optional-locks: a read never takes index.lock from an agent committing in the same folder
+        proc = subprocess.run(["git", "--no-optional-locks", "-C", str(repo), *args], capture_output=True, timeout=timeout,
                               creationflags=NO_WINDOW)
     except subprocess.TimeoutExpired:
         return False, f"git {args[0]} timed out after {timeout:g}s"

@@ -12,6 +12,7 @@ from test_server_fixes import MeshRig
 from test_spawn_fixes import git
 
 from almanac import spawner, uds, web
+from almanac.store import Store
 
 
 class ObjectRig(MeshRig):
@@ -543,6 +544,14 @@ class HandinTests(ObjectRig):
         obj = self.hand_in("T-1", who="arch")["object"]
         self.assertEqual((obj["sha"], obj["branch"], obj["base"], obj["merged"]), (head, None, None, True))
 
+    def test_a_squad_folder_outside_git_records_nothing_and_says_nothing(self):          # L1
+        plain = self.root / "plain"
+        plain.mkdir()
+        self.store.db.execute("update squads set cwd = ? where id = 'sq-1'", (str(plain),))
+        self.file(owner="arch")
+        res = self.hand_in("T-1", who="arch")
+        self.assertEqual((res["object"]["sha"], res["entry"]["sha"], res["entry"]["body"]), (None, None, "done"))
+
     def test_uncommitted_changes_are_said_on_the_log_row(self):
         self.file(owner="impl")
         head = self.commit(self.wt, "one.py")
@@ -551,6 +560,80 @@ class HandinTests(ObjectRig):
         self.assertEqual(res["object"]["sha"], head)
         self.assertIn(f"1 uncommitted path(s) in {self.wt} are not in {head[:7]}", res["entry"]["body"])
         self.assertTrue(res["entry"]["body"].startswith("done"))
+
+    def test_an_owner_set_in_the_same_call_is_the_one_whose_head_is_recorded(self):          # L3
+        self.file()
+        head = self.commit(self.wt, "one.py")
+        status, _, res = self.log(ref="T-1", owner="impl", status="in review")
+        self.assertEqual(status, 200, res)
+        self.assertEqual((res["object"]["sha"], res["object"]["branch"]), (head, "almanac/sq-1/impl"))
+
+    def test_a_branch_named_like_a_path_still_counts(self):                                     # L4
+        self.file(owner="impl")
+        self.commit(self.wt, "one.py")
+        (self.repo / "almanac" / "sq-1").mkdir(parents=True)
+        (self.repo / "almanac" / "sq-1" / "impl").write_text("x", encoding="utf-8")   # a path spelled as the branch
+        git(self.repo, "tag", "almanac/sq-1/impl", self.base)                         # and a tag of the same name
+        self.assertEqual([b["ahead"] for b in self.branches()], [1])
+        self.assertIs(self.hand_in("T-1")["object"]["merged"], False)
+
+    def test_branches_are_the_callers_squads_once_per_worktree_with_errors_kept(self):
+        self.file(owner="impl")
+        first = self.commit(self.wt, "one.py")
+        self.hand_in("T-1")
+        # a respawn: a second row on the same worktree, written before T-46 (no branch), now owns the task
+        self.store.record_spawn(agent_name="impl", session_id="sess-impl2", squad_id="sq-1", role_id=None,
+                                provider="claude", model=None, effort=None, cwd=str(self.wt),
+                                worktree_path=str(self.wt), pid=0)
+        self.store.log_object(1, who=dict(agent_name="operator"), kind="assign", owner_session="sess-impl2")
+        second = self.commit(self.wt, "two.py")
+        obj = self.hand_in("T-1", body="fixed")["object"]
+        self.assertEqual((obj["sha"], obj["branch"], obj["base"]), (second, "almanac/sq-1/impl", self.base))
+        self.assertNotEqual(first, second)
+        ghost = self.root / "ghost"
+        ghost.mkdir()
+        self.store.record_spawn(agent_name="ghost", session_id="sess-ghost", squad_id="sq-1", role_id=None,
+                                provider="claude", model=None, effort=None, cwd=str(ghost), worktree_path=str(ghost),
+                                pid=0, branch="almanac/sq-1/ghost", base=self.base)
+        status, _, res = self.get("/api/mesh/branches", token=self.tok("arch"))
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["squad"], "sq-1", "an agent reads its own squad by default")
+        listed = {b["agent_name"]: b for b in res["branches"]}
+        self.assertEqual(set(listed), {"impl", "ghost"}, "one row per worktree")
+        self.assertEqual(listed["impl"]["ahead"], 2)
+        self.assertIsNone(listed["ghost"]["ahead"])
+        self.assertIn("failed", listed["ghost"]["error"], "a branch git cannot count is listed, not left out")
+        self.assertEqual(self.get("/api/mesh/branches", token=self.tok("other"), squad="sq-1")[0], 403)
+
+    def test_the_two_second_poll_runs_no_git(self):
+        self.file(owner="impl")
+        self.commit(self.wt, "one.py")
+        self.hand_in("T-1")
+        with mock.patch.object(spawner, "git_try", side_effect=AssertionError("git on the poll")) as called:
+            status, _, res = self.get("/api/mesh")
+        self.assertEqual(status, 200, res)
+        called.assert_not_called()
+
+    def test_a_pre_v12_database_gains_the_columns_and_reads_its_old_rows(self):
+        path = self.root / "old" / "almanac.db"
+        st = Store(path)
+        for table, column in (("spawned_agents", "branch"), ("spawned_agents", "base"), ("objects", "base"),
+                              ("object_log", "sha")):
+            st.db.execute(f"alter table {table} drop column {column}")
+        st.db.execute("insert into spawned_agents (session_id, agent_name, squad_id, provider, cwd, created_ts) "
+                      "values ('s1', 'old', 'sq', 'claude', '.', 1)")
+        st.db.execute("insert into objects (kind, project, squad_id, title, status, created_by_name, created_ts, "
+                      "updated_ts) values ('task', 'p', 'sq', 'old task', 'queued', 'operator', 1, 1)")
+        st.db.execute("insert into object_log (object_id, ts, agent_name, kind, body) values (1, 1, 'operator', 'create', '')")
+        st.db.commit()
+        st.close()
+        for _ in range(2):                                      # the second open finds nothing to add
+            st = Store(path)
+            self.assertEqual((st.spawn_by_session("s1")["branch"], st.spawn_by_session("s1")["base"]), (None, None))
+            row = st.object_row(1)
+            self.assertEqual((row["title"], row["sha"], row["branch"], row["base"]), ("old task", None, None, None))
+            self.assertIsNone(st.object_log(1, 5)[0]["sha"])
+            st.close()
 
     def test_a_git_failure_or_timeout_never_refuses_the_hand_in(self):
         self.file(owner="impl")
