@@ -1748,9 +1748,10 @@ def amend_task(service, agent, caller, body: dict) -> dict:
 
 
 def _notify(service, row: dict, who: dict, status, handin: bool, head: dict | None, text: str, agent, caller) -> None:
-    """One notice per agent for a status change or a hand-in: the task's creator (unless it made the change), and on a
-    hand-in each live reviewer of the squad (role_class of its role is `reviewer`) with the branch and commit. Never
-    the agent that logged it; a reviewer who is also the creator hears once."""
+    """One notice per agent for a status change or a hand-in: the task's creator (unless it made the change), and the
+    squad's live lead when the creator is not live in the squad; on a hand-in also each live reviewer of the squad
+    (role_class of its role is `reviewer`), with the branch and commit. Never the agent that logged it; one message
+    to an agent that is more than one of these."""
     move = f"{row['status']} → {status}" if status else "in review again"
     notice = f"[{ref_of(row)} {move} by {who['agent_name']}] {row['title']}"
     if handin:
@@ -1766,8 +1767,10 @@ def _notify(service, row: dict, who: dict, status, handin: bool, head: dict | No
         to_name, to_session = row["created_by_name"], row["created_by"]
         if to_session and (service.store.spawn_by_session(to_session) or {}).get("squad_id") != row["squad_id"]:
             to_name, to_session = "operator", None     # filed in the backlog by another squad, dispatched since
+        if row["squad_id"] and row["created_by"] not in live:    # the operator, another squad or an ended session
             lead = squad_lead(service, service.store.squad(row["squad_id"]) or {})
-            if lead and lead["session_id"] in live and lead["session_id"] not in skip:   # it stands in for the creator
+            if (lead and lead["session_id"] in live and lead["session_id"] not in skip
+                    and (row["created_by"] or lead["agent_name"] != row["created_by_name"])):  # name-only lead: once
                 to[lead["session_id"]] = (lead["agent_name"], lead["session_id"])
         to[to_session or to_name] = (to_name, to_session)
     if handin:

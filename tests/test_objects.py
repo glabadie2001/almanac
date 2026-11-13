@@ -694,9 +694,10 @@ class HandinNoticeTests(HandinTests):
 
     def test_the_reviewer_handing_in_is_not_told(self):
         self.file(owner="rev")                                   # the operator created it
+        self.store.db.execute("update spawned_agents set spawned_by = 'arch' where agent_name in ('impl', 'rev')")
         self.clear()
         self.hand_in("T-1", who="rev")
-        self.assertEqual(self.counts(), {}, "the operator is no peer here; rev logged it")
+        self.assertEqual(self.counts(), {"arch": 1}, "rev logged it, so only the lead, standing in for the operator")
 
     def test_accepting_an_unmerged_sha_is_noted_and_never_refused(self):
         self.file(owner="impl")
@@ -724,6 +725,55 @@ class HandinNoticeTests(HandinTests):
         self.log(self.tok("arch"), ref="T-1", status="accepted")
         self.assertEqual(self.counts(), {}, "the lead accepting it is not told")
 
+
+    def test_a_task_the_operator_filed_wakes_the_lead_too(self):                       # F1b
+        self.file(owner="impl")                                  # created_by None, created_by_name operator
+        self.store.db.execute("update spawned_agents set spawned_by = 'arch' where agent_name in ('impl', 'rev')")
+        self.clear()
+        before = self.store.db.execute("select max(id) from messages").fetchone()[0] or 0
+        self.hand_in("T-1")
+        self.assertEqual(self.counts(), {"arch": 1, "rev": 1})
+        to = [r[0] for r in self.store.db.execute("select to_name from messages where id > ?", (before,))]
+        self.assertEqual(sorted(to), ["arch", "operator", "rev"])
+        self.clear()
+        self.log(self.tok("arch"), ref="T-1", status="accepted")
+        self.assertEqual(self.counts(), {}, "the lead accepting it is not told")
+
+    def test_a_lead_named_as_creator_without_a_session_hears_once(self):
+        self.file(owner="impl")
+        self.store.db.execute("update objects set created_by_name = 'arch' where id = 1")
+        self.store.db.execute("update spawned_agents set spawned_by = 'arch' where agent_name in ('impl', 'rev')")
+        self.clear()
+        self.hand_in("T-1")
+        self.assertEqual(self.counts(), {"arch": 1, "rev": 1})
+
+    def test_a_creator_whose_session_ended_has_the_live_lead_stand_in(self):             # R2
+        self.file(self.tok("arch"), owner="impl")
+        self.store.db.execute("update spawned_agents set spawned_by = 'arch' where agent_name in ('impl', 'rev')")
+        self.store.record_spawn(agent_name="arch", session_id="sess-arch-old", squad_id="sq-1", role_id=None,
+                                provider="claude", model=None, effort=None, cwd=str(self.repo), worktree_path=None,
+                                pid=0)
+        self.store.record_spawn(agent_name="arch", session_id="sess-arch", squad_id="sq-1", role_id=None,
+                                provider="claude", model=None, effort=None, cwd=str(self.repo), worktree_path=None,
+                                pid=0)                           # the live session is the newest
+        self.store.db.execute("update objects set created_by = 'sess-arch-old' where id = 1")
+        self.clear()
+        self.hand_in("T-1")
+        self.assertEqual(self.counts(), {"arch": 1, "rev": 1})
+
+    def test_a_lead_who_reviews_hears_once_and_no_live_lead_leaves_the_operator(self):
+        self.store.db.execute("update spawned_agents set role_id = 'reviewer-claude' where agent_name = 'arch'")
+        self.store.db.execute("update spawned_agents set spawned_by = 'arch' where agent_name in ('impl', 'rev')")
+        self.file(owner="impl")
+        self.clear()
+        self.hand_in("T-1")
+        self.assertEqual(self.counts(), {"arch": 1, "rev": 1})
+        self.store.db.execute("update spawned_agents set spawned_by = 'x' where agent_name = 'arch'")   # no lead
+        self.clear()
+        before = self.store.db.execute("select max(id) from messages").fetchone()[0]
+        self.hand_in("T-1", body="again")
+        to = sorted(r[0] for r in self.store.db.execute("select to_name from messages where id > ?", (before,)))
+        self.assertEqual(to, ["arch", "operator", "rev"], "arch hears as a reviewer only")
 
 class ImplementerBriefTests(ObjectRig):
     def test_an_unedited_brief_is_upgraded_and_an_edited_one_kept(self):            # F2

@@ -201,7 +201,7 @@ def build_mesh_charter(
         "reads one with its log. Architects file each slice with `mesh_file(kind=\"task\", title=..., body=..., owner=..., "
         "files=[...])` instead of describing it in a message: filing with an owner is the assignment. Owners hand in with "
         "`mesh_log(ref, status=\"in review\", body=<files touched, test command and result, what is left>)` and nothing "
-        "else: the hub sends the task's creator and the squad's reviewer one notice each, with the branch and commit, so "
+        "else: the hub sends the task's creator (or, when it is not in the squad, the squad's lead) and the squad's reviewer one notice each, with the branch and commit, so "
         "send no separate message to the reviewer or the lead; a fix round is the same call again. As you go, "
         "`mesh_log` what you learned (`kind=\"learned\"`), dead ends (`kind=\"dead\"`, or `kind=\"parked\"` with "
         "\"retry when ...\") and what comes next (`kind=\"next\"`). Reply about a task with `mesh_send(..., re=\"T-12\")`. "
@@ -1166,7 +1166,7 @@ def join_squad(
     tail = [f"You were added to the running squad by {who}. Report to {report_to} over `mesh_send` for questions and "
             f"blockers. When your slice is done, hand in with `mesh_log(ref=\"{ref}\", status=\"in review\", "
             "body=<files touched, the test command and its result, anything you could not do>)` and send nothing else: "
-            "the hub tells the task's creator and the squad's reviewer, with your branch and commit. A fix round is the "
+            "the hub tells the task's creator (or, when it is not in the squad, the squad's lead) and the squad's reviewer, with your branch and commit. A fix round is the "
             "same call again."]
     wmode = (operator_overrides.get("workspace_mode") or role.get("workspace_mode") or "shared").strip().lower()
     if wmode == "worktree":
