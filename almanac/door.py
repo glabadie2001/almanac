@@ -1818,8 +1818,12 @@ def spawn_covered(service, squad: dict, task_row: dict | None, files=None) -> st
                 + (f" ({ref_of(plan)} is {plan['status']})" if plan else ""))
     # the cut is the hand-in the operator accepted, not the click; accepted without a hand-in: the click
     cut = (plan["data"].get("plan") or {}).get("handin_ts") or accepted
-    if task_row["created_ts"] >= cut or service.store.amended_since(task_row["id"], cut):
-        return f"{ref} changed after plan {ref_of(plan)} was handed in: hand the plan in again"
+    # the task and every ancestor below the plan: a slice moved in after the cut brings its parts in unseen (T-60)
+    walk = task_row
+    while walk is not None and walk["id"] != plan["id"]:
+        if walk["created_ts"] >= cut or service.store.amended_since(walk["id"], cut):
+            return f"{ref} changed after plan {ref_of(plan)} was handed in: hand the plan in again"
+        walk = service.store.object_row(walk["parent_id"]) if walk["parent_id"] else None
     if files:
         return f"{ref}'s files are the plan's: amend the task and hand the plan in again"
     return None
@@ -2377,14 +2381,17 @@ def dispatch_task(service, ref, *, almanac_url: str, token: str) -> dict:
     members = [dict(role_id=m["role"], **({"agent_name": m["name"]} if m.get("name") else {})) for m in roster]
     slices = _move_children(service, row, None, dry=True)["moved"]        # what will join with it, as it reads now
     plan = (f"Its slices {', '.join(slices)} are already filed and join your plan with it, queued and unowned: read "
-            "mesh_objects() first, put members on them with mesh_spawn(ref=...), and file only what is missing"
-            if slices else "Plan it, file each slice with mesh_file")
+            "mesh_objects() first, put members on them with mesh_spawn(ref=...), and file only what is missing, and "
+            "hand in" if slices else "Plan it, file each slice with mesh_file, and hand in")
     if slices and data.get("plan_first"):
         plan = (f"Its slices {', '.join(slices)} are already filed and join your squad with it, queued and unowned: "
-                f"read mesh_objects() first. {PLAN_FIRST_MOVE[:-1]}, filing only what is missing")
+                f"read mesh_objects() first. This squad is plan-first: file a plan (mesh_file(plan=true)), move these "
+                "slices under it with mesh_log(ref=<slice>, parent=<plan>) and file what is missing under it, then "
+                "hand the plan in. Once the operator accepts it, put members on the slices with mesh_spawn(ref=...). "
+                "When the work is done, hand the feature in")
     members[0].update(files=row["files"], task=(
-        f"{row['title']}\n\nYou lead this squad on backlog task {ref}: the mission above is its body. {plan}, and "
-        f"hand in with mesh_log(ref=\"{ref}\", status=\"in review\")."))
+        f"{row['title']}\n\nYou lead this squad on backlog task {ref}: the mission above is its body. {plan} with "
+        f"mesh_log(ref=\"{ref}\", status=\"in review\")."))
     with _DISPATCH_LOCK:                 # a double click launches one squad
         current = service.store.object_row(row["id"])
         if current["squad_id"] or row["id"] in _DISPATCHING:

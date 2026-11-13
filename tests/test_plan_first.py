@@ -560,5 +560,27 @@ class MoveTests(GateTests):
                 with self.assertRaises(RuntimeError):
                     dispatch_task(self.service, top, almanac_url="http://x", token=TOKEN)
             task = launch.call_args.kwargs["members"][0]["task"]
-            self.assertEqual(PLAN_FIRST_MOVE[:-1] in task, plan_first, task)
+            self.assertEqual("file what is missing under it, then hand the plan in. Once the operator accepts it, put "
+                             "members on the slices with mesh_spawn(ref=...). When the work is done, hand the feature "
+                             f"in with mesh_log(ref=\"{top}\", status=\"in review\")." in task, plan_first, task)
             self.assertEqual("put members on them with mesh_spawn" in task, not plan_first, task)
+
+    def test_the_parts_of_a_slice_moved_after_the_hand_in_are_not_covered(self):
+        a = self.loose(body=SLICE)                         # T-1
+        a1 = self.loose(body=SLICE, parent=a)              # T-2, its part
+        b = self.loose(body=SLICE)                         # T-3
+        b1 = self.loose(body=SLICE, parent=b)              # T-4
+        self.plan()                                        # T-5
+        self.assertEqual(self.move(b, "T-5")[0], 200)      # handed in with the plan: b and its part are covered
+        self.slice(parent="T-5")                           # T-6
+        self.assertEqual(self.hand_in("T-5")[0], 200)
+        self.assertEqual(self.move(a, "T-5")[0], 200, "moved while the plan is in review")
+        self.assertEqual(self.log(ref="T-5", status="accepted")[0], 200)
+        self.refused(f"{a1} changed after plan T-5 was handed in", ref=a1)
+        self.refused(f"{a} changed after plan T-5 was handed in", ref=a)
+        self.assertEqual(self.spawn(ref=b1)[0], 200, "a part of a slice that was handed in is covered")
+        self.argv.clear()
+        c = self.loose(body=SLICE)
+        c1 = self.loose(body=SLICE, parent=c)
+        self.assertEqual(self.move(c, "T-5")[0], 200, "moved under the accepted plan")
+        self.refused(f"{c1} changed after plan T-5 was handed in", ref=c1)
