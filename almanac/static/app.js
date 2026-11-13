@@ -2001,6 +2001,12 @@ async function loadMesh() {
 
 // elastic squads: what the architect may add (and how much is used), the operator's limit editor and [+ ADD MEMBER].
 // The tools row is rebuilt only when the squad changes, so a half-typed task survives the 2 s poll.
+// plan first: shown until a plan of this squad is accepted. It reads the plan rows already loaded and never fetches;
+// hidden until this squad's rows have arrived (no flash on a switch), repainted when they do (no lag after ACCEPT)
+function paintPlanChip(squad = state.squads.find((s) => s.id === meshState.squadFilter)) {
+  $("strip-plan").hidden = !squad?.plan_first || planState.loadedKey !== squad.id
+    || planState.rows.some((o) => o.status === "accepted" && o.data?.plan?.accepted_ts);
+}
 function paintStripTools(squad) {
   const target = state.roles.find((r) => r.id === squad.spawn_role);
   $("strip-grow").textContent = squad.spawn_role
@@ -2008,9 +2014,7 @@ function paintStripTools(squad) {
     : "agents add nobody (no spawn role)";
   $("strip-grow").title = squad.spawn_role === "*" ? `an agent whose role may add members can add up to ${squad.spawn_limit} members of any role`
     : target ? `an agent whose role may add members can add up to ${squad.spawn_limit} ${target.title}` : "";
-  // plan first: shown until a plan of this squad is accepted; reads the plan rows already loaded, never fetches
-  $("strip-plan").hidden = !squad.plan_first || (planState.key === squad.id
-    && planState.rows.some((o) => o.status === "accepted" && o.data?.plan?.accepted_ts));
+  paintPlanChip(squad);
   const strip = $("mesh-strip");
   const rolesSig = state.roles.map((r) => `${r.id}:${r.title}`).join(",");      // a renamed or swapped role rebuilds too
   if (strip.dataset.squad === squad.id && strip.dataset.roles === rolesSig) return;
@@ -2185,7 +2189,7 @@ async function loadPlan(rev) {
   const sq = meshState.squadFilter;
   if (!planState.stale && sq === planState.key && rev === planState.rev) return;
   const seq = ++planState.seq;                         // only the newest fetch paints
-  if (sq !== planState.key) { planState.rows = []; planState.branches = ""; planState.note = "loading plan…"; paintPlan(); }
+  if (sq !== planState.key) { planState.rows = []; planState.loadedKey = null; planState.branches = ""; planState.note = "loading plan…"; paintPlan(); }
   planState.stale = false; planState.key = sq; planState.rev = rev;
   if (!sq) { planState.note = "pick a squad above to see its plan"; paintPlan(); return; }
   let doc, br;
@@ -2202,6 +2206,8 @@ async function loadPlan(rev) {
   }
   if (seq !== planState.seq || sq !== meshState.squadFilter) return;   // a newer fetch or another squad
   planState.rows = doc?.objects || [];
+  planState.loadedKey = doc ? sq : null;
+  paintPlanChip();
   planState.branches = branchesLine(br?.branches);
   planState.note = doc ? "" : "this server predates tasks: restart Almanac";
   paintPlan();
