@@ -63,7 +63,7 @@ const meshState = {
   seenMsgIds: new Set(), ctxSig: "", squadFilter: "", open: [], pair: null, squadChosen: false,
 };
 // MESH plan: the selected squad's tasks (GET /api/mesh/objects), refetched only when objects_rev or the squad changes
-const planState = { key: null, rev: undefined, rows: [], note: "", stale: true, sig: "", seq: 0, group: get("plan-group", "tree") };
+const planState = { key: null, rev: undefined, rows: [], branches: "", note: "", stale: true, sig: "", seq: 0, group: get("plan-group", "tree") };
 // feed filters shared by FLEET, GALLERY and the MESH context stream: [kinds= value, label]
 const KIND_SETS = [["", "all"], ["you,claude,gemini,peer_in,peer_out", "dialog"], ["peer_in,peer_out", "contacts"], ["tool,result,error", "tools"]];
 function fillKindSeg(id, current) {
@@ -2182,12 +2182,14 @@ async function loadPlan(rev) {
   const sq = meshState.squadFilter;
   if (!planState.stale && sq === planState.key && rev === planState.rev) return;
   const seq = ++planState.seq;                         // only the newest fetch paints
-  if (sq !== planState.key) { planState.rows = []; planState.note = "loading plan…"; paintPlan(); }
+  if (sq !== planState.key) { planState.rows = []; planState.branches = ""; planState.note = "loading plan…"; paintPlan(); }
   planState.stale = false; planState.key = sq; planState.rev = rev;
   if (!sq) { planState.note = "pick a squad above to see its plan"; paintPlan(); return; }
-  let doc;
+  let doc, br;
   try {
-    doc = await planGet(`/api/mesh/objects?squad=${encodeURIComponent(sq)}&kind=task&limit=500`);
+    // the branches ride with the plan's fetch (never the 2 s poll); a failure there only hides the line
+    [doc, br] = await Promise.all([planGet(`/api/mesh/objects?squad=${encodeURIComponent(sq)}&kind=task&limit=500`),
+      planGet(`/api/mesh/branches?squad=${encodeURIComponent(sq)}`).catch(() => null)]);
   } catch (err) {
     if (seq !== planState.seq || sq !== meshState.squadFilter) return;
     planState.stale = true;                            // retried on the next poll, only while it fails
@@ -2197,6 +2199,7 @@ async function loadPlan(rev) {
   }
   if (seq !== planState.seq || sq !== meshState.squadFilter) return;   // a newer fetch or another squad
   planState.rows = doc?.objects || [];
+  planState.branches = branchesLine(br?.branches);
   planState.note = doc ? "" : "this server predates tasks: restart Almanac";
   paintPlan();
   if (meshState.selTask) loadTask(meshState.selTask);
@@ -2218,6 +2221,24 @@ function planOwnerState(o) {
   const p = meshState.peers.find((q) => (o.owner_session ? q.session_id === o.owner_session : q.name === o.owner_name));
   return !p ? "ended" : p.stall ? "stalled" : active(p) ? "busy" : "idle";   // p.stall: {error, text, ts} while stopped
 }
+// plan-sha:begin
+// a task's commit chip: null without a sha; merged true/false/null (null: git could not tell, shown as "?")
+function shaChip(o) {
+  if (!o?.sha) return null;
+  const state = o.merged === true ? "merged" : o.merged === false ? "unmerged" : "?";
+  const full = `${o.sha}${o.branch ? `\nbranch ${o.branch}` : ""}${o.base ? `\nbase ${o.base}` : ""}`;
+  return { text: `${o.sha.slice(0, 7)} ${state}`, title: state === "?" ? `${full}\ngit could not tell whether this is merged` : full,
+    cls: state === "merged" ? "st-accepted" : state === "unmerged" ? "st-in-progress" : "st-queued" };
+}
+// "unmerged: impl-x (2 commits), impl-y (git: boom)"; "" when there is nothing to say
+function branchesLine(list) {
+  if (!list?.length) return "";
+  return "unmerged: " + list.map((b) => `${b.agent_name} (${b.error ? `git: ${b.error}` : `${b.ahead} commit${b.ahead === 1 ? "" : "s"}`})`).join(", ");
+}
+// shown tasks whose merge state can still change: a sha that is not known merged
+const planPending = (rows) => rows.some((o) => o.sha && o.merged !== true);
+// plan-sha:end
+const shaEl = (o) => { const c = shaChip(o); return c ? el("span", { cls: `flag ${c.cls}`, text: c.text, title: c.title }) : null; };
 const statusPill = (s) => el("span", { cls: `flag st-${slug(s)}`, text: s || "–" });
 function ownerChip(o) {
   const own = planOwnerState(o);
@@ -2248,7 +2269,7 @@ function planRow(o, depth, byOwner) {
   const tr = el("tr", { tabindex: "0", "data-ref": o.ref, cls: meshState.selTask === o.ref ? "sel" : "" },
     el("td", { cls: "cyan", text: o.ref }),
     task,
-    el("td", {}, statusPill(o.status)),
+    el("td", {}, statusPill(o.status), shaEl(o) ? " " : null, shaEl(o)),
     el("td", {}, ownerChip(o)),
     el("td", { cls: "r", text: String(o.files?.length || 0), title: (o.files || []).join("\n") }),
     el("td", { cls: "last", text: planLast(o.last_log), title: o.last_log?.body || "" }),
@@ -2269,6 +2290,8 @@ function paintPlan() {
   if (brief) tog.hidden = mp.classList.contains("clamp") && mp.scrollHeight <= mp.clientHeight + 1;   // fits in two lines
 
   const rows = planState.rows, byOwner = planState.group === "owner";
+  $("plan-branches").hidden = !planState.branches;     // cheap and idempotent: safe on every poll
+  if ($("plan-branches").textContent !== planState.branches) $("plan-branches").textContent = planState.branches;
   const sig = JSON.stringify([planState.group, meshState.selTask, planState.note, rows, rows.map(planOwnerState), rows.map((o) => planLast(o.last_log))]);
   // what the owner chips show (rounded k and the warn class), not the raw count: that moves on every step
   const ctxSig = JSON.stringify(rows.map((o) => { const [n, t] = planOwnerCtx(o); return [ctxText(n, t), ctxWarn(n)]; }));
@@ -2388,7 +2411,7 @@ async function loadTask(ref) {
   if (!doc) { $("mesh-ctx-head").replaceChildren(el("span", { cls: "dim", text: "this server predates tasks: restart Almanac" })); return; }
   const o = doc.object, log = doc.log || [];
   $("mesh-ctx-head").replaceChildren(...[            // replaceChildren would print a null as "null"
-    el("span", { cls: "title", text: `${o.ref} ${o.title}` }), " ", statusPill(o.status), " ", ownerChip(o),
+    el("span", { cls: "title", text: `${o.ref} ${o.title}` }), " ", statusPill(o.status), shaEl(o) ? " " : null, shaEl(o), " ", ownerChip(o),
     el("span", { cls: "dim", text: ` · filed by ${o.created_by_name} ${age(o.created_ts)} ago${o.parent ? ` · part of ${o.parent}` : ""}` }),
     o.children?.total ? el("span", { cls: "dim", text: ` · accepted ${o.children.accepted}/${o.children.total}` }) : null,
     o.squad_id && o.owner_name && o.status !== "accepted" ? respawnButton(o) : null,
@@ -2396,6 +2419,7 @@ async function loadTask(ref) {
   ].filter((n) => n !== null));
   const logHead = (l) => `${clock(l.ts)} ${l.agent_name} [${l.kind}]`
     + `${!l.status_to ? "" : l.kind === "create" ? ` as ${l.status_to}` : ` ${l.status_from || "–"} → ${l.status_to}`}`
+    + `${l.sha ? ` ${l.sha.slice(0, 7)}` : ""}`
     + `${l.owner_to ? ` owner → ${l.owner_to}` : ""}`;
   const logCls = (k) => (k === "dead" ? "error" : k === "message" ? "peer_out" : k === "status" || k === "assign" || k === "dispatch" || k === "respawn" || k === "retired" || k === "compact" || k === "parent" || k === "amend" ? "tool" : "claude");
   // a refresh (every objects_rev change re-runs this for the open task) keeps the reader's place, measured from the
@@ -3674,6 +3698,10 @@ setInterval(async () => {
 }, 2000);
 setInterval(() => { if (!document.hidden) loadInboxCounts(); }, 5000);
 setInterval(() => { if (!document.hidden && state.tab === "mesh") loadHeat(true); }, 30000);
+// a merge does not bump objects_rev: while a shown task is unmerged or unknown, refetch the plan (and branches) every 30 s
+setInterval(() => {
+  if (!document.hidden && state.tab === "mesh" && planPending(planState.rows)) { planState.stale = true; loadPlan(planState.rev); }
+}, 30000);
 setInterval(() => { if (!document.hidden && state.tab === "log") loadLog(); }, 5000);
 setInterval(() => { if (!document.hidden) loadHealth(); }, 15000);
 setInterval(() => { if (!document.hidden && state.tab === "telemetry") loadReport(); }, 5 * 60 * 1000);
