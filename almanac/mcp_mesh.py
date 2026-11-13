@@ -272,6 +272,10 @@ MCP_TOOLS = [
                 "spawn_role": {"type": "string",
                                "description": "Backlog only: the role (or '*') that squad's lead may add."},
                 "spawn_limit": {"type": "integer", "description": "Backlog only: how many members it may add (0-20)."},
+                "plan": {"type": "boolean", "description": (
+                    "This task is the squad's plan; its slices are its children (file them with `parent`). Leads "
+                    "only. The reply holds the template each slice's body follows. Hand it in with status='in "
+                    "review': only the operator accepts it or sends it back.")},
             },
             "required": ["title"],
         },
@@ -525,7 +529,7 @@ class MeshClient:
             return self._api(f"/api/mesh/diff?{urllib.parse.urlencode(params)}")
         if name == "mesh_file":
             payload = {k: args[k] for k in ("kind", "title", "body", "files", "owner", "parent", "status", "backlog",
-                                            "roster", "spawn_role") if args.get(k)}
+                                            "roster", "spawn_role", "plan") if args.get(k)}
             for k in ("roster", "spawn_limit"):           # an empty roster or a limit of 0 still goes, to be checked
                 if args.get(k) is not None:
                     payload[k] = args[k]
@@ -713,6 +717,7 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
     p_file.add_argument("--roster", nargs="*", help="backlog: role or role:name, lead first")
     p_file.add_argument("--spawn-role")
     p_file.add_argument("--spawn-limit", type=int)
+    p_file.add_argument("--plan", action="store_true", help="this task is the squad's plan (leads only)")
 
     p_log = sp.add_parser("log")
     p_log.add_argument("ref")
@@ -770,7 +775,7 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
         res = client.call_tool("mesh_file", {"kind": ns.kind, "title": ns.title, "body": ns.body, "files": ns.files,
                                              "owner": ns.owner, "parent": ns.parent, "status": ns.status,
                                              "backlog": ns.backlog, "spawn_role": ns.spawn_role,
-                                             "spawn_limit": ns.spawn_limit,
+                                             "spawn_limit": ns.spawn_limit, "plan": ns.plan,
                                              "roster": [dict(zip(("role", "name"), m.split(":", 1)))
                                                         for m in ns.roster] if ns.roster is not None else None})
     elif ns.cmd == "log":

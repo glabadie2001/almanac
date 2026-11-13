@@ -1621,20 +1621,20 @@ def _status(value) -> str:
     return value
 
 
-def _hub_tell(service, *, to_name, to_session, text, agent, caller, squad) -> tuple[bool, int]:
+def _hub_tell(service, *, to_name, to_session, text, agent, caller, squad, needs=None) -> tuple[bool, int]:
     """Send a work-object message as the caller and journal it; a recipient that has ended still gets the journal
     row, undelivered. It never closes an open flag. (delivered, message id)"""
     from_name, from_session = agent or "operator", (caller or {}).get("session_id") if agent else None
     try:
         res = service.mesh_send(to=to_session or to_name, text=text, from_name=from_name, from_session=from_session,
-                                squad_id=squad, answers=False)
+                                squad_id=squad, answers=False, needs=needs)
     except (ValueError, OSError) as exc:
         res = dict(ok=False, error=str(exc))
     if res.get("ok"):
         return bool(res.get("delivered")), res["message"]["id"]
     entry = service.store.record_message(from_name=from_name, from_session=from_session, to_name=to_name,
                                          to_session=to_session, squad_id=squad, body=text, transport="undelivered",
-                                         answers=False)
+                                         answers=False, needs=needs)
     return False, entry["id"]
 
 
@@ -1733,6 +1733,17 @@ def file_object(service, agent, caller, body: dict) -> dict:
             raise ValueError("a backlog task is queued until it is dispatched")
     elif any(body.get(k) not in (None, "", []) for k in ("roster", "spawn_role", "spawn_limit")):
         raise ValueError("roster, spawn_role and spawn_limit are for a backlog task")
+    plan = _flag(body.get("plan"))
+    if plan and backlog:
+        raise ValueError("a plan is filed in a squad, not the backlog")
+    if plan and agent:
+        mine = service.store.role((caller or {}).get("role_id") or "") if (caller or {}).get("role_id") else None
+        if not mine or not mine.get("may_spawn"):
+            raise _refused(403, f"role {(caller or {}).get('role_id') or '(none)'} may not file a plan: "
+                                "the squad's lead or the operator does")
+        if body.get("status") not in (None, "", "queued", "in progress"):
+            raise _refused(403, "a plan is filed queued or in progress: hand it in with mesh_log(status=\"in review\")"
+                           if body["status"] == "in review" else "only the operator decides a plan")
     by_folder = backlog and not agent and body.get("project")
     squad = None if by_folder else object_squad(service, agent, caller, body.get("squad"))
     title = _text(body, "title")
@@ -1743,7 +1754,7 @@ def file_object(service, agent, caller, body: dict) -> dict:
         project = _project(body["project"]) if by_folder else caller_project(service, dict(squad_id=squad))
         data, squad = _backlog_data(service, body), None
     else:
-        project, data = (service.store.squad(squad) or {}).get("cwd") or "", None
+        project, data = (service.store.squad(squad) or {}).get("cwd") or "", dict(plan={}) if plan else None
     files = _files(body.get("files") or [], project)
     parent_id = _parent_row(service, body["parent"], squad, project)["id"] if body.get("parent") else None
     owner = _owner(service, squad, body["owner"]) if body.get("owner") else None
@@ -1757,7 +1768,52 @@ def file_object(service, agent, caller, body: dict) -> dict:
     if owner:
         delivered, mid = _assign(service, row, owner, agent, caller)
         service.store.log_object(row["id"], who=who, kind="assign", owner_name=owner["agent_name"], message_id=mid)
-    return dict(object=object_docs(service, [row], body=True)[0], delivered=delivered)
+    doc = dict(object=object_docs(service, [row], body=True)[0], delivered=delivered)
+    if plan:
+        doc["template"] = PLAN_TEMPLATE
+    return doc
+
+
+# what each slice under a plan holds (T-52); returned when a plan is filed, so it costs no charter text
+PLAN_TEMPLATE = (
+    "## Goal\n"
+    "## Files\n"
+    "## Sketch      signatures, data shapes, routes, test names, in code blocks; no bodies\n"
+    "## Screen      only when the files touch almanac/static/: a text wireframe, and the data each region reads\n"
+    "## Tier        model, effort, one line why\n"
+    "## Done when")
+
+
+def plan_of(service, row: dict) -> dict | None:
+    """`row` if it is a plan, else its nearest ancestor that is one."""
+    seen = set()
+    while row is not None and row["id"] not in seen:
+        if "plan" in (row.get("data") or {}):
+            return row
+        seen.add(row["id"])
+        row = service.store.object_row(row["parent_id"]) if row["parent_id"] else None
+    return None
+
+
+def plan_gaps(service, plan: dict) -> list[str]:
+    """One line per descendant task that cannot be planned from: 'T-9: no ## Sketch'; 'T-9: no ## Screen' when its
+    files touch almanac/static/. A plan with no slices: one line saying so."""
+    gaps, todo, seen, slices = [], service.store.children(plan["id"]), {plan["id"]}, 0
+    while todo:
+        row = todo.pop(0)
+        if row["id"] in seen:
+            continue
+        seen.add(row["id"])
+        if "plan" in row["data"]:
+            continue                     # a plan under a plan is decided on its own, with its slices
+        slices += 1
+        if not re.search(r"^## Sketch\b", row["body"] or "", re.M):
+            gaps.append(f"{ref_of(row)}: no ## Sketch")
+        if (any(f.startswith("almanac/static/") for f in row["files"])
+                and not re.search(r"^## Screen\b", row["body"] or "", re.M)):
+            gaps.append(f"{ref_of(row)}: no ## Screen")
+        todo.extend(service.store.children(row["id"]))
+    return gaps if slices else [f"{ref_of(plan)} has no slices: file them with parent=\"{ref_of(plan)}\""]
 
 
 def _new_parent(service, row: dict, raw) -> dict | None:
@@ -1818,15 +1874,17 @@ def _standing_reviewers(service, peers: list[dict]) -> list[tuple[str, str]]:
 
 
 def _notify(service, row: dict, who: dict, status, handin: bool, head: dict | None, text: str, agent, caller,
-            *, reviewers="standing") -> tuple[str, set]:
+            *, reviewers="standing", plan=False) -> tuple[str, set]:
     """One notice per agent for a status change or a hand-in: the task's creator (unless it made the change), and the
     squad's live lead when the creator is not live in the squad; on a hand-in also its reviewers, with the branch and
     commit: `reviewers` is "standing" (each live standing reviewer of the squad), None (none: a fresh reviewer is about
     to start, _start_reviewer) or (name, session) (the task's own live fresh reviewer). Never the agent that logged
-    it; one message to an agent that is more than one of these. Returns (the notice, the sessions or names told)."""
+    it; one message to an agent that is more than one of these. `plan`: the task is a plan (T-54): a hand-in also
+    goes to the operator as a blocking message, and any change also to the squad's live lead. Returns (the notice,
+    the sessions or names told, the id of that blocking message or None)."""
     move = f"{row['status']} → {status}" if status else "in review again"
     notice = f"[{ref_of(row)} {move} by {who['agent_name']}] {row['title']}"
-    if handin:
+    if handin and not plan:
         notice += (f"\nBranch: {(head or {}).get('branch') or '(none)'}, commit: "
                    f"{head['sha'][:7] if head and head.get('sha') else 'no commit recorded'}")
     notice += f"\n\n{text}" if text else ""
@@ -1845,14 +1903,23 @@ def _notify(service, row: dict, who: dict, status, handin: bool, head: dict | No
                     and (row["created_by"] or lead["agent_name"] != row["created_by_name"])):  # name-only lead: once
                 to[lead["session_id"]] = (lead["agent_name"], lead["session_id"])
         to[to_session or to_name] = (to_name, to_session)
+    if plan and row["squad_id"]:
+        lead = squad_lead(service, service.store.squad(row["squad_id"]) or {})
+        if lead and lead["session_id"] in live and lead["session_id"] not in skip:
+            to.setdefault(lead["session_id"], (lead["agent_name"], lead["session_id"]))
+        if handin and agent:
+            to["operator"] = ("operator", None)
     if handin and reviewers:
         for name, sid in ([reviewers] if isinstance(reviewers, tuple) else _standing_reviewers(service, peers)):
             if sid not in skip:
                 to.setdefault(sid, (name, sid))
+    flag = None
     for to_name, to_session in to.values():
-        _hub_tell(service, to_name=to_name, to_session=to_session, text=notice, agent=agent, caller=caller,
-                  squad=row["squad_id"])
-    return notice, set(to) | skip
+        blocking = plan and handin and to_name == "operator"
+        _, mid = _hub_tell(service, to_name=to_name, to_session=to_session, text=notice, agent=agent, caller=caller,
+                           squad=row["squad_id"], needs="blocking" if blocking else None)
+        flag = mid if blocking else flag
+    return notice, set(to) | skip, flag
 
 
 def squad_lead(service, squad: dict) -> dict | None:
@@ -1967,6 +2034,18 @@ def log_to_object(service, agent, caller, body: dict, *, after: list | None = No
         raise ValueError(f"{ref_of(row)} is in the backlog: it has no owner until it is dispatched")
     if agent and body.get("status") and not row["squad_id"] and body["status"] != row["status"]:
         raise _refused(403, f"{ref_of(row)} is in the backlog: only the operator changes its status")
+    plan = "plan" in row["data"]
+    if plan and agent and (status or handin or body.get("owner")):
+        # a lead hands a plan in (again, also from accepted: a re-plan) and moves it among queued, in progress and
+        # blocked while it is undecided; any other move is the operator's. Any member may still add a note.
+        mine = service.store.role((caller or {}).get("role_id") or "") if (caller or {}).get("role_id") else None
+        if not mine or not mine.get("may_spawn"):
+            raise _refused(403, f"role {(caller or {}).get('role_id') or '(none)'} may not change a plan: "
+                                "its lead or the operator does")
+        if not handin and status and (status == "accepted" or row["status"] in ("in review", "accepted")):
+            raise _refused(403, f"{ref_of(row)} is a plan: only the operator decides a plan")
+    if plan and handin and (gaps := plan_gaps(service, row)):
+        raise ValueError(f"{ref_of(row)} cannot be handed in: " + "; ".join(gaps))
     owner = _owner(service, row["squad_id"], body["owner"]) if body.get("owner") else None
     owner = owner if owner and owner["session_id"] != row["owner_session"] else None
     reparent = body.get("parent") is not None
@@ -1974,9 +2053,9 @@ def log_to_object(service, agent, caller, body: dict, *, after: list | None = No
     if not (text or status or owner or reparent or handin):
         raise ValueError("body is required unless status, owner or parent changes")
     # an owner set in the same call is the one whose worktree shipped it
-    head, note = (handin_head(service, dict(row, owner_session=owner["session_id"]) if owner else row) if handin
-                  else (None, ""))
-    if status == "accepted" and merge_state(service, [row]).get(row["id"]) is False:     # said, never refused
+    head, note = (handin_head(service, dict(row, owner_session=owner["session_id"]) if owner else row)
+                  if handin and not plan else (None, ""))       # a plan ships no code: no head, no merge state
+    if status == "accepted" and not plan and merge_state(service, [row]).get(row["id"]) is False:     # said, never refused
         note = (f"almanac-hub: accepted with {row['sha'][:7]} not in "
                 f"{(service.store.squad(row['squad_id']) or {}).get('cwd')}'s HEAD")
     text = "\n\n".join(x for x in (text, note) if x)
@@ -1999,7 +2078,9 @@ def log_to_object(service, agent, caller, body: dict, *, after: list | None = No
             head=head)
     later = [] if after is None else after
     reviewers, fresh = "standing", None
-    if handin:
+    if handin and plan:
+        reviewers = None                 # a plan is decided by the operator (_notify tells them), never reviewed
+    elif handin:
         # the task's own fresh reviewer while it lives; else, on its first hand-in, a fresh one of the launched
         # reviewer's role (after the response); else the standing reviewers
         mine = row["data"].get("reviewer") or {}
@@ -2016,10 +2097,22 @@ def log_to_object(service, agent, caller, body: dict, *, after: list | None = No
                     service.review_starts.add(row["id"])
                     fresh, reviewers = role, None
     if status or handin:                 # a fix round (in review again) notifies like the first hand-in
-        notice, told = _notify(service, row, who, status, handin, head, text, agent, caller, reviewers=reviewers)
+        notice, told, flag = _notify(service, row, who, status, handin, head, text, agent, caller,
+                                     reviewers=reviewers, plan=plan)
+        if plan:
+            # the operator's blocking flag from the last hand-in closes on any change: their decision, or the new
+            # hand-in's flag replacing it (data.plan.flag); accepting stamps accepted_ts (T-55's spawn gate)
+            now = dict(service.store.object_row(row["id"])["data"].get("plan") or {})
+            if old := now.pop("flag", None):
+                service.store.resolve_message(old)
+            if status == "accepted":
+                now["accepted_ts"] = entry["ts"]
+            if flag:
+                now["flag"] = flag
+            service.store.merge_object_data(row["id"], plan=now)
         if fresh:
             later.append(lambda: _start_reviewer(service, row, fresh, notice, told, agent, caller, hub))
-    if status == "accepted":
+    if status == "accepted" and not plan:    # a plan accepted starts the work: nobody is retired or compacted
         context_boundary(service, service.store.object_row(row["id"]), caller if agent else None, after=later)
     doc = dict(object=object_docs(service, [service.store.object_row(row["id"])], body=True)[0],
                entry=log_doc(entry), delivered=delivered)
