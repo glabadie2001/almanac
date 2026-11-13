@@ -2348,6 +2348,7 @@ $("plan-mission-toggle").addEventListener("click", (e) => {
 // a task opens in the peer context pane and holds it until a peer is picked or the squad changes
 function openTask(ref) {
   meshState.selTask = ref;
+  if ($("mesh-ctx-decide").dataset.ref !== ref) paintDecide(null);   // another task's bar goes while this one loads
   paintPlan(); paintBacklog();
   $("mesh-ctx-box").setAttribute("data-title", `TASK // ${ref}`.slice(0, 56));
   $("mesh-ctx-kinds").hidden = true;
@@ -2358,6 +2359,7 @@ function openTask(ref) {
 function closeTask() {
   if (!meshState.selTask) return;
   meshState.selTask = null;
+  paintDecide(null);
   meshState.ctxSig = "";
   $("mesh-ctx-kinds").hidden = false;
   clearPeerContext();                                  // the next loadPeerContext() repaints the peer
@@ -2409,10 +2411,17 @@ function decideBody(status, comment) {
 // plan-decide:end
 // [ACCEPT] / [SEND BACK] on a task in review (POST /api/mesh/object/log, the operator's). One bar per ref, kept so the
 // refresh on an objects_rev change re-attaches it with its half-typed comment instead of rebuilding it.
-const decideBars = {};
+// It lives in its own slot (#mesh-ctx-decide), outside the feed that loadTask rebuilds: the slot is only touched when the
+// ref or the in-review state changes, so a refresh never blurs the textarea or drops a half-typed comment.
+function paintDecide(o) {
+  const slot = $("mesh-ctx-decide"), want = o && o.status === "in review" ? o.ref : "";
+  if ((slot.dataset.ref || "") === want) return;
+  slot.dataset.ref = want;
+  slot.hidden = !want;
+  slot.replaceChildren(...(want ? [decideBar(o)] : []));
+}
 function decideBar(o) {
-  if (decideBars[o.ref]) return decideBars[o.ref];
-  const box = el("textarea", { rows: 2, placeholder: "comment (needed to send back)", "aria-label": "comment (needed to send back)", style: "width:100%" });
+  const box = el("textarea", { rows: 2, placeholder: "comment (needed to send back)", "aria-label": "comment (needed to send back)" });
   const msg = el("span", { cls: "red" });
   const btns = ["accepted", "in progress"].map((status) =>
     el("button", { type: "button", cls: "btn hi", text: status === "accepted" ? "[ACCEPT]" : "[SEND BACK]" }));
@@ -2424,11 +2433,10 @@ function decideBar(o) {
     try { r = await post("/api/mesh/object/log", { ref: o.ref, ...d }); } catch (err) { r = { error: err.message }; }
     btns.forEach((b) => { b.disabled = false; });
     if (r?.error || r?.ok === false) { msg.textContent = r.error || "not recorded"; return; }   // the comment stays
-    delete decideBars[o.ref];
     planState.stale = true; loadMesh();
-    if (meshState.selTask === o.ref) loadTask(o.ref);
+    if (meshState.selTask === o.ref) loadTask(o.ref);   // the status moved on: the slot empties itself
   }));
-  return (decideBars[o.ref] = el("li", { cls: "result" }, box, el("div", {}, ...btns, " ", msg)));
+  return el("div", { cls: "field" }, box, el("div", { cls: "bar-line" }, ...btns, msg));
 }
 
 async function loadTask(ref) {
@@ -2442,6 +2450,7 @@ async function loadTask(ref) {
   if (meshState.selTask !== ref) return;
   if (!doc) { $("mesh-ctx-head").replaceChildren(el("span", { cls: "dim", text: "this server predates tasks: restart Almanac" })); return; }
   const o = doc.object, log = doc.log || [];
+  paintDecide(o);
   $("mesh-ctx-head").replaceChildren(...[            // replaceChildren would print a null as "null"
     el("span", { cls: "title", text: `${o.ref} ${o.title}` }), " ", statusPill(o.status), shaEl(o) ? " " : null, shaEl(o), " ", ownerChip(o),
     el("span", { cls: "dim", text: ` · filed by ${o.created_by_name} ${age(o.created_ts)} ago${o.parent ? ` · part of ${o.parent}` : ""}` }),
@@ -2460,7 +2469,6 @@ async function loadTask(ref) {
   feed.replaceChildren(
     el("li", { cls: "you" }, o.body ? renderMd(o.body) : "(no body)"),
     el("li", { cls: "result", text: o.files?.length ? `files: ${o.files.join(", ")}` : "files: none" }),
-    ...(o.status === "in review" ? [decideBar(o)] : (delete decideBars[o.ref], [])),   // a later round starts a fresh bar
     ...(log.length
       ? log.map((l) => el("li", { cls: logCls(l.kind), title: new Date(l.ts * 1000).toLocaleString() }, logHead(l), l.body ? renderMd(l.body) : null))
       : [el("li", { cls: "result", text: "no log entries yet" })]),
