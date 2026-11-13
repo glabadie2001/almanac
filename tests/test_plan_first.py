@@ -77,6 +77,15 @@ class PlanTests(ObjectRig):
         self.assertEqual(self.file(title="p", plan=True, backlog=True)[0], 400, "not in the backlog")
         self.assertEqual(self.store.objects_rev(), 0, "nothing written")
 
+    def test_an_agent_files_a_plan_undecided_only(self):
+        for status in ("accepted", "in review", "blocked"):
+            code, _, res = self.file(self.tok("arch"), title="p", plan=True, status=status)
+            self.assertEqual(code, 403, (status, res))
+        self.assertIn("hand it in with mesh_log", self.file(self.tok("arch"), title="p", plan=True,
+                                                            status="in review")[2]["error"])
+        self.assertEqual(self.store.objects_rev(), 0, "nothing written")
+        self.assertEqual(self.file(self.tok("arch"), title="p", plan=True, status="in progress")[0], 200)
+
     def test_handin_refused_names_slices_without_a_sketch(self):
         self.plan()
         status, _, res = self.hand_in()
@@ -85,12 +94,16 @@ class PlanTests(ObjectRig):
         self.slice()                                                   # T-2 fine
         self.slice(body="## Goal\nmentions ## Sketch mid-line only")   # T-3
         self.slice(parent="T-2", body="no headings")                   # T-4, a grandchild
+        self.file(self.tok("arch"), title="an addition", plan=True, parent="T-1")   # T-5, a plan under the plan
+        self.slice(parent="T-5", body="no headings")                   # T-6: T-5's to decide, not T-1's
         rev = self.store.objects_rev()
         status, _, res = self.hand_in()
         self.assertEqual(status, 400, res)
         self.assertIn("T-3: no ## Sketch", res["error"])
         self.assertIn("T-4: no ## Sketch", res["error"])
         self.assertNotIn("T-2", res["error"])
+        self.assertNotIn("T-5", res["error"])
+        self.assertNotIn("T-6", res["error"])
         self.assertEqual((self.store.objects_rev(), self.store.object_row(1)["status"]), (rev, "queued"),
                          "a refused hand-in writes nothing")
         self.assertEqual(self.operator_mail(), [])

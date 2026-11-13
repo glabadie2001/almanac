@@ -1741,6 +1741,9 @@ def file_object(service, agent, caller, body: dict) -> dict:
         if not mine or not mine.get("may_spawn"):
             raise _refused(403, f"role {(caller or {}).get('role_id') or '(none)'} may not file a plan: "
                                 "the squad's lead or the operator does")
+        if body.get("status") not in (None, "", "queued", "in progress"):
+            raise _refused(403, "a plan is filed queued or in progress: hand it in with mesh_log(status=\"in review\")"
+                           if body["status"] == "in review" else "only the operator decides a plan")
     by_folder = backlog and not agent and body.get("project")
     squad = None if by_folder else object_squad(service, agent, caller, body.get("squad"))
     title = _text(body, "title")
@@ -1803,6 +1806,8 @@ def plan_gaps(service, plan: dict) -> list[str]:
         if row["id"] in seen:
             continue
         seen.add(row["id"])
+        if "plan" in row["data"]:
+            continue                     # a plan under a plan is decided on its own, with its slices
         if not re.search(r"^## Sketch\b", row["body"] or "", re.M):
             gaps.append(f"{ref_of(row)}: no ## Sketch")
         if (any(f.startswith("almanac/static/") for f in row["files"])
