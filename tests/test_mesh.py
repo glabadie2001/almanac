@@ -703,5 +703,52 @@ class GeminiHostAndSpawnerTests(Fixture):
         self.assertIn(hres["session_id"], service.headless_procs)
 
 
+class ReviewTestRunTests(Fixture):
+    """T-39: agy allows exact lines only, so a reviewer gets one exact line per test module, and only plain names."""
+
+    def test_a_full_suite_role_gets_one_exact_line_per_plain_test_module(self):
+        from almanac.store import REVIEWER_COMMANDS
+        tests = self.root / "repo" / "tests"
+        tests.mkdir(parents=True)
+        plain = ["test_b", "test_a", "test_x9_y"]
+        hostile = ["test_a;del x", "test_a&calc", "test_a$(id)", "test_a`id`", "test_a b", "test_a.b", "test_a-b",
+                   "test_é", "test_", "tests_a", "test_a(1)", "test_a,b", "test_a'b"]
+        for name in plain + hostile:
+            try:
+                (tests / f"{name}.py").write_text("", encoding="utf-8")
+            except OSError:                  # a name this filesystem refuses cannot reach a rule either
+                pass
+        (tests / "support.py").write_text("", encoding="utf-8")
+        cmds = spawner.role_commands(REVIEWER_COMMANDS, self.root / "repo")
+        self.assertEqual(cmds[:len(REVIEWER_COMMANDS)], REVIEWER_COMMANDS, "the stored lines come first, unchanged")
+        self.assertEqual(cmds[len(REVIEWER_COMMANDS):],
+                         ["python -m unittest discover tests -p test_a.py", "python -m unittest discover tests -p test_b.py",
+                          "python -m unittest discover tests -p test_x9_y.py"])
+        for line in cmds[len(REVIEWER_COMMANDS):]:
+            self.assertRegex(line, r"\Apython -m unittest discover tests -p test_[A-Za-z0-9_]+\.py\Z")
+        self.assertEqual(cmds.count("python -m unittest discover tests -p test_a.py"), 1)
+        self.assertEqual(spawner.role_commands(cmds, self.root / "repo"), cmds, "no line twice")
+
+    def test_a_role_without_the_full_suite_line_and_a_folder_without_tests_get_nothing_more(self):
+        tests = self.root / "repo" / "tests"
+        tests.mkdir(parents=True)
+        (tests / "test_a.py").write_text("", encoding="utf-8")
+        self.assertEqual(spawner.role_commands(["git diff"], self.root / "repo"), ["git diff"])
+        self.assertEqual(spawner.role_commands(None, self.root / "repo"), [])
+        self.assertEqual(spawner.role_commands(["python -m unittest discover tests"], self.root / "empty"),
+                         ["python -m unittest discover tests"])
+
+    def test_the_squad_charter_says_who_runs_what(self):
+        text = spawner.build_mesh_charter(agent_name="r", provider="gemini", role_title="R", role_prompt="p",
+                                          almanac_url="u", squad_id="sq",
+                                          allowed_commands=["python -m unittest discover tests -p test_a.py"])
+        self.assertIn("on a fix round, the builder and the reviewer run only the test modules of the files touched", text)
+        self.assertIn("by the lead on the merged tree; that run is the merge gate", text)
+        self.assertIn("`python -m unittest discover tests -p test_a.py`", text)
+        solo = spawner.build_mesh_charter(agent_name="r", provider="claude", role_title="R", role_prompt="p",
+                                          almanac_url="u")
+        self.assertNotIn("merge gate", solo, "no squad, no review rounds")
+
+
 if __name__ == "__main__":
     unittest.main()
