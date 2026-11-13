@@ -133,6 +133,24 @@ def _policy_line(value) -> str | None:
     return None
 
 
+_TEST_MODULE = re.compile(r"test_\w+", re.ASCII)
+_MODULE_LINE = re.compile(r"python -m unittest discover tests -p test_\w+\.py", re.ASCII)
+
+
+def role_commands(cmds, cwd) -> list[str]:
+    """A role's allowed_commands as its runner gets them. agy allows exact lines only, so a list holding the full-suite
+    line also gets one `python -m unittest discover tests -p test_<name>.py` line per `tests/test_*.py` in `cwd`
+    now (not `tests.test_<name>`: the tests import `support` top-level, which only `discover` puts on the path); a module added
+    later is reached through the full suite. Only plain word names count, so a file name cannot smuggle shell syntax
+    into an allow rule."""
+    from almanac.store import FULL_SUITE
+    cmds = [str(c) for c in cmds or []]
+    if FULL_SUITE in cmds:
+        mods = sorted(f.stem for f in (Path(cwd) / "tests").glob("test_*.py") if _TEST_MODULE.fullmatch(f.stem))
+        cmds += [line for line in (f"{FULL_SUITE} -p {m}.py" for m in mods) if line not in cmds]
+    return cmds
+
+
 def build_mesh_charter(
     *,
     agent_name: str,
@@ -215,6 +233,11 @@ def build_mesh_charter(
                      "starts a fresh one with the same handle, role and worktree, whose kickoff is the task and its log. "
                      "Use it when an owner's context has grown too large, or when a stalled owner did not recover after "
                      "`continue`; `model` / `effort` change its tier within what the role allows. Never on yourself.")
+    if squad_id:
+        lines.append("- **Test runs**: on a fix round, the builder and the reviewer run only the test modules of the files "
+                     "touched (`python -m unittest discover tests -p test_<name>.py`, one module per command). The full suite (`python -m unittest discover tests`) "
+                     "is run by the builder before the first hand-in and by the lead on the merged tree; that run is the "
+                     "merge gate, and nothing merges without it.")
     policy = _policy_line(context_policy) if squad_id else None
     if policy:
         lines.append(policy)
@@ -223,8 +246,14 @@ def build_mesh_charter(
                      "and never with a failing suite; static files need no restart. Almanac refuses if its preflight "
                      "fails, and your mesh tools wait while it comes back.")
     if allowed_commands and provider == "gemini":     # agy's allow rules; for Claude the role field is informational
+        # the per-module lines from role_commands are named once, not one by one: the charter is re-read every turn
+        base = [c for c in allowed_commands if not _MODULE_LINE.fullmatch(c)]
+        named = [f"`{c}`" for c in base]
+        if len(base) < len(allowed_commands):
+            named.append("one test module at a time, `python -m unittest discover tests -p test_<name>.py`, for the "
+                         "test files that existed when you were spawned")
         lines.append("- **Shell**: your runner only permits these exact command lines, typed character for character: "
-                     + ", ".join(f"`{c}`" for c in allowed_commands) + "; anything else is denied, so do not try variants.")
+                     + ", ".join(named) + "; anything else is denied, so do not try variants.")
     if add_dirs and provider == "gemini":             # agy `--add-dir`; Claude agents already read outside their cwd
         lines.append("- **Folders**: these folders are also part of your workspace: "
                      + ", ".join(f"`{d}`" for d in add_dirs) + ".")
@@ -552,6 +581,7 @@ def _spawn_agent(
         if wt != repo_dir:
             worktree_path = wt
             run_cwd = wt
+    allowed = role_commands((role or {}).get("allowed_commands"), run_cwd)
 
     spawn_dir = service.state / "spawns" / f"{eff_name}-{session_id[:8]}"
     spawn_dir.mkdir(parents=True, exist_ok=True)
@@ -570,7 +600,7 @@ def _spawn_agent(
         python_exe=python_exe,
         may_page_operator=bool(role is None or role.get("may_page_operator")),   # role-less agents may page (door.may_page_operator)
         grow=_grow_line(service, role, squad_id),
-        allowed_commands=(role or {}).get("allowed_commands") or [],
+        allowed_commands=allowed,
         add_dirs=add_dirs,
         may_restart=bool((role or {}).get("may_restart")),
         may_respawn=bool(squad_id and (role or {}).get("may_spawn")),
@@ -725,7 +755,7 @@ def _spawn_agent(
             argv += ["--squad", squad_id]
         for ch in eff_channels:
             argv += ["--channel", ch]
-        for cmd in (role or {}).get("allowed_commands") or []:
+        for cmd in allowed:
             argv += ["--allow-command", cmd]
         initial_prompt = initial_prompt(PROMPT_UNBOUNDED) if callable(initial_prompt) else initial_prompt
         if initial_prompt and initial_prompt.strip():

@@ -148,8 +148,10 @@ IMPLEMENTER = (
 )
 # a role's `allowed_commands`: exact command lines its runner may run. For Gemini they become agy allow rules (agy's
 # default mode, all this account gets, denies every other shell command); for Claude agents the field is
-# informational for now. The shipped reviewers get the lines a review needs.
-REVIEWER_COMMANDS = ["git status --short", "git diff", "git diff --stat", "python -m unittest discover tests"]
+# informational for now. The shipped reviewers get the lines a review needs. A list with FULL_SUITE in it also gets,
+# at spawn time, one `python -m unittest discover tests -p test_<name>.py` line per test module (spawner.role_commands).
+FULL_SUITE = "python -m unittest discover tests"
+REVIEWER_COMMANDS = ["git status --short", "git diff", "git diff --stat", FULL_SUITE]
 REVIEWER = (
     "You are the Cross-Model Peer Reviewer: you do not edit code. Read the implementer's diff and live context "
     "(`mesh_context_stream`), run the tests yourself, and probe edge cases. Send findings (file:line, what breaks, "
