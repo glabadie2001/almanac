@@ -941,6 +941,24 @@ class FreshReviewerTests(ObjectRig):
         self.assertEqual(names, ("rev-claude", "rev-claude-2"))
         self.assertIn("## Your task (`T-2`)", self.argv[1][-1])
 
+    def test_a_start_that_runs_late_checks_the_task_again(self):                          # L1
+        from almanac import door
+        real, queued = door._start_reviewer, []
+        self.file(self.tok("arch"), owner="impl")
+        with mock.patch.object(door, "_start_reviewer", side_effect=lambda *a: queued.append(a)):
+            self.hand_in()                                 # back to in progress and in again before either start runs
+            self.log(self.tok("impl"), ref="T-1", status="in progress", body="one more")
+            self.hand_in(body="again")
+            self.file(self.tok("arch"), owner="impl")
+            self.hand_in("T-2")
+        self.assertEqual(len(queued), 3)
+        real(*queued[0])
+        real(*queued[1])
+        self.assertEqual((len(self.argv), self.reviewer()["agent_name"]), (1, "rev-claude"), "one task, one reviewer")
+        self.log(self.tok("arch"), ref="T-2", status="accepted")   # accepted before its start ran
+        real(*queued[2])
+        self.assertEqual((len(self.argv), self.reviewer("T-2"), self.hub_rows("T-2")), (1, None, []))
+
     def test_a_restart_between_the_hand_in_and_the_fix_round_still_finds_the_reviewer(self):
         self.file(self.tok("arch"), owner="impl")
         self.hand_in()

@@ -1880,6 +1880,9 @@ def _start_reviewer(service, row: dict, role: dict, head: dict | None, notice: s
     ref = ref_of(row)
     try:
         with service.spawn_lock:                 # the limit check and the spawn are one step, as for mesh_spawn
+            fresh = service.store.object_row(row["id"])
+            if fresh["status"] != "in review" or fresh["data"].get("reviewer"):
+                return           # accepted or moved on since, or a crossing hand-in already started its reviewer
             squad = service.store.squad(row["squad_id"]) or {}
             used, limit = squad.get("spawn_used") or 0, squad.get("spawn_limit") or 0
             if squad.get("status") != "active":
@@ -1888,8 +1891,7 @@ def _start_reviewer(service, row: dict, role: dict, head: dict | None, notice: s
                 why = f"{used}/{limit} of the squad's spawn limit used"
             else:
                 name = spawner.free_handle(service, squad, role)
-                fresh = service.store.object_row(row["id"])
-                log = list(reversed(service.store.object_log(row["id"], 100_000)))
+                log =list(reversed(service.store.object_log(row["id"], 100_000)))
                 res = spawner.spawn_agent(
                     service, almanac_url=hub[0], token=hub[1], cwd=squad["cwd"], agent_name=name, role_id=role["id"],
                     provider=role["provider"], workspace_mode="shared",
