@@ -2348,6 +2348,7 @@ $("plan-mission-toggle").addEventListener("click", (e) => {
 // a task opens in the peer context pane and holds it until a peer is picked or the squad changes
 function openTask(ref) {
   meshState.selTask = ref;
+  if ($("mesh-ctx-decide").dataset.ref !== ref) paintDecide(null);   // another task's bar goes while this one loads
   paintPlan(); paintBacklog();
   $("mesh-ctx-box").setAttribute("data-title", `TASK // ${ref}`.slice(0, 56));
   $("mesh-ctx-kinds").hidden = true;
@@ -2358,6 +2359,7 @@ function openTask(ref) {
 function closeTask() {
   if (!meshState.selTask) return;
   meshState.selTask = null;
+  paintDecide(null);
   meshState.ctxSig = "";
   $("mesh-ctx-kinds").hidden = false;
   clearPeerContext();                                  // the next loadPeerContext() repaints the peer
@@ -2399,6 +2401,43 @@ async function respawnOwner(o) {
   setTimeout(() => { loadFleet(); loadMesh(); }, 900);
 }
 
+// plan-decide:begin
+// the operator's decision on a task in review: accepted takes any comment, sending back needs one
+function decideBody(status, comment) {
+  const body = (comment || "").trim();
+  if (status === "in progress" && !body) return { error: "say what to change" };
+  return { status, body };
+}
+// plan-decide:end
+// [ACCEPT] / [SEND BACK] on a task in review (POST /api/mesh/object/log, the operator's).
+// It lives in its own slot (#mesh-ctx-decide), outside the feed that loadTask rebuilds: the slot is only touched when the
+// ref or the in-review state changes, so a refresh never blurs the textarea or drops a half-typed comment.
+function paintDecide(o) {
+  const slot = $("mesh-ctx-decide"), want = o && o.status === "in review" ? o.ref : "";
+  if ((slot.dataset.ref || "") === want) return;
+  slot.dataset.ref = want;
+  slot.hidden = !want;
+  slot.replaceChildren(...(want ? [decideBar(o)] : []));
+}
+function decideBar(o) {
+  const box = el("textarea", { rows: 2, placeholder: "comment (needed to send back)", "aria-label": "comment (needed to send back)" });
+  const msg = el("span", { cls: "red" });
+  const btns = ["accepted", "in progress"].map((status) =>
+    el("button", { type: "button", cls: "btn hi", text: status === "accepted" ? "[ACCEPT]" : "[SEND BACK]" }));
+  btns.forEach((btn, i) => btn.addEventListener("click", async () => {
+    const d = decideBody(i ? "in progress" : "accepted", box.value);
+    if (d.error) { msg.textContent = d.error; return; }
+    btns.forEach((b) => { b.disabled = true; }); msg.textContent = "";
+    let r;
+    try { r = await post("/api/mesh/object/log", { ref: o.ref, ...d }); } catch (err) { r = { error: err.message }; }
+    btns.forEach((b) => { b.disabled = false; });
+    if (r?.error || r?.ok === false) { msg.textContent = r.error || "not recorded"; return; }   // the comment stays
+    planState.stale = true; loadMesh();
+    if (meshState.selTask === o.ref) loadTask(o.ref);   // the status moved on: the slot empties itself
+  }));
+  return el("div", { cls: "field" }, box, el("div", { cls: "bar-line" }, ...btns, msg));
+}
+
 async function loadTask(ref) {
   let doc;
   try {
@@ -2410,6 +2449,7 @@ async function loadTask(ref) {
   if (meshState.selTask !== ref) return;
   if (!doc) { $("mesh-ctx-head").replaceChildren(el("span", { cls: "dim", text: "this server predates tasks: restart Almanac" })); return; }
   const o = doc.object, log = doc.log || [];
+  paintDecide(o);
   $("mesh-ctx-head").replaceChildren(...[            // replaceChildren would print a null as "null"
     el("span", { cls: "title", text: `${o.ref} ${o.title}` }), " ", statusPill(o.status), shaEl(o) ? " " : null, shaEl(o), " ", ownerChip(o),
     el("span", { cls: "dim", text: ` · filed by ${o.created_by_name} ${age(o.created_ts)} ago${o.parent ? ` · part of ${o.parent}` : ""}` }),
