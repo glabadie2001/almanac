@@ -2836,6 +2836,7 @@ function heatQuery() {
 async function loadHeat(force = false) {
   const q = heatQuery();
   if (!force && q === heatState.key) return;
+  if (q !== heatState.key) heatState.view = null;      // another squad or set of peers: its whole run
   heatState.key = q;
   if (!q) { heatState.doc = null; paintHeat(); return; }
   try { heatState.doc = await api(`/api/worktime?${q}`); }
@@ -2864,29 +2865,62 @@ function heatSummary(doc, names) {
   return { line, pairs };
 }
 
+// heat-view:begin
+// The zoomed time window {t0, t1} in seconds (null: the whole run), kept in time so a refresh that adds buckets or
+// changes their size does not move it. heatWindow: the window after zooming by `f` (<1 in, >1 out) around the fraction
+// `at` of the shown span and panning by `dx` spans; never under 4 buckets, never outside the run, null once it is all.
+function heatWindow(r, view, f, at = 0.5, dx = 0) {
+  const end = r.start + r.n * r.bucket_s, v = view || { t0: r.start, t1: end }, was = v.t1 - v.t0;
+  const span = Math.min(end - r.start, Math.max(4 * r.bucket_s, was * f));
+  if (span >= end - r.start) return null;
+  const t0 = Math.max(r.start, Math.min(end - span, v.t0 + (was - span) * at + span * dx));
+  return { t0, t1: t0 + span };
+}
+// the worktime doc cut to a window: bucket arrays, marks and messages inside it; every total stays the whole run's
+function heatView(doc, view) {
+  if (!view) return doc;
+  const r = doc.range, min = Math.min(4, r.n), clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const i0 = clamp(Math.floor((view.t0 - r.start) / r.bucket_s), 0, r.n - min);
+  const i1 = clamp(Math.ceil((view.t1 - r.start) / r.bucket_s), i0 + min, r.n);
+  const cut = (xs) => xs.slice(i0, i1), start = r.start + i0 * r.bucket_s, end = r.start + i1 * r.bucket_s;
+  const within = (m) => m.ts >= start && m.ts < end;
+  return { ...doc, range: { ...r, start, end, n: i1 - i0 },
+    agents: doc.agents.map((a) => ({ ...a, work: cut(a.work), wait: cut(a.wait), events: cut(a.events), output: cut(a.output) })),
+    overlap: { ...doc.overlap, max_working: cut(doc.overlap.max_working) },
+    marks: (doc.marks || []).filter(within), messages: (doc.messages || []).filter(within) };
+}
+// heat-view:end
+function heatZoom(f, at = 0.5, dx = 0) {
+  const r = heatState.doc?.range;
+  if (!r?.n) return;
+  heatState.view = heatWindow(r, heatState.view, f, at, dx);
+  paintHeat();
+}
+
 function paintHeat() {
-  const doc = heatState.doc, box = $("heat");
+  const full = heatState.doc, box = $("heat");
   const sq = state.squads.find((s) => s.id === meshState.squadFilter);
-  if (!doc || !doc.agents?.length || !doc.range?.n) {
+  if (!full || !full.agents?.length || !full.range?.n) {
     $("heat-scope").textContent = sq ? `squad ${sq.name}` : "peers shown";
-    box.replaceChildren(el("p", { cls: "dim", text: doc?.agents?.length ? "no turns recorded yet for these sessions (transcripts are read every 30 s while agents run)" : "no sessions to chart" }));
+    box.replaceChildren(el("p", { cls: "dim", text: full?.agents?.length ? "no turns recorded yet for these sessions (transcripts are read every 30 s while agents run)" : "no sessions to chart" }));
     $("heat-legend").replaceChildren(); $("heat-summary").textContent = "";
     $("heat-table").querySelector("tbody").replaceChildren();
     return;
   }
+  const doc = heatView(full, heatState.view);      // what is drawn; the stats and the summary stay the whole run's
   const names = Object.fromEntries(doc.agents.map((a) => [a.session_id, a.agent_name]));
   const W = Math.max(360, Math.round(box.clientWidth || 640)), labelW = 150, statW = 178, gridX = labelW, gridW = W - labelW - statW;
   const geo = heatColumns(doc, Math.max(10, Math.floor(gridW / 4)));
   const cw = gridW / geo.cols, rowH = 16, gap = 3, parY = 2, rowsY = parY + rowH + 8;
   const axisY = rowsY + geo.agents.length * (rowH + gap) + 2, H = axisY + 18;
-  heatState.geo = { ...geo, gridX, cw, W };
+  heatState.geo = { ...geo, gridX, cw, W, t0: doc.range.start };
   // intensity: per-minute rate in each worked column, scaled to the squad's 95th percentile so one burst
   // does not flatten the rest
   const per = (a, i) => (heatState.mode === "output" ? a.output[i] : a.events[i]) / (geo.bucket / 60);
   const rates = geo.agents.flatMap((a) => a.work.map((w, i) => (w > 0 ? per(a, i) : null))).filter((v) => v !== null && v > 0).sort((x, y) => x - y);
   const p95 = rates.length ? rates[Math.min(rates.length - 1, Math.floor(rates.length * 0.95))] : 0;
   const step = (a, i) => (p95 > 0 ? Math.min(5, Math.max(1, Math.ceil((per(a, i) / p95) * 5))) : 1);
-  const summary = heatSummary(doc, names);
+  const summary = heatSummary(full, names);
   const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": `Work heatmap. ${summary.line}. ${summary.pairs.join(", ")}` });
   const cell = (x, y, fill) => svgEl("rect", { x: x.toFixed(2), y, width: Math.max(1, cw - (cw > 4 ? 1 : 0)).toFixed(2), height: rowH, fill, rx: cw > 6 ? 1 : 0 });
   // PARALLEL row
@@ -2936,7 +2970,8 @@ function paintHeat() {
   });
   if (heatState.layers === "events") drawSwimlane(svg, doc, geo, { gridX, cw, rowsY, rowH, gap });
   box.replaceChildren(svg);
-  $("heat-scope").textContent = `${sq ? `squad ${sq.name}` : `${doc.agents.length} peers shown`} · since ${hhmm(doc.range.start)} · ${fmtDur(geo.bucket)} columns`;
+  const when = heatState.view ? `${hhmm(doc.range.start)}–${hhmm(doc.range.end)} of ${fmtDur(full.range.n * full.range.bucket_s)}` : `since ${hhmm(doc.range.start)}`;
+  $("heat-scope").textContent = `${sq ? `squad ${sq.name}` : `${doc.agents.length} peers shown`} · ${when} · ${fmtDur(geo.bucket)} columns`;
   // CSSOM, not a style attribute: the page's CSP (style-src 'self') blocks inline style attributes
   const sw = (v) => { const n = el("span", { cls: "sw" }); n.style.background = `var(${v})`; return n; };
   $("heat-legend").replaceChildren(
@@ -2944,7 +2979,7 @@ function paintHeat() {
     el("span", {}, sw("--heat-wait"), " waiting (mesh_wait)"),
     el("span", {}, "parallel ", sw("--par-1"), " solo ", sw("--par-2"), " 2 ", sw("--par-3"), " 3 ", sw("--par-4"), " 4+"),
     el("span", {}, "blank = idle"),
-    heatState.layers === "events" && !("marks" in doc) ? el("span", { text: "events need an Almanac restart: this server predates them" })
+    heatState.layers === "events" && !("marks" in full) ? el("span", { text: "events need an Almanac restart: this server predates them" })
     : heatState.layers === "events" ? el("span", {}, "events: ", el("span", { cls: "red", text: "│" }), " tool error · ",
       el("span", { text: "ˌ" }), " file edit · ", el("span", { cls: "cyan", text: "●" }), " message (",
       el("span", { cls: "amber", text: "reply" }), " / ", el("span", { cls: "red", text: "blocking" }), ", ○ once answered)") : "");
@@ -3008,7 +3043,7 @@ function heatTip(a, e, svg) {
   const g = heatState.geo, box = svg.getBoundingClientRect();
   const x = ((e.clientX - box.left) / box.width) * g.W;
   const i = Math.min(g.cols - 1, Math.max(0, Math.floor((x - g.gridX) / g.cw)));
-  const t0 = heatState.doc.range.start + i * g.bucket, span = `${clock(t0)}–${clock(t0 + g.bucket)}`;
+  const t0 = g.t0 + i * g.bucket, span = `${clock(t0)}–${clock(t0 + g.bucket)}`;
   if (!a) return `PARALLEL · ${span}\nat most ${g.maxWorking[i]} agent${g.maxWorking[i] === 1 ? "" : "s"} working at once`;
   return `${a.agent_name} · ${span}\nwork ${fmtDur(a.work[i])} · waiting ${fmtDur(a.wait[i])}\n${a.events[i]} events · ${num(a.output[i], 0)} output tokens`;
 }
@@ -3020,6 +3055,22 @@ $("heat-mode").addEventListener("click", (e) => {
   paintHeat();
 });
 document.querySelectorAll("#heat-mode button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.v === heatState.mode)));
+// zoom and pan: the buttons, Ctrl + wheel (zoom at the pointer) and Shift + wheel or a sideways wheel (pan). A plain
+// wheel is left to the page, so scrolling past the heatmap never zooms it.
+$("heat-zoom").addEventListener("click", (e) => {
+  const z = e.target.dataset.z;
+  if (z === "all") { heatState.view = null; paintHeat(); }
+  else if (z) heatZoom(z === "in" ? 0.5 : z === "out" ? 2 : 1, 0.5, z === "left" ? -0.5 : z === "right" ? 0.5 : 0);
+});
+$("heat").addEventListener("wheel", (e) => {
+  const g = heatState.geo, svg = $("heat").querySelector("svg");
+  const zoom = e.ctrlKey || e.metaKey, pan = !zoom && heatState.view && (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY));
+  if (!g || !svg || !(zoom || pan)) return;
+  e.preventDefault();
+  const box = svg.getBoundingClientRect(), x = ((e.clientX - box.left) / box.width) * g.W;
+  if (zoom) heatZoom(e.deltaY < 0 ? 0.8 : 1.25, Math.max(0, Math.min(1, (x - g.gridX) / (g.cols * g.cw))));
+  else heatZoom(1, 0.5, Math.sign(e.deltaX || e.deltaY) * 0.1);
+}, { passive: false });
 let heatResize = 0;
 addEventListener("resize", () => { clearTimeout(heatResize); heatResize = setTimeout(() => { if (state.tab === "mesh") { paintHeat(); paintTopo(); } }, 200); });
 
