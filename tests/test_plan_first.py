@@ -376,6 +376,25 @@ class GateTests(PlanTests):
                 dispatch_task(self.service, res["object"]["ref"], almanac_url="http://x", token=TOKEN)
         self.assertIs(launch.call_args.kwargs["plan_first"], True)
 
+    def test_mesh_file_and_the_cli_send_plan_first(self):
+        import contextlib
+        import io
+        from almanac import mcp_mesh
+
+        def api(path, method="GET", body=None, timeout=30.0):
+            status, _, doc = self.request(self.handler, path, token=self.tok("arch"), method=method, body=body)
+            if status >= 400:
+                raise RuntimeError(doc.get("error"))
+            return doc
+        client = mcp_mesh.MeshClient(url="http://x", token="t", self_name="arch", squad_id="sq-1", api_fn=api)
+        res = client.call_tool("mesh_file", {"title": "later", "backlog": True, "plan_first": True})
+        self.assertIs(self.store.object_row(res["object"]["id"])["data"]["plan_first"], True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            mcp_mesh._run_cli(["file", "later too", "--backlog", "--plan-first"], client)
+            mcp_mesh._run_cli(["file", "a squad task"], client)          # left out: not sent, so not refused
+        self.assertIs(self.store.object_row(2)["data"]["plan_first"], True)
+        self.assertEqual(self.store.object_row(3)["title"], "a squad task")
+
 
 class RespawnGateTests(RespawnRig):
     def test_respawn_is_never_gated(self):
