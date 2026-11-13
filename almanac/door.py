@@ -1799,11 +1799,11 @@ def plan_of(service, row: dict) -> dict | None:
     return None
 
 
-def spawn_covered(service, squad: dict, task_row: dict | None) -> str | None:
+def spawn_covered(service, squad: dict, task_row: dict | None, files=None) -> str | None:
     """An agent's mesh_spawn in `squad` onto `task_row` (None: no ref): None when the member may start, else the
     refusal. Only a plan-first squad gates: the task must be a slice (not a plan) whose nearest plan the operator
     accepted (status accepted AND accepted_ts: the stamp outlives a re-hand-in), filed before that and not amended
-    since."""
+    since. `files` at spawn would replace the slice's in the kickoff, outside what was accepted: refused."""
     if not squad.get("plan_first"):
         return None
     if task_row is None:
@@ -1818,6 +1818,8 @@ def spawn_covered(service, squad: dict, task_row: dict | None) -> str | None:
                 + (f" ({ref_of(plan)} is {plan['status']})" if plan else ""))
     if task_row["created_ts"] >= accepted or service.store.amended_since(task_row["id"], accepted):
         return f"{ref} changed after plan {ref_of(plan)} was accepted: hand the plan in again"
+    if files:
+        return f"{ref}'s files are the plan's: amend the task and hand the plan in again"
     return None
 
 
@@ -2896,7 +2898,7 @@ def make_handler(service, token, *, hosts=()):
                         overrides = {k: body[k] for k in ("model", "effort", "workspace_mode", "permission_mode") if body.get(k)}
                     if body.get("ref"):          # checked under the lock: two calls cannot both take the task
                         task_row = spawn_ref_row(service, body["ref"], squad_id)
-                    if self.agent and (reason := spawn_covered(service, squad, task_row)):   # T-55: no slot, no task
+                    if self.agent and (reason := spawn_covered(service, squad, task_row, body.get("files"))):   # T-55: no slot, no task
                         service.store.log_action("spawn", 0, dict(name=body.get("name")), False,
                                                  f"mesh_spawn refused: {reason}", self._who())
                         return self._send(403, dict(ok=False, error=reason))

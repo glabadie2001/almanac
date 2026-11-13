@@ -301,6 +301,13 @@ class GateTests(PlanTests):
         self.assertIn("accepted_ts", self.store.object_row(1)["data"]["plan"])
         self.refused("(T-1 is in review)", ref="T-3")
 
+    def test_files_at_spawn_cannot_widen_a_covered_slice(self):
+        self.accepted_plan()
+        self.assertEqual(self.refused("files are the plan's", ref="T-2", files=["almanac/other.py"]),
+                         "T-2's files are the plan's: amend the task and hand the plan in again")
+        status, _, res = self.spawn(ref="T-2", task="working notes: start from the store, then the route")
+        self.assertEqual(status, 200, res)
+
     def test_refuses_a_slice_filed_after_accept(self):
         self.accepted_plan()
         ref = self.slice()
