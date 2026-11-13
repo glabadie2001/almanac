@@ -2399,6 +2399,38 @@ async function respawnOwner(o) {
   setTimeout(() => { loadFleet(); loadMesh(); }, 900);
 }
 
+// plan-decide:begin
+// the operator's decision on a task in review: accepted takes any comment, sending back needs one
+function decideBody(status, comment) {
+  const body = (comment || "").trim();
+  if (status === "in progress" && !body) return { error: "say what to change" };
+  return { status, body };
+}
+// plan-decide:end
+// [ACCEPT] / [SEND BACK] on a task in review (POST /api/mesh/object/log, the operator's). One bar per ref, kept so the
+// refresh on an objects_rev change re-attaches it with its half-typed comment instead of rebuilding it.
+const decideBars = {};
+function decideBar(o) {
+  if (decideBars[o.ref]) return decideBars[o.ref];
+  const box = el("textarea", { rows: 2, placeholder: "comment (needed to send back)", style: "width:100%" });
+  const msg = el("span", { cls: "red" });
+  const btns = ["accepted", "in progress"].map((status) =>
+    el("button", { type: "button", cls: "btn hi", text: status === "accepted" ? "[ACCEPT]" : "[SEND BACK]" }));
+  btns.forEach((btn, i) => btn.addEventListener("click", async () => {
+    const d = decideBody(i ? "in progress" : "accepted", box.value);
+    if (d.error) { msg.textContent = d.error; return; }
+    btns.forEach((b) => { b.disabled = true; }); msg.textContent = "";
+    let r;
+    try { r = await post("/api/mesh/object/log", { ref: o.ref, ...d }); } catch (err) { r = { error: err.message }; }
+    btns.forEach((b) => { b.disabled = false; });
+    if (r?.error || r?.ok === false) { msg.textContent = r.error || "not recorded"; return; }   // the comment stays
+    delete decideBars[o.ref];
+    planState.stale = true; loadMesh();
+    if (meshState.selTask === o.ref) loadTask(o.ref);
+  }));
+  return (decideBars[o.ref] = el("li", { cls: "result" }, box, el("div", {}, ...btns, " ", msg)));
+}
+
 async function loadTask(ref) {
   let doc;
   try {
@@ -2428,6 +2460,7 @@ async function loadTask(ref) {
   feed.replaceChildren(
     el("li", { cls: "you" }, o.body ? renderMd(o.body) : "(no body)"),
     el("li", { cls: "result", text: o.files?.length ? `files: ${o.files.join(", ")}` : "files: none" }),
+    ...(o.status === "in review" ? [decideBar(o)] : []),
     ...(log.length
       ? log.map((l) => el("li", { cls: logCls(l.kind), title: new Date(l.ts * 1000).toLocaleString() }, logHead(l), l.body ? renderMd(l.body) : null))
       : [el("li", { cls: "result", text: "no log entries yet" })]),
