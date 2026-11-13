@@ -1747,6 +1747,34 @@ def amend_task(service, agent, caller, body: dict) -> dict:
     return dict(object=object_docs(service, [service.store.object_row(row["id"])], body=True)[0], entry=log_doc(entry))
 
 
+def _notify(service, row: dict, who: dict, status, handin: bool, head: dict | None, text: str, agent, caller) -> None:
+    """One notice per agent for a status change or a hand-in: the task's creator (unless it made the change), and on a
+    hand-in each live reviewer of the squad (role_class of its role is `reviewer`) with the branch and commit. Never
+    the agent that logged it; a reviewer who is also the creator hears once."""
+    move = f"{row['status']} → {status}" if status else "in review again"
+    notice = f"[{ref_of(row)} {move} by {who['agent_name']}] {row['title']}"
+    if handin:
+        notice += (f"\nBranch: {(head or {}).get('branch') or '(none)'}, commit: "
+                   f"{head['sha'][:7] if head and head.get('sha') else 'no commit recorded'}")
+    notice += f"\n\n{text}" if text else ""
+    by_creator = (row["created_by"] == who.get("session")) if row["created_by"] else row["created_by_name"] == who["agent_name"]
+    to = []                              # (name, session)
+    if not by_creator:
+        to_name, to_session = row["created_by_name"], row["created_by"]
+        if to_session and (service.store.spawn_by_session(to_session) or {}).get("squad_id") != row["squad_id"]:
+            to_name, to_session = "operator", None     # filed in the backlog by another squad, dispatched since
+        to.append((to_name, to_session))
+    if handin:
+        roles = {r["id"]: r["title"] for r in service.store.roles()}
+        skip = {who.get("session"), row["created_by"]} - {None}
+        to += [(p["name"], p["session_id"]) for p in service.mesh_peers(squad_id=row["squad_id"])
+               if p.get("session_id") and p["session_id"] not in skip
+               and role_class(p.get("agent_role"), roles.get(p.get("agent_role"))) == "reviewer"]
+    for to_name, to_session in dict.fromkeys(to):
+        _hub_tell(service, to_name=to_name, to_session=to_session, text=notice, agent=agent, caller=caller,
+                  squad=row["squad_id"])
+
+
 def log_to_object(service, agent, caller, body: dict, *, after: list | None = None) -> dict:
     """POST /api/mesh/object/log: append to a task's log, optionally changing its status or owner. A changed owner
     gets the assignment message; a changed status sends its creator one notice; a task becoming accepted is a context
@@ -1773,6 +1801,9 @@ def log_to_object(service, agent, caller, body: dict, *, after: list | None = No
     # an owner set in the same call is the one whose worktree shipped it
     head, note = (handin_head(service, dict(row, owner_session=owner["session_id"]) if owner else row) if handin
                   else (None, ""))
+    if status == "accepted" and merge_state(service, [row]).get(row["id"]) is False:     # said, never refused
+        note = (f"almanac-hub: accepted with {row['sha'][:7]} not in "
+                f"{(service.store.squad(row['squad_id']) or {}).get('cwd')}'s HEAD")
     text = "\n\n".join(x for x in (text, note) if x)
     who = log_identity(agent, caller)
     delivered = mid = entry = None
@@ -1791,14 +1822,8 @@ def log_to_object(service, agent, caller, body: dict, *, after: list | None = No
             row["id"], who=who, kind="assign" if owner else "status" if status else kind, body=text, status=status,
             owner_session=owner and owner["session_id"], owner_name=owner and owner["agent_name"], message_id=mid,
             head=head)
-    by_creator = (row["created_by"] == who.get("session")) if row["created_by"] else row["created_by_name"] == who["agent_name"]
-    if status and not by_creator:
-        notice = f"[{ref_of(row)} {row['status']} → {status} by {who['agent_name']}] {row['title']}"
-        to_name, to_session = row["created_by_name"], row["created_by"]
-        if to_session and (service.store.spawn_by_session(to_session) or {}).get("squad_id") != row["squad_id"]:
-            to_name, to_session = "operator", None     # filed in the backlog by another squad, dispatched since
-        _hub_tell(service, to_name=to_name, to_session=to_session,
-                  text=notice + (f"\n\n{text}" if text else ""), agent=agent, caller=caller, squad=row["squad_id"])
+    if status or handin:                 # a fix round (in review again) notifies like the first hand-in
+        _notify(service, row, who, status, handin, head, text, agent, caller)
     later = [] if after is None else after
     if status == "accepted":
         context_boundary(service, service.store.object_row(row["id"]), caller if agent else None, after=later)

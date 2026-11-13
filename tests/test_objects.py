@@ -647,3 +647,65 @@ class HandinTests(ObjectRig):
         self.assertIsNone(res["object"]["sha"])
         self.assertIn("no commit recorded: git rev-parse failed", res["entry"]["body"])
         self.assertIsNone(res["object"]["merged"])
+
+
+class HandinNoticeTests(HandinTests):
+    """T-37: one hand-in, one notice each to the lead and the squad's live reviewer; none to the sender."""
+
+    PEERS = HandinTests.PEERS + (("rev", 900, "sq-1", ["#squad"]),)
+
+    def setUp(self):
+        super().setUp()
+        self.store.record_spawn(agent_name="rev", session_id="sess-rev", squad_id="sq-1", role_id="reviewer-gemini",
+                                provider="claude", model=None, effort=None, cwd=str(self.repo), worktree_path=None,
+                                pid=0)
+
+    def counts(self):
+        return {name: len(got) for name, got in self.inbox.items() if got}
+
+    def clear(self):
+        for got in self.inbox.values():
+            got.clear()
+
+    def test_a_hand_in_and_a_fix_round_each_tell_the_lead_and_the_reviewer_once(self):
+        self.file(self.tok("arch"), owner="impl")
+        self.clear()
+        first = self.commit(self.wt, "one.py")
+        self.hand_in("T-1", body="store.py; 12 OK")
+        self.assertEqual(self.counts(), {"arch": 1, "rev": 1})
+        rev = json.dumps(self.inbox["rev"][0], ensure_ascii=False)
+        for part in ("[T-1 in progress → in review by impl] a task", "Branch: almanac/sq-1/impl, commit: " + first[:7],
+                     "store.py; 12 OK"):
+            self.assertIn(part, rev)
+        self.clear()
+        second = self.commit(self.wt, "two.py")
+        self.hand_in("T-1", body="fixed F1")
+        self.assertEqual(self.counts(), {"arch": 1, "rev": 1}, "a fix round is one event too")
+        self.assertIn("in review again", json.dumps(self.inbox["arch"][0]))
+        self.assertIn("commit: " + second[:7], json.dumps(self.inbox["rev"][0]))
+
+    def test_a_reviewer_who_created_the_task_hears_once_and_no_commit_is_said(self):
+        self.file(self.tok("rev"), owner="impl")
+        self.clear()
+        with mock.patch.object(spawner.subprocess, "run", side_effect=subprocess.TimeoutExpired("git", 10)):
+            self.hand_in("T-1")
+        self.assertEqual(self.counts(), {"rev": 1})
+        self.assertIn("commit: no commit recorded", json.dumps(self.inbox["rev"][0]))
+
+    def test_the_reviewer_handing_in_is_not_told(self):
+        self.file(owner="rev")                                   # the operator created it
+        self.clear()
+        self.hand_in("T-1", who="rev")
+        self.assertEqual(self.counts(), {}, "the operator is no peer here; rev logged it")
+
+    def test_accepting_an_unmerged_sha_is_noted_and_never_refused(self):
+        self.file(owner="impl")
+        sha = self.commit(self.wt, "one.py")
+        self.hand_in("T-1")
+        status, _, res = self.log(ref="T-1", status="accepted")
+        self.assertEqual((status, res["object"]["status"]), (200, "accepted"))
+        self.assertEqual(res["entry"]["body"], f"almanac-hub: accepted with {sha[:7]} not in {self.repo}'s HEAD")
+        self.file(owner="impl")                                  # T-2, merged before it is accepted
+        self.hand_in("T-2")
+        git(self.repo, "merge", "-q", "--no-ff", "-m", "merge", "almanac/sq-1/impl")
+        self.assertEqual(self.log(ref="T-2", status="accepted", body="ok")[2]["entry"]["body"], "ok")
