@@ -2712,15 +2712,22 @@ def make_handler(service, token, *, hosts=()):
             if method == "POST" and path == "/api/mesh/object/log":
                 # what must wait for the response: ending the caller itself (context_boundary), starting a fresh
                 # reviewer (_start_reviewer)
+                # reviewer (_start_reviewer). They run even when the write fails (a client that timed out): the log row
+                # is written, so a reviewer must still start and review_starts must still be cleared
                 after = []
                 port = getattr(self.server, "server_port", 8812)
-                self._send(200, log_to_object(service, self.agent, service.caller(self.agent, self.agent_session),
-                                              self._body(), after=after, hub=(f"http://127.0.0.1:{port}", token)))
-                if after:
-                    self.close_connection = True
-                    self.wfile.flush()
-                for step in after:
-                    step()
+                try:
+                    self._send(200, log_to_object(service, self.agent, service.caller(self.agent, self.agent_session),
+                                                  self._body(), after=after, hub=(f"http://127.0.0.1:{port}", token)))
+                    if after:
+                        self.close_connection = True
+                        self.wfile.flush()
+                finally:
+                    for step in after:
+                        try:
+                            step()
+                        except Exception:          # noqa: BLE001 -- one step failing never skips the next
+                            logging.getLogger("almanac").exception("a step after %s failed", path)
                 return None
             if method == "POST" and path == "/api/mesh/object/amend":
                 return self._send(200, amend_task(service, self.agent, service.caller(self.agent, self.agent_session),

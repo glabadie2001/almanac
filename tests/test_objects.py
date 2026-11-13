@@ -4,9 +4,10 @@ import json
 import os
 import subprocess
 import urllib.parse
+from types import SimpleNamespace
 from unittest import mock
 
-from support import TOKEN, runner_probe
+from support import PORT, TOKEN, MemorySocket, runner_probe
 from test_fleet import CLI
 from test_server_fixes import MeshRig
 from test_spawn_fixes import git
@@ -1004,6 +1005,24 @@ class FreshReviewerTests(ObjectRig):
         self.assertEqual(len(queued), 1)
         real(*queued[0])
         self.assertEqual((len(self.hub_rows()), self.counts().get("rev")), (1, 1))
+
+    def test_a_response_that_cannot_be_written_still_starts_the_reviewer(self):            # L2
+        self.file(self.tok("arch"), owner="impl")
+        body = json.dumps({"ref": "T-1", "status": "in review", "body": "done"}).encode()
+        wire = (f"POST /api/mesh/object/log HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\nContent-Length: {len(body)}\r\n"
+                f"Content-Type: application/json\r\nAuthorization: Bearer {self.tok('impl')}\r\n"
+                "Connection: close\r\n\r\n").encode() + body
+
+        class Gone(MemorySocket):                          # the builder's client timed out mid-response
+            def sendall(self, data):
+                raise ConnectionResetError("the client went away")
+        try:
+            self.handler(Gone(wire), ("127.0.0.1", 9999), SimpleNamespace(server_port=PORT, server_name="localhost"))
+        except OSError:
+            pass
+        self.assertEqual(self.store.object_row(1)["status"], "in review", "the hand-in was written")
+        self.assertEqual((len(self.argv), self.reviewer()["agent_name"]), (1, "rev-claude"), "its reviewer started once")
+        self.assertEqual(self.service.review_starts, set())
 
     def test_a_restart_between_the_hand_in_and_the_fix_round_still_finds_the_reviewer(self):
         self.file(self.tok("arch"), owner="impl")
