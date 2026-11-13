@@ -5,8 +5,9 @@ import json
 import subprocess
 from unittest import mock
 
-from support import runner_probe
+from support import TOKEN, runner_probe
 from test_objects import ObjectRig
+from test_respawn import RespawnRig
 
 from almanac import spawner
 from almanac.door import PLAN_TEMPLATE, plan_of
@@ -232,3 +233,147 @@ class PlanTests(ObjectRig):
         self.assertIn("split T-2 in two", said)
         self.assertEqual(self.store.object_row(1)["data"]["plan"], {})
         self.assertEqual(self.blocking(), 0, "sending it back closes the hand-in's flag")
+
+
+TASK = "Build the slice to its sketch, with tests, and hand it in."
+
+
+class GateTests(PlanTests):
+    """T-55: in a plan-first squad an agent's mesh_spawn starts a member only on a slice of a plan the operator
+    accepted. sq-1 lets arch (the lead) add implementers, up to 2."""
+
+    def setUp(self):
+        super().setUp()
+        self.store.upsert_role(dict(self.store.role("implementer-claude"), models=[], efforts=[]))
+        self.store.update_squad("sq-1", spawn_role="implementer-claude", spawn_limit=2, plan_first=True)
+        # the test folder sits inside Almanac's own checkout: a real worktree would branch the live repo
+        mock.patch.object(spawner, "ensure_worktree", side_effect=lambda repo, *a, **k: repo).start()
+
+    def spawn(self, agent="arch", **body):
+        token = self.tok(agent) if agent else TOKEN
+        return self.request(self.handler, "/api/mesh/spawn", token=token, method="POST", body={"task": TASK, **body})
+
+    def refused(self, needle, **body):
+        rev, used = self.store.objects_rev(), self.store.squad("sq-1")["spawn_used"]
+        status, _, res = self.spawn(**body)
+        self.assertEqual(status, 403, res)
+        self.assertIn(needle, res["error"])
+        self.assertEqual((self.store.objects_rev(), self.store.squad("sq-1")["spawn_used"], self.argv), (rev, used, []),
+                         "no task filed, no slot taken, nothing started")
+        self.assertEqual(self.store.actions()[0]["detail"], f"mesh_spawn refused: {res['error']}")
+        return res["error"]
+
+    def accepted_plan(self):
+        """T-1 a plan with slice T-2, handed in and accepted."""
+        self.plan()
+        self.slice()
+        self.assertEqual(self.hand_in()[0], 200)
+        self.assertEqual(self.log(ref="T-1", status="accepted")[0], 200)
+
+    def test_a_plan_first_squad_refuses_spawn_without_ref(self):
+        self.assertIn("squad sq-1 is plan-first: name a filed task with ref", self.refused("plan-first"))
+
+    def test_refuses_a_task_outside_any_plan(self):
+        self.file(self.tok("arch"), title="loose work")                       # T-1, under no plan
+        self.assertEqual(self.refused("not under an accepted plan", ref="T-1"),
+                         "T-1 is not under an accepted plan: file the slices, hand the plan in and wait for the operator")
+        self.plan()                                                           # T-2: a plan itself is no slice
+        self.refused("T-2 is a plan, not a slice", ref="T-2")
+
+    def test_refuses_while_the_plan_is_in_review(self):
+        self.plan()
+        self.slice()
+        self.refused("(T-1 is queued)", ref="T-2")
+        self.hand_in()
+        self.refused("(T-1 is in review)", ref="T-2")
+
+    def test_allows_a_covered_slice_after_accept(self):
+        self.accepted_plan()
+        self.slice()                                       # T-3
+        status, _, res = self.spawn(ref="T-2")
+        self.assertEqual(status, 200, res)
+        self.assertEqual((self.store.object_row(2)["status"], self.store.squad("sq-1")["spawn_used"]), ("in progress", 1))
+        # a re-hand-in keeps accepted_ts but not the status: nothing is covered until the operator accepts again
+        self.store.db.execute("update objects set created_ts = 0 where id = 3")     # as if filed before the accept
+        self.store.db.commit()
+        self.argv.clear()
+        self.assertEqual(self.hand_in()[0], 200)
+        self.assertIn("accepted_ts", self.store.object_row(1)["data"]["plan"])
+        self.refused("(T-1 is in review)", ref="T-3")
+
+    def test_refuses_a_slice_filed_after_accept(self):
+        self.accepted_plan()
+        ref = self.slice()
+        self.assertEqual(self.refused("changed after", ref=ref),
+                         f"{ref} changed after plan T-1 was accepted: hand the plan in again")
+
+    def test_refuses_a_slice_amended_after_accept(self):
+        self.accepted_plan()
+        status, _, res = self.post("/api/mesh/object/amend", ref="T-2", body=SLICE + "\nand one thing more")
+        self.assertEqual(status, 200, res)
+        self.refused("T-2 changed after plan T-1 was accepted", ref="T-2")
+
+    def test_a_second_accepted_plan_covers_its_own_slices(self):
+        self.accepted_plan()
+        self.plan(parent="T-1")                            # T-3, an addition under the accepted plan
+        ref = self.slice(parent="T-3")                     # T-4: T-3 decides it, not T-1
+        self.refused("(T-3 is queued)", ref=ref)
+        self.assertEqual(self.hand_in("T-3")[0], 200)
+        self.assertEqual(self.log(ref="T-3", status="accepted")[0], 200)
+        self.assertEqual(self.spawn(ref=ref)[0], 200)
+        self.assertEqual(self.spawn(ref="T-2", name="impl-two")[0], 200, "T-1's slice is still covered")
+
+    def test_the_operator_is_never_gated(self):
+        status, _, res = self.spawn(agent=None, squad_id="sq-1", role_id="implementer-claude")
+        self.assertEqual(status, 200, res)
+        loose = self.file(self.tok("arch"), title="loose")[2]["object"]["ref"]       # under no plan
+        self.assertEqual(self.spawn(agent=None, squad_id="sq-1", role_id="implementer-claude", ref=loose,
+                                    name="impl-two")[0], 200)
+
+    def test_the_hub_reviewer_is_never_gated(self):
+        self.file(self.tok("arch"), owner="impl")          # T-1, under no plan: its first hand-in starts a reviewer
+        self.assertEqual(self.log(self.tok("impl"), ref="T-1", status="in review", body="done")[0], 200)
+        self.assertEqual(len(self.argv), 1)
+
+    def test_a_squad_without_plan_first_is_unchanged(self):
+        self.store.update_squad("sq-1", plan_first=False)
+        status, _, res = self.spawn()
+        self.assertEqual(status, 200, res)
+        self.assertEqual(self.store.squad("sq-1")["spawn_used"], 1)
+
+    def test_a_squad_launched_plan_first_has_it_before_any_member_starts(self):
+        seen, wrapped = [], self.popen
+
+        def popen(argv, **kwargs):
+            if argv[0] != "git":
+                seen.append(self.store.squads(limit=1)[0]["plan_first"])
+            return wrapped(argv, **kwargs)
+        mock.patch.object(spawner.subprocess, "Popen", side_effect=popen).start()
+        member = [dict(role_id="implementer-claude", workspace_mode="shared")]
+        status, _, res = self.post("/api/squads", name="pf", cwd=str(self.root), brief="b", plan_first=True,
+                                   members=member)
+        self.assertEqual(status, 200, res)
+        self.assertEqual((seen, res["squad"]["plan_first"]), ([True], True))
+        status, _, res = self.post("/api/squads", name="off", cwd=str(self.root), brief="b", members=member)
+        self.assertEqual(status, 200, res)
+        self.assertEqual((seen[-1], res["squad"]["plan_first"]), (False, False), "left out: off")
+
+    def test_a_backlog_task_carries_plan_first_to_its_dispatch(self):
+        from almanac.door import dispatch_task
+        status, _, res = self.file(title="later", backlog=True, project=str(self.root), plan_first=True)
+        self.assertEqual(status, 200, res)
+        self.assertIs(self.store.object_row(res["object"]["id"])["data"]["plan_first"], True)
+        self.assertEqual(self.file(self.tok("arch"), title="now", plan_first=True)[0], 400, "for a backlog task")
+        with mock.patch.object(spawner, "launch_squad", side_effect=RuntimeError("stop")) as launch:
+            with self.assertRaises(RuntimeError):
+                dispatch_task(self.service, res["object"]["ref"], almanac_url="http://x", token=TOKEN)
+        self.assertIs(launch.call_args.kwargs["plan_first"], True)
+
+
+class RespawnGateTests(RespawnRig):
+    def test_respawn_is_never_gated(self):
+        """mesh_respawn carries on a task that already has its member: a plan-first squad does not gate it."""
+        self.store.update_squad("sq-1", plan_first=True)
+        status, _, res = self.respawn("arch")             # T-1 is under no plan
+        self.assertEqual(status, 200, res)
+        self.assertEqual(self.killed, [500])

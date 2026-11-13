@@ -28,8 +28,9 @@ POST /api/operator/resolve   {id}: close an open flagged message by hand
 GET  /api/roles              list agent role definitions (POST upserts, DELETE `?id=` deletes)
 POST /api/spawn              launch a Claude or Gemini agent with role, workspace mode, and mesh wiring
 GET  /api/squads             list multi-agent squads (POST launches one; `spawn_role` + `spawn_limit` let its
-                             architect add members later)
-POST /api/squad              {id, spawn_role?, spawn_limit?}: what agents may add to a running squad (operator only)
+                             architect add members later; `plan_first`: only on slices of an accepted plan)
+POST /api/squad              {id, spawn_role?, spawn_limit?, plan_first?}: what agents may add to a running squad
+                             (operator only)
 POST /api/squad/member       {squad_id, role_id, agent_name?, task?, model?, ...}: the operator adds a member (no limit)
 POST /api/mesh/object/respawn {ref, model?, effort?}: end a task owner's session and start a fresh one of the same
                              handle and worktree on that task, its log as the kickoff (the operator, or a squadmate
@@ -40,7 +41,8 @@ POST /api/mesh/object/amend  {ref, title?, body?, files?}: replace a task's titl
 POST /api/mesh/spawn         {task, name?, role?, ref?}: an agent whose role may_spawn adds one member of the squad's
                              spawn_role (or of `role` when spawn_role is `*`), within spawn_limit (403 or 400 with
                              the reason otherwise). `ref`: put it on an existing queued, unowned task of the squad
-                             instead of filing a new one (`task` is then optional extra instructions)
+                             instead of filing a new one (`task` is then optional extra instructions). In a
+                             plan-first squad, only with a ref to a slice of a plan the operator accepted
 POST /api/squads/assign      {ref, squad_id}: move a queued backlog task into a running squad of its project (the
                              operator's only); the squad's lead is told (409 with the reason otherwise)
 GET  /api/models             known & CLI-discovered Claude and Gemini model identifiers
@@ -1689,7 +1691,7 @@ def _roster(service, raw) -> list[dict]:
 
 
 def _backlog_data(service, body: dict) -> dict:
-    """The squad a backlog task will dispatch: `roster`, `spawn_role`, `spawn_limit`, each checked now."""
+    """The squad a backlog task will dispatch: `roster`, `spawn_role`, `spawn_limit`, `plan_first`, each checked now."""
     data = {}
     if body.get("roster") is not None:
         data["roster"] = _roster(service, body["roster"])
@@ -1697,6 +1699,8 @@ def _backlog_data(service, body: dict) -> dict:
         data["spawn_role"] = service.store._spawn_settings(body["spawn_role"], 0)[0]
     if body.get("spawn_limit") not in (None, ""):
         data["spawn_limit"] = service.store._spawn_settings(None, body["spawn_limit"])[1]
+    if body.get("plan_first") not in (None, ""):
+        data["plan_first"] = _flag(body["plan_first"])
     return data
 
 
@@ -1731,8 +1735,8 @@ def file_object(service, agent, caller, body: dict) -> dict:
             raise ValueError("a backlog task has no owner until it is dispatched")
         if body.get("status") not in (None, "", "queued"):
             raise ValueError("a backlog task is queued until it is dispatched")
-    elif any(body.get(k) not in (None, "", []) for k in ("roster", "spawn_role", "spawn_limit")):
-        raise ValueError("roster, spawn_role and spawn_limit are for a backlog task")
+    elif any(body.get(k) not in (None, "", []) for k in ("roster", "spawn_role", "spawn_limit", "plan_first")):
+        raise ValueError("roster, spawn_role, spawn_limit and plan_first are for a backlog task")
     plan = _flag(body.get("plan"))
     if plan and backlog:
         raise ValueError("a plan is filed in a squad, not the backlog")
@@ -1792,6 +1796,28 @@ def plan_of(service, row: dict) -> dict | None:
             return row
         seen.add(row["id"])
         row = service.store.object_row(row["parent_id"]) if row["parent_id"] else None
+    return None
+
+
+def spawn_covered(service, squad: dict, task_row: dict | None) -> str | None:
+    """An agent's mesh_spawn in `squad` onto `task_row` (None: no ref): None when the member may start, else the
+    refusal. Only a plan-first squad gates: the task must be a slice (not a plan) whose nearest plan the operator
+    accepted (status accepted AND accepted_ts: the stamp outlives a re-hand-in), filed before that and not amended
+    since."""
+    if not squad.get("plan_first"):
+        return None
+    if task_row is None:
+        return (f"squad {squad['id']} is plan-first: name a filed task with ref, a slice of a plan the operator "
+                "accepted")
+    ref, plan = ref_of(task_row), plan_of(service, task_row)
+    if plan is not None and plan["id"] == task_row["id"]:
+        return f"{ref} is a plan, not a slice: put members on its slices once the operator accepts it"
+    accepted = plan and (plan["data"].get("plan") or {}).get("accepted_ts")
+    if plan is None or plan["status"] != "accepted" or not accepted:
+        return (f"{ref} is not under an accepted plan: file the slices, hand the plan in and wait for the operator"
+                + (f" ({ref_of(plan)} is {plan['status']})" if plan else ""))
+    if task_row["created_ts"] >= accepted or service.store.amended_since(task_row["id"], accepted):
+        return f"{ref} changed after plan {ref_of(plan)} was accepted: hand the plan in again"
     return None
 
 
@@ -2343,7 +2369,8 @@ def dispatch_task(service, ref, *, almanac_url: str, token: str) -> dict:
     try:
         res = spawner.launch_squad(service, almanac_url=almanac_url, token=token, name=row["title"],
                                    cwd=row["project"], brief=f"{row['title']}\n\n{row['body']}".strip(),
-                                   members=members, spawn_role=spawn_role, spawn_limit=spawn_limit, lead_task=row)
+                                   members=members, spawn_role=spawn_role, spawn_limit=spawn_limit, lead_task=row,
+                                   plan_first=bool(data.get("plan_first")))
     finally:
         with _DISPATCH_LOCK:
             _DISPATCHING.discard(row["id"])
@@ -2869,6 +2896,10 @@ def make_handler(service, token, *, hosts=()):
                         overrides = {k: body[k] for k in ("model", "effort", "workspace_mode", "permission_mode") if body.get(k)}
                     if body.get("ref"):          # checked under the lock: two calls cannot both take the task
                         task_row = spawn_ref_row(service, body["ref"], squad_id)
+                    if self.agent and (reason := spawn_covered(service, squad, task_row)):   # T-55: no slot, no task
+                        service.store.log_action("spawn", 0, dict(name=body.get("name")), False,
+                                                 f"mesh_spawn refused: {reason}", self._who())
+                        return self._send(403, dict(ok=False, error=reason))
                     try:
                         res = spawner.join_squad(service, almanac_url=f"http://127.0.0.1:{port}", token=token,
                                                  squad_id=squad_id, role_id=role_id, task=task, agent_name=body.get("name"),
@@ -2890,12 +2921,16 @@ def make_handler(service, token, *, hosts=()):
                 sid = str(body.get("id") or body.get("squad_id") or "").strip()
                 if not sid:
                     raise ValueError("id is required")
-                doc = service.store.update_squad(sid, **{k: body[k] for k in ("spawn_role", "spawn_limit") if k in body})
+                if "plan_first" in body:
+                    body["plan_first"] = _flag(body["plan_first"])
+                doc = service.store.update_squad(sid, **{k: body[k] for k in ("spawn_role", "spawn_limit", "plan_first")
+                                                         if k in body})
                 if doc is None:
                     return self._send(404, dict(ok=False, error=f"no squad {sid}"))
                 service.store.log_action("squad", 0, dict(name=sid), True,
                                          f"agents may add {doc['spawn_role'] or 'nobody'} up to {doc['spawn_limit']} "
-                                         f"({doc['spawn_used']} used)", self._who())
+                                         f"({doc['spawn_used']} used)" + ("; plan first" if doc["plan_first"] else ""),
+                                         self._who())
                 return self._send(200, dict(ok=True, squad=doc))
             if method == "POST" and path == "/api/squad/member":
                 from almanac import spawner
@@ -3002,6 +3037,7 @@ def make_handler(service, token, *, hosts=()):
                     members=body.get("members") or [],
                     spawn_role=body.get("spawn_role") or None,
                     spawn_limit=body.get("spawn_limit") or 0,
+                    plan_first=_flag(body.get("plan_first")),
                 )
                 service.store.log_action(
                     "squad",

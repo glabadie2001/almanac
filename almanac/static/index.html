@@ -134,6 +134,9 @@
           <label for="squad-spawn-limit">up to</label>
           <input id="squad-spawn-limit" name="spawn_limit" type="number" min="0" max="20" step="1" value="0">
         </div>
+        <div class="field check-field span-all">
+          <label for="squad-plan-first"><input type="checkbox" id="squad-plan-first" name="plan_first" checked> plan first: no builder starts before I accept the lead's plan</label>
+        </div>
         <div class="form-actions span-all">
           <button type="submit" id="squad-submit" class="btn hi">[LAUNCH SQUAD ▸]</button>
           <button type="button" id="squad-cancel" class="btn dim">[CLOSE]</button>
@@ -312,6 +315,7 @@
       <div id="mesh-strip-info" class="strip-row"></div>
       <div id="mesh-strip-tools" class="strip-row">
         <span id="strip-grow" class="dim"></span>
+        <span id="strip-plan" class="flag reply" hidden title="plan-first squad: agents start members only on slices of a plan you accepted">plan first</span>
         <button type="button" id="strip-edit" class="btn" aria-expanded="false" title="what the squad's architect may add">[LIMIT ✎]</button>
         <button type="button" id="strip-add" class="btn cyan" aria-expanded="false">[+ ADD MEMBER]</button>
         <form id="strip-edit-form" class="strip-row" autocomplete="off" hidden>

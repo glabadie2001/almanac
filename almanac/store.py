@@ -407,7 +407,10 @@ class Store:
             if column not in {r[1] for r in self.db.execute(f"pragma table_info({table})")}:
                 self.db.execute(f"alter table {table} add column {column} text")
         have = {r[1] for r in self.db.execute("pragma table_info(squads)")}
-        for column, kind in (("spawn_role", "text"), ("spawn_limit", "integer default 0")):
+        # T-55: a plan-first squad's agents start members only on slices of a plan the operator accepted (running
+        # squads stay off)
+        for column, kind in (("spawn_role", "text"), ("spawn_limit", "integer default 0"),
+                             ("plan_first", "integer default 0")):
             if column not in have:
                 self.db.execute(f"alter table squads add column {column} {kind}")
         if "may_spawn" not in {r[1] for r in self.db.execute("pragma table_info(roles)")}:
@@ -1496,20 +1499,21 @@ class Store:
         return role, limit
 
     def create_squad(self, squad_id: str, name: str, cwd: str, brief: str = "", *, spawn_role: str | None = None,
-                     spawn_limit: int = 0) -> dict:
+                     spawn_limit: int = 0, plan_first: bool = False) -> dict:
         """`spawn_role` / `spawn_limit`: the role (or `*`, any defined role) and how many members an agent whose role
-        may_spawn can add to this squad (elastic squads). 0 means agents add nobody; the operator always can."""
+        may_spawn can add to this squad (elastic squads). 0 means agents add nobody; the operator always can.
+        `plan_first`: an agent's mesh_spawn starts a member only on a slice of an accepted plan (door.spawn_covered)."""
         role, limit = self._spawn_settings(spawn_role, spawn_limit)
         now = time.time()
         with self.lock:
             self.db.execute(
-                "insert or replace into squads (id, name, cwd, brief, created_ts, status, spawn_role, spawn_limit) "
-                "values (?, ?, ?, ?, ?, 'active', ?, ?)",
-                (squad_id, name, cwd, brief, now, role, limit),
+                "insert or replace into squads (id, name, cwd, brief, created_ts, status, spawn_role, spawn_limit, "
+                "plan_first) values (?, ?, ?, ?, ?, 'active', ?, ?, ?)",
+                (squad_id, name, cwd, brief, now, role, limit, int(bool(plan_first))),
             )
             self.db.commit()
         return dict(id=squad_id, name=name, cwd=cwd, brief=brief, created_ts=now, status="active", spawn_role=role,
-                    spawn_limit=limit, spawn_used=0)
+                    spawn_limit=limit, spawn_used=0, plan_first=bool(plan_first))
 
     _KEEP = object()
 
@@ -1520,15 +1524,17 @@ class Store:
             self.db.execute("delete from squads where id = ?", (squad_id,))
             self.db.commit()
 
-    def update_squad(self, squad_id: str, *, spawn_role=_KEEP, spawn_limit=_KEEP) -> dict | None:
+    def update_squad(self, squad_id: str, *, spawn_role=_KEEP, spawn_limit=_KEEP, plan_first=_KEEP) -> dict | None:
         """Change what agents may add to a running squad. Left out = unchanged. None if there is no such squad."""
         current = self.squad(squad_id)
         if current is None:
             return None
         role, limit = self._spawn_settings(current["spawn_role"] if spawn_role is self._KEEP else spawn_role,
                                            current["spawn_limit"] if spawn_limit is self._KEEP else spawn_limit)
+        first = current["plan_first"] if plan_first is self._KEEP else bool(plan_first)
         with self.lock:
-            self.db.execute("update squads set spawn_role = ?, spawn_limit = ? where id = ?", (role, limit, squad_id))
+            self.db.execute("update squads set spawn_role = ?, spawn_limit = ?, plan_first = ? where id = ?",
+                            (role, limit, int(first), squad_id))
             self.db.commit()
         return self.squad(squad_id)
 
@@ -1546,7 +1552,7 @@ class Store:
         where, params = ("where id = ? ", [squad_id]) if squad_id else ("", [])
         with self.lock:
             rows = self.db.execute(
-                "select id, name, cwd, brief, created_ts, status, spawn_role, coalesce(spawn_limit, 0), "
+                "select id, name, cwd, brief, created_ts, status, spawn_role, coalesce(spawn_limit, 0), coalesce(plan_first, 0), "
                 # members, not sessions: a respawn (door.respawn_task) reuses its handle and takes no slot; a handle
                 # whose newest row was retired (fresh-per-task) gives its slot back
                 "(select count(distinct a.agent_name) from spawned_agents a where a.squad_id = squads.id "
@@ -1589,7 +1595,8 @@ class Store:
                 status=r[5],
                 spawn_role=r[6],
                 spawn_limit=r[7],
-                spawn_used=r[8],
+                spawn_used=r[9],
+                plan_first=bool(r[8]),
                 agents=by_squad.get(r[0], []),
             )
             for r in rows
@@ -1799,6 +1806,12 @@ class Store:
             self.db.commit()
             r = self.db.execute(f"select {LOG_COLUMNS} from object_log where id = ?", (lid,)).fetchone()
         return _log(r)
+
+    def amended_since(self, oid: int, ts: float) -> bool:
+        """Has the object an `amend` log row at or after `ts`?"""
+        with self.lock:
+            return self.db.execute("select 1 from object_log where object_id = ? and kind = 'amend' and ts >= ? limit 1",
+                                   (oid, ts)).fetchone() is not None
 
     def object_row(self, oid: int) -> dict | None:
         with self.lock:

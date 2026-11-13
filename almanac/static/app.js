@@ -1076,7 +1076,7 @@ $("squad-form").addEventListener("submit", async (e) => {
   btn.disabled = true; msg.textContent = `launching ${members.length} squad agents…`;
   try {
     const r = await post("/api/squads", { name, cwd, brief, members, spawn_role: $("squad-spawn-role").value || null,
-      spawn_limit: Number($("squad-spawn-limit").value || 0) });
+      spawn_limit: Number($("squad-spawn-limit").value || 0), plan_first: $("squad-plan-first").checked });
     // a member the server refused (no runner, a launch that died) says why
     const refused = (r.squad?.agents || []).filter((a) => !a.ok).map((a) => `${a.agent_name}: ${a.error || "failed"}`);
     if (r.ok) {
@@ -2008,6 +2008,9 @@ function paintStripTools(squad) {
     : "agents add nobody (no spawn role)";
   $("strip-grow").title = squad.spawn_role === "*" ? `an agent whose role may add members can add up to ${squad.spawn_limit} members of any role`
     : target ? `an agent whose role may add members can add up to ${squad.spawn_limit} ${target.title}` : "";
+  // plan first: shown until a plan of this squad is accepted; reads the plan rows already loaded, never fetches
+  $("strip-plan").hidden = !squad.plan_first || (planState.key === squad.id
+    && planState.rows.some((o) => o.status === "accepted" && o.data?.plan?.accepted_ts));
   const strip = $("mesh-strip");
   const rolesSig = state.roles.map((r) => `${r.id}:${r.title}`).join(",");      // a renamed or swapped role rebuilds too
   if (strip.dataset.squad === squad.id && strip.dataset.roles === rolesSig) return;
