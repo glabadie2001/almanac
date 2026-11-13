@@ -1,4 +1,5 @@
 import json
+import sys
 import threading
 import time
 import unittest
@@ -821,7 +822,8 @@ class TaskDiffTests(test_objects.ObjectRig):
         (self.wt / "sub").mkdir()
         self.commit(self.wt / "sub", "d.py")
         self.hand_in("T-1")
-        for path in ("sub\\d.py", "sub/d.py"):
+        # git turns `\` into `/` only on Windows; elsewhere, with --literal-pathspecs, it is part of a file name
+        for path in ("sub/d.py",) + (("sub\\d.py",) if sys.platform == "win32" else ()):
             status, _, res = self.diff(ref="T-1", path=path)
             self.assertEqual(status, 200, res)
             self.assertIn("sub/d.py", res["diff"], path)
