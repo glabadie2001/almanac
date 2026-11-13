@@ -1,18 +1,26 @@
 """Stage 1, tasks as objects: the `objects` / `object_log` store, the four `/api/mesh/` object routes, `re=` on
 mesh_send, `objects_rev`, the squad rules, caps, and the caller resolved by session (two squads sharing a handle)."""
 import json
+import os
+import subprocess
 import urllib.parse
+from unittest import mock
 
 from support import TOKEN
 from test_fleet import CLI
 from test_server_fixes import MeshRig
+from test_spawn_fixes import git
 
-from almanac import uds, web
+from almanac import spawner, uds, web
 
 
 class ObjectRig(MeshRig):
     def setUp(self):
         super().setUp()
+        # the temp folder sits inside Almanac's own checkout: a hand-in must not read that repo's HEAD
+        ceiling = mock.patch.dict(os.environ, GIT_CEILING_DIRECTORIES=str(self.root.resolve()))
+        ceiling.start()
+        self.addCleanup(ceiling.stop)
         for name, squad in (("arch", "sq-1"), ("impl", "sq-1"), ("other", "sq-2")):
             self.store.record_spawn(agent_name=name, session_id=f"sess-{name}", squad_id=squad, role_id=None,
                                     provider="claude", model=None, effort=None, cwd=str(self.root), worktree_path=None,
@@ -61,7 +69,7 @@ class FileTests(ObjectRig):
         msg = self.store.message(doc["log"][0]["message_id"])
         self.assertEqual((msg["from_name"], msg["to_name"], msg["squad_id"]), ("operator", "impl", "sq-1"))
         self.assertEqual(set(doc["log"][0]), {"id", "ts", "agent_name", "role_id", "provider", "kind", "body",
-                                              "status_from", "status_to", "owner_to", "message_id"})
+                                              "status_from", "status_to", "owner_to", "message_id", "sha"})
 
     def test_unowned_is_queued_and_sends_nothing(self):
         status, _, res = self.file()
@@ -454,3 +462,105 @@ class LaunchValidationTests(ElasticRig):
             self.assertEqual(status, 400, res)
         self.assertEqual(self.argv, [], "nobody was started")
         self.assertFalse([s for s in self.store.squads() if s["name"] == "delta"], "no squad row")
+
+
+class HandinTests(ObjectRig):
+    """T-46: a hand-in records the owner's head, branch and base; merge state is read from the squad folder."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        git(self.repo, "init", "-q", "-b", "main")
+        git(self.repo, "config", "user.name", "t")
+        git(self.repo, "config", "user.email", "t@t")
+        (self.repo / "a.py").write_text("one\n", encoding="utf-8")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "base")
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        self.store.db.execute("update squads set cwd = ? where id = 'sq-1'", (str(self.repo),))
+        self.wt = spawner.ensure_worktree(self.repo, self.state, "impl", "sq-1")
+        branch, base = spawner.branch_and_base(self.wt)
+        self.store.record_spawn(agent_name="impl", session_id="sess-impl", squad_id="sq-1", role_id=None,
+                                provider="claude", model=None, effort=None, cwd=str(self.wt),
+                                worktree_path=str(self.wt), pid=0, branch=branch, base=base)
+        self.store.record_spawn(agent_name="arch", session_id="sess-arch", squad_id="sq-1", role_id=None,
+                                provider="claude", model=None, effort=None, cwd=str(self.repo), worktree_path=None,
+                                pid=0)
+
+    def commit(self, where, name):
+        (where / name).write_text(name, encoding="utf-8")
+        git(where, "add", "-A")
+        git(where, "commit", "-q", "-m", name)
+        return git(where, "rev-parse", "HEAD")
+
+    def hand_in(self, ref, who="impl", body="done"):
+        status, _, res = self.log(self.tok(who), ref=ref, status="in review", body=body)
+        self.assertEqual(status, 200, res)
+        return res
+
+    def read(self, ref):
+        return self.get("/api/mesh/object", ref=ref)[2]
+
+    def branches(self):
+        return self.get("/api/mesh/branches", squad="sq-1")[2]["branches"]
+
+    def test_the_spawn_row_holds_the_branch_and_the_commit_it_was_cut_from(self):
+        row = self.store.spawn_by_session("sess-impl")
+        self.assertEqual((row["branch"], row["base"]), ("almanac/sq-1/impl", self.base))
+        self.commit(self.wt, "w.py")
+        self.assertEqual(spawner.branch_and_base(self.wt), ("almanac/sq-1/impl", self.base),
+                         "a respawn into the same worktree reads the same base after commits")
+        self.assertEqual(spawner.branch_and_base(self.root / "nowhere"), (None, None))
+        self.assertIsNone(self.store.spawn_by_session("sess-arch")["branch"], "a shared-folder member has none")
+
+    def test_a_hand_in_records_its_head_a_fix_round_moves_it_and_a_merge_turns_it_merged(self):
+        self.file(owner="impl")
+        first = self.commit(self.wt, "one.py")
+        res = self.hand_in("T-1")
+        obj = res["object"]
+        self.assertEqual((obj["sha"], obj["branch"], obj["base"], obj["merged"]),
+                         (first, "almanac/sq-1/impl", self.base, False))
+        self.assertEqual((res["entry"]["sha"], res["entry"]["body"]), (first, "done"), "a clean worktree adds no note")
+        self.assertEqual(self.branches(), [dict(agent_name="impl", branch="almanac/sq-1/impl", worktree=str(self.wt),
+                                                ahead=1)])
+
+        second = self.commit(self.wt, "two.py")                       # the fix round: still in review
+        res = self.hand_in("T-1", body="fixed F1")
+        self.assertEqual((res["object"]["sha"], res["entry"]["sha"], res["object"]["merged"]), (second, second, False))
+        self.assertEqual([e["sha"] for e in self.read("T-1")["log"][:2]], [second, first])
+        self.assertEqual(self.branches()[0]["ahead"], 2)
+
+        git(self.repo, "merge", "-q", "--no-ff", "-m", "merge", "almanac/sq-1/impl")
+        self.assertIs(self.read("T-1")["object"]["merged"], True, "nobody logged the merge")
+        listed = self.get("/api/mesh/objects", squad="sq-1")[2]["objects"]
+        self.assertEqual([(o["ref"], o["sha"], o["merged"]) for o in listed], [("T-1", second, True)])
+        self.assertEqual(self.branches(), [], "no branch holds commits the checkout lacks")
+
+    def test_an_owner_without_a_worktree_records_the_checkouts_head_and_no_branch(self):
+        self.file(owner="arch")
+        head = self.commit(self.repo, "lead.py")
+        obj = self.hand_in("T-1", who="arch")["object"]
+        self.assertEqual((obj["sha"], obj["branch"], obj["base"], obj["merged"]), (head, None, None, True))
+
+    def test_uncommitted_changes_are_said_on_the_log_row(self):
+        self.file(owner="impl")
+        head = self.commit(self.wt, "one.py")
+        (self.wt / "loose.py").write_text("x", encoding="utf-8")
+        res = self.hand_in("T-1")
+        self.assertEqual(res["object"]["sha"], head)
+        self.assertIn(f"1 uncommitted path(s) in {self.wt} are not in {head[:7]}", res["entry"]["body"])
+        self.assertTrue(res["entry"]["body"].startswith("done"))
+
+    def test_a_git_failure_or_timeout_never_refuses_the_hand_in(self):
+        self.file(owner="impl")
+        with mock.patch.object(spawner.subprocess, "run", side_effect=subprocess.TimeoutExpired("git", 10)):
+            res = self.hand_in("T-1")
+        self.assertEqual((res["object"]["status"], res["object"]["sha"], res["entry"]["sha"]), ("in review", None, None))
+        self.assertIn("no commit recorded: git rev-parse timed out after 10s", res["entry"]["body"])
+        self.store.db.execute("update spawned_agents set worktree_path = ? where session_id = 'sess-impl'",
+                              (str(self.root / "gone"),))
+        res = self.hand_in("T-1", body="again")
+        self.assertIsNone(res["object"]["sha"])
+        self.assertIn("no commit recorded: git rev-parse failed", res["entry"]["body"])
+        self.assertIsNone(res["object"]["merged"])
