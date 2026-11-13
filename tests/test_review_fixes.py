@@ -141,5 +141,6 @@ class CookieHeaderTests(Fixture):
         for raw in (f"{name}={good}", f"other=1; {name}={good}", f"bad[key]=1; {name}={good}",
                     f'a="unterminated; {name}={good}', f"{name}={good}; 2fa=on", f'{name}="{good}"'):
             self.assertTrue(web.valid_session(raw, token, name=name), raw[:24])
-        for raw in (f"{web.COOKIE}={good}", f"x{name}={good}", f"{name}=", "", None, f"{name}={good[:-2]}00"):
+        bad = good[:-1] + ("1" if good[-1] == "0" else "0")    # always differs: a fixed tail equals the real one 1 run in 256
+        for raw in (f"{web.COOKIE}={good}", f"x{name}={good}", f"{name}=", "", None, f"{name}={bad}"):
             self.assertFalse(web.valid_session(raw, token, name=name), raw)
