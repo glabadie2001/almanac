@@ -94,7 +94,7 @@ class DoorTests(Fixture):
         self.assertIn("SameSite=Strict", headers["Set-Cookie"])
         status, _, _ = self.request(self.handler, "/api/fleet", token="", headers={"Cookie": cookie})
         self.assertEqual(status, 200, "the cookie signs the browser in")
-        forged = cookie[:-4] + "0000"
+        forged = cookie[:-1] + ("1" if cookie[-1] == "0" else "0")   # always differs; a fixed tail can equal the real one
         status, _, _ = self.request(self.handler, "/api/fleet", token="", headers={"Cookie": forged})
         self.assertEqual(status, 401)
         status, _, doc = self.request(self.handler, "/api/ingest", token="", method="POST",
