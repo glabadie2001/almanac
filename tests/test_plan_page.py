@@ -29,6 +29,11 @@ class PlanOrderTests(unittest.TestCase):
         got = run_js(f"planOrder({ROWS}, 'T-7').map((x) => [x.row.ref, x.depth])")
         self.assertEqual(got, [["T-8", 1], ["T-10", 2], ["T-9", 1], ["T-12", 2]])
 
+    def test_a_nested_plan_and_its_slices_are_left_out(self):
+        got = run_js("planOrder([{ref:'T-8',parent:'T-7',data:{}},{ref:'T-20',parent:'T-7',data:{plan:{}}},"
+                     "{ref:'T-21',parent:'T-20',data:{}}], 'T-7').map((x) => [x.row.ref, x.depth])")
+        self.assertEqual(got, [["T-8", 1]])
+
     def test_no_slices_and_a_cycle_end(self):
         self.assertEqual(run_js("planOrder([], 'T-7')"), [])
         self.assertEqual(run_js("planOrder([{ref:'T-1',parent:'T-2'},{ref:'T-2',parent:'T-1'}], 'T-1').length"), 1)

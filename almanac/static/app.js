@@ -2448,13 +2448,13 @@ function decideBar(o) {
 }
 
 // plan-page:begin
-// a plan's descendants in the rows' order, a parent before its parts, each with its depth below the plan (1: a slice)
+// a plan's descendants (not a nested plan's) in the rows' order, a parent before its parts, each with its depth below the plan (1: a slice)
 function planOrder(rows, planRef) {
   const kids = new Map(), out = [], seen = new Set([planRef]);
   for (const o of rows) if (o.parent) kids.set(o.parent, [...(kids.get(o.parent) || []), o]);
   const walk = (ref, depth) => {
     for (const o of kids.get(ref) || []) {
-      if (seen.has(o.ref)) continue;
+      if (seen.has(o.ref) || o.data?.plan) continue;      // a nested plan is decided on its own, with its slices
       seen.add(o.ref); out.push({ row: o, depth }); walk(o.ref, depth + 1);
     }
   };
@@ -2516,16 +2516,25 @@ async function loadTask(ref) {
   // bottom because new log entries arrive at the top; only a newly opened task, or a reader at the top, starts at the top
   const slices = o.data?.plan ? await planPage(o, planState.rows) : [];
   if (meshState.selTask !== ref) return;
-  const feed = $("mesh-ctx-feed"), fromBottom = feed.scrollTop ? feed.scrollHeight - feed.scrollTop : 0;
+  const feed = $("mesh-ctx-feed");
+  // nothing changed since the last paint (a 30 s or objects_rev refresh): leave the nodes, so a selection or a scrolled <pre> stays
+  const sig = JSON.stringify([o.ref, o.body, o.files, log.map((l) => l.id ?? [l.ts, l.kind, l.body]), slices.map((n) => n.textContent)]);
+  if (feed.childElementCount && feed.dataset.sig === sig) return;
+  feed.dataset.sig = sig;
+  // a reader in the log is anchored from the bottom (new entries arrive at the top of the log); above it, the plan and
+  // its slices, the position is kept as it is
+  const top = feed.scrollTop, first = feed.querySelector("li[data-log]");
+  const inLog = first && top >= first.getBoundingClientRect().top - feed.getBoundingClientRect().top + top;
+  const fromBottom = inLog ? feed.scrollHeight - top : 0;
   feed.replaceChildren(
     el("li", { cls: "you" }, o.body ? renderMd(o.body) : "(no body)"),
     ...slices,
     el("li", { cls: "result", text: o.files?.length ? `files: ${o.files.join(", ")}` : "files: none" }),
     ...(log.length
-      ? log.map((l) => el("li", { cls: logCls(l.kind), title: new Date(l.ts * 1000).toLocaleString() }, logHead(l), l.body ? renderMd(l.body) : null))
+      ? log.map((l) => el("li", { cls: logCls(l.kind), "data-log": "1", title: new Date(l.ts * 1000).toLocaleString() }, logHead(l), l.body ? renderMd(l.body) : null))
       : [el("li", { cls: "result", text: "no log entries yet" })]),
   );
-  feed.scrollTop = fromBottom ? feed.scrollHeight - fromBottom : 0;   // the log is newest first
+  feed.scrollTop = inLog ? feed.scrollHeight - fromBottom : top;   // the log is newest first
 }
 
 // ------------------------------------------------------------------ mesh: backlog (tasks no squad has taken yet)
