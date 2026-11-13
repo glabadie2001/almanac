@@ -853,7 +853,8 @@ class FreshReviewerTests(ObjectRig):
         self.assertEqual(self.counts(), {"arch": 1}, "the standing reviewer is not also told: no double review")
         kickoff = self.argv[0][-1]
         for part in ("## Your task (`T-1`): store slice", "Build the store slice.", "store.py; 12 OK",
-                     'mesh_diff(ref="T-1")', "owner `impl`", "lead `arch`", "edit nothing"):
+                     'mesh_diff(ref="T-1")', "lows to the owner `impl` only", "mediums and highs to the owner and the "
+                     "lead `arch`", "edit nothing"):
             self.assertIn(part, kickoff)
         [note] = self.hub_rows()
         self.assertIn(f"rev-claude (reviewer-claude) started to review T-1, session {mine['session_id']}", note)
@@ -922,14 +923,24 @@ class FreshReviewerTests(ObjectRig):
         self.file(self.tok("arch"), owner="impl")
         self.hand_in()
         mine = self.reviewer()
-        status, _, res = self.log(self.tok("arch"), ref="T-1", status="accepted")
+        self.go_live(mine["agent_name"], mine["session_id"], 9001)        # running: it is ended, not just marked
+        killed = []
+
+        def kill(pid, created):
+            killed.append(pid)
+            self.machine.procs.pop(pid, None)
+            return True, "SUCCESS", {}
+        with mock.patch.object(self.fleet, "kill", side_effect=kill):
+            status, _, res = self.log(self.tok("arch"), ref="T-1", status="accepted")
         self.assertEqual(status, 200, res)
+        self.assertEqual(killed, [9001], "the fresh reviewer's process, not the standing reviewer's")
         self.assertIsNotNone(self.store.spawn_by_session(mine["session_id"])["retired_ts"])
         self.assertIsNone(self.store.spawn_by_session("sess-rev")["retired_ts"])
         self.assertEqual(self.store.squad("sq-1")["spawn_used"], 0, "its slot comes back")
         retired = [e["body"] for e in self.task()["log"] if e["kind"] == "retired"]
         self.assertEqual(len(retired), 1)
         self.assertIn("rev-claude retired on T-1", retired[0])
+        self.assertIn("was ended", retired[0])
 
     def test_two_tasks_handed_in_back_to_back_get_two_reviewers(self):
         self.file(self.tok("arch"), owner="impl")
@@ -941,23 +952,58 @@ class FreshReviewerTests(ObjectRig):
         self.assertEqual(names, ("rev-claude", "rev-claude-2"))
         self.assertIn("## Your task (`T-2`)", self.argv[1][-1])
 
-    def test_a_start_that_runs_late_checks_the_task_again(self):                          # L1
+    def queue_starts(self):
+        """_start_reviewer held back: each queued start is (real function, its arguments), run when the test says."""
         from almanac import door
-        real, queued = door._start_reviewer, []
+        queued = []
+        patcher = mock.patch.object(door, "_start_reviewer", side_effect=lambda *a: queued.append(a))
+        return door._start_reviewer, queued, patcher
+
+    def test_hand_ins_while_a_start_is_in_flight_tell_no_reviewer_and_start_none(self):       # F1a, F1c
+        real, queued, patcher = self.queue_starts()
+        heads = iter([dict(sha="a" * 40, branch="almanac/sq-1/impl", base="b" * 40),
+                      dict(sha="c" * 40, branch="almanac/sq-1/impl", base="b" * 40),
+                      dict(sha="d" * 40, branch="almanac/sq-1/impl", base="b" * 40)])
         self.file(self.tok("arch"), owner="impl")
-        with mock.patch.object(door, "_start_reviewer", side_effect=lambda *a: queued.append(a)):
-            self.hand_in()                                 # back to in progress and in again before either start runs
+        self.clear()
+        with patcher, mock.patch("almanac.door.handin_head", side_effect=lambda *a: (next(heads), "")):
+            self.hand_in(body="v1")
+            self.hand_in(body="v2")                        # a retry or quick fix round, in review again
             self.log(self.tok("impl"), ref="T-1", status="in progress", body="one more")
-            self.hand_in(body="again")
-            self.file(self.tok("arch"), owner="impl")
-            self.hand_in("T-2")
-        self.assertEqual(len(queued), 3)
+            self.hand_in(body="v3")                        # in review from another status, start still in flight
+        self.assertEqual(len(queued), 1, "one start queued for the task")
+        self.assertNotIn("rev", self.counts(), "the standing reviewer is not told while a start is in flight")
         real(*queued[0])
-        real(*queued[1])
-        self.assertEqual((len(self.argv), self.reviewer()["agent_name"]), (1, "rev-claude"), "one task, one reviewer")
-        self.log(self.tok("arch"), ref="T-2", status="accepted")   # accepted before its start ran
-        real(*queued[2])
-        self.assertEqual((len(self.argv), self.reviewer("T-2"), self.hub_rows("T-2")), (1, None, []))
+        self.assertEqual((len(self.argv), self.counts().get("rev")), (1, None), "one reviewer, no double review")
+        kickoff = self.argv[0][-1]
+        self.assertIn("commit ddddddd", kickoff, "the kickoff names the latest hand-in's commit")
+        self.assertNotIn("commit aaaaaaa", kickoff)
+        self.assertEqual(self.service.review_starts, set(), "done: out of the in-flight set")
+
+    def test_a_start_that_runs_late_checks_the_task_again(self):                          # L1
+        real, queued, patcher = self.queue_starts()
+        self.file(self.tok("arch"), owner="impl")
+        with patcher:
+            self.hand_in()
+        self.log(self.tok("arch"), ref="T-1", status="accepted")    # accepted before its start ran
+        real(*queued[0])
+        self.assertEqual((len(self.argv), self.reviewer(), self.hub_rows()), (0, None, []))
+        self.file(self.tok("arch"), owner="impl")                   # T-2: a reviewer already on record
+        self.hand_in("T-2")
+        real(*queued[0][:1], self.store.object_row(2), *queued[0][2:])
+        self.assertEqual(len(self.argv), 1, "one task, one reviewer")
+
+    def test_crossing_hand_ins_whose_start_falls_back_write_one_row_and_one_notice(self):     # F1b
+        self.store.update_squad("sq-1", spawn_limit=0)
+        real, queued, patcher = self.queue_starts()
+        self.file(self.tok("arch"), owner="impl")
+        self.clear()
+        with patcher:
+            self.hand_in(body="v1")
+            self.hand_in(body="v2")
+        self.assertEqual(len(queued), 1)
+        real(*queued[0])
+        self.assertEqual((len(self.hub_rows()), self.counts().get("rev")), (1, 1))
 
     def test_a_restart_between_the_hand_in_and_the_fix_round_still_finds_the_reviewer(self):
         self.file(self.tok("arch"), owner="impl")

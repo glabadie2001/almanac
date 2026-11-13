@@ -136,6 +136,10 @@ class Service:
         self.ingesting = threading.Lock()
         self.fleet_lock = threading.Lock()
         self.spawn_lock = threading.Lock()            # an agent's limit check and its spawn are one step
+        # ids of tasks whose fresh reviewer start is queued or running (_start_reviewer), under a lock of their own:
+        # a hand-in checks it without ever waiting on spawn_lock
+        self.review_starts: set[int] = set()
+        self.review_lock = threading.Lock()
         self.error = ""
         self.exit_code = 0                            # what `python -m almanac` returns when the door stops
         self.on_exit = None                           # set by __main__: stops the server; tests inject their own
@@ -1868,14 +1872,23 @@ def launched_reviewer_role(service, squad: dict) -> dict | None:
     return service.store.role(first["role_id"]) if first else None
 
 
-def _start_reviewer(service, row: dict, role: dict, head: dict | None, notice: str, told: set, agent, caller,
+def _start_reviewer(service, row: dict, role: dict, notice: str, told: set, agent, caller,
                     hub: tuple[str, str]) -> None:
     """Run once a task's first hand-in is answered: start one fresh member of `role` on it, whose kickoff is the task,
     its log and how to review it, and record it on the task (data.reviewer) so a fix round reaches it and accepting
     the task retires it (context_boundary). It counts toward the squad's spawn limit like any member, but it is the
     hub's spawn, not an agent's mesh_spawn, so the squad's spawn_role does not bind it. When the limit is used up or
     the start fails for any reason, the standing reviewers get the hand-in's notice instead and the task's log says
-    why: the hand-in itself has already been answered."""
+    why: the hand-in itself has already been answered. The task stays in service.review_starts (entered by
+    log_to_object) until this is done, so a hand-in crossing it tells no reviewer and starts nothing."""
+    try:
+        _start_reviewer_now(service, row, role, notice, told, agent, caller, hub)
+    finally:
+        with service.review_lock:
+            service.review_starts.discard(row["id"])
+
+
+def _start_reviewer_now(service, row, role, notice, told, agent, caller, hub) -> None:
     from almanac import spawner
     ref = ref_of(row)
     try:
@@ -1891,12 +1904,12 @@ def _start_reviewer(service, row: dict, role: dict, head: dict | None, notice: s
                 why = f"{used}/{limit} of the squad's spawn limit used"
             else:
                 name = spawner.free_handle(service, squad, role)
-                log =list(reversed(service.store.object_log(row["id"], 100_000)))
+                log = list(reversed(service.store.object_log(row["id"], 100_000)))
                 res = spawner.spawn_agent(
                     service, almanac_url=hub[0], token=hub[1], cwd=squad["cwd"], agent_name=name, role_id=role["id"],
                     provider=role["provider"], workspace_mode="shared",
                     initial_prompt=lambda room: task_kickoff(fresh, log, squad, room,
-                                                             _reviewer_tail(service, fresh, squad, name, head)),
+                                                             _reviewer_tail(service, fresh, squad, name)),
                     squad_id=squad["id"], squad_name=squad["name"], spawned_by=HUB["agent_name"],
                     teammates=spawner.squad_roster(service, squad))
                 if res.get("ok"):
@@ -1918,18 +1931,20 @@ def _start_reviewer(service, row: dict, role: dict, head: dict | None, notice: s
                       squad=row["squad_id"])
 
 
-def _reviewer_tail(service, row: dict, squad: dict, name: str, head: dict | None) -> str:
-    """What a fresh reviewer is to do: the hand-in's branch and commit, how to read the diff, where findings go."""
+def _reviewer_tail(service, row: dict, squad: dict, name: str) -> str:
+    """What a fresh reviewer is to do: the latest hand-in's branch and commit (`row` as it stands now), how to read the
+    diff, where findings go."""
     ref = ref_of(row)
     owner = (service.store.spawn_by_session(row["owner_session"]) or {}).get("agent_name") if row["owner_session"] else None
     lead = (squad_lead(service, squad) or {}).get("agent_name")
     return (f"You are `{name}`, a fresh reviewer the hub started on {ref}'s hand-in: branch "
-            f"{(head or {}).get('branch') or '(none)'}, commit "
-            f"{head['sha'][:7] if head and head.get('sha') else '(no commit recorded)'}. You review this task only, "
+            f"{row.get('branch') or '(none)'}, commit "
+            f"{row['sha'][:7] if row.get('sha') else '(no commit recorded)'}. You review this task only, "
             "edit nothing, and are retired when it is accepted. Read the diff with "
             f"`mesh_diff(ref=\"{ref}\")` (stat, path or commit narrow it) and run the tests of the files it touches. "
-            f"Send findings (file:line, what breaks, how to reproduce) to the owner `{owner or '(none)'}`, and your "
-            f"verdict (sign-off or the open findings) to the lead `{lead or '#squad'}`, with `mesh_send(..., "
+            "Rate each finding (file:line, what breaks, how to reproduce) low, medium or high. Send lows to the owner "
+            f"`{owner or '(none)'}` only, mediums and highs to the owner and the lead `{lead or '#squad'}`, and your "
+            f"verdict to the lead, listing every finding with its rating and state, each with `mesh_send(..., "
             f"re=\"{ref}\")`. A fix round on this task comes to you as a message with its new commit.")
 
 
@@ -1991,13 +2006,19 @@ def log_to_object(service, agent, caller, body: dict, *, after: list | None = No
         if mine:
             live = {p["session_id"] for p in service.mesh_peers(squad_id=row["squad_id"]) if p.get("session_id")}
             reviewers = (mine["agent_name"], mine["session_id"]) if mine.get("session_id") in live else "standing"
-        elif status == "in review" and hub:
-            fresh = launched_reviewer_role(service, service.store.squad(row["squad_id"]) or {})
-            reviewers = None if fresh else "standing"
+        elif hub:
+            role = (launched_reviewer_role(service, service.store.squad(row["squad_id"]) or {})
+                    if status == "in review" else None)
+            with service.review_lock:
+                if row["id"] in service.review_starts:
+                    reviewers = None         # a start in flight covers it; its fallback tells the standing reviewers
+                elif role:
+                    service.review_starts.add(row["id"])
+                    fresh, reviewers = role, None
     if status or handin:                 # a fix round (in review again) notifies like the first hand-in
         notice, told = _notify(service, row, who, status, handin, head, text, agent, caller, reviewers=reviewers)
         if fresh:
-            later.append(lambda: _start_reviewer(service, row, fresh, head, notice, told, agent, caller, hub))
+            later.append(lambda: _start_reviewer(service, row, fresh, notice, told, agent, caller, hub))
     if status == "accepted":
         context_boundary(service, service.store.object_row(row["id"]), caller if agent else None, after=later)
     doc = dict(object=object_docs(service, [service.store.object_row(row["id"])], body=True)[0],
