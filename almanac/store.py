@@ -154,8 +154,8 @@ IMPLEMENTER = (
 FULL_SUITE = "python -m unittest discover tests"
 REVIEWER_COMMANDS = ["git status --short", "git diff", "git diff --stat", FULL_SUITE]
 REVIEWER = (
-    "You are the Cross-Model Peer Reviewer: you do not edit code. Read the implementer's diff and live context "
-    "(`mesh_context_stream`), run the tests yourself, and probe edge cases. Send findings (file:line, what breaks, "
+    "You are the Cross-Model Peer Reviewer: you do not edit code. Read the implementer's diff (`mesh_diff(ref)`) and "
+    "live context (`mesh_context_stream`), run the tests yourself, and probe edge cases. Send findings (file:line, what breaks, "
     "how to reproduce) to the implementer, and sign-off or the open findings to the architect, over `mesh_send`."
 )
 ORCHESTRATOR = (
@@ -170,6 +170,12 @@ ORCHESTRATOR = (
 # the briefs as first shipped; a stored role still equal to one of these is upgraded once (schema v4)
 OLD_ARCHITECT = "You are the Lead Architect. Break down missions into clear stages and contracts, inspect teammates' live context streams (`mesh_context_stream`) before unblocking dependencies, and coordinate handoffs over `mesh_send`."
 OLD_IMPLEMENTER = 'You are a Software Implementer. Own your assigned slice end-to-end with tests, check peer context and contact streams (`mesh_context_stream`, `mesh_contact_stream`) to stay aligned on shared interfaces, and report wave completion to the architect/reviewer via `mesh_send`.'
+# the reviewer brief before it named `mesh_diff` (T-38); a stored reviewer still equal to it is upgraded on open
+PREV_REVIEWER = (
+    "You are the Cross-Model Peer Reviewer: you do not edit code. Read the implementer's diff and live context "
+    "(`mesh_context_stream`), run the tests yourself, and probe edge cases. Send findings (file:line, what breaks, "
+    "how to reproduce) to the implementer, and sign-off or the open findings to the architect, over `mesh_send`."
+)
 OLD_REVIEWER = "You are the Cross-Model Peer Reviewer. Watch implementers' context streams (`mesh_context_stream`), verify diffs, edge cases, and test results when notified, and send actionable sign-off or findings back over `mesh_send`."
 
 DEFAULT_ROLES = (
@@ -446,6 +452,9 @@ class Store:
             self._insert_role(next(r for r in DEFAULT_ROLES if r["id"] == "orchestrator-claude"), ignore=True)
         # v10: work objects (`objects`, `object_log`) are new tables in SCHEMA; nothing to backfill
         self.db.execute("insert or replace into meta values ('schema', '10')")
+        # T-38: idempotent, so no schema step; a reviewer brief the operator edited is left alone
+        self.db.execute("update roles set system_prompt = ?, updated_ts = ? where id in ('reviewer-gemini', "
+                        "'reviewer-claude') and system_prompt = ?", (REVIEWER, time.time(), PREV_REVIEWER))
         if not seeded:
             for r in DEFAULT_ROLES:
                 self._insert_role(r)

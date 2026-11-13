@@ -12,6 +12,7 @@ CLI mode (usable from any agent shell or script):
     python -m almanac.mcp_mesh --cli wait [--timeout 120]      (the operator's scripts; an agent ends its turn instead)
     python -m almanac.mcp_mesh --cli objects [--status <s,..>] [--owner <name|none>] [--q <text>]
     python -m almanac.mcp_mesh --cli object <ref> [--log-limit 20]
+    python -m almanac.mcp_mesh --cli diff <ref> [--stat] [--path <p>] [--commit <sha>]
     python -m almanac.mcp_mesh --cli file <title> [--body <text>] [--files <path> ...] [--owner <name>] [--parent <ref>]
     python -m almanac.mcp_mesh --cli log <ref> [<body...>] [--kind <k>] [--status <s>] [--owner <name>] [--parent <ref>|""]
     python -m almanac.mcp_mesh --cli amend <ref> [--title <t>] [--body <text>] [--files <path> ...]
@@ -220,6 +221,24 @@ MCP_TOOLS = [
             "properties": {
                 "ref": {"type": "string", "description": "The ref, e.g. 'T-12' (or the bare id)."},
                 "log_limit": {"type": "integer", "description": "Log entries to return (default 20, max 500)."},
+            },
+            "required": ["ref"],
+        },
+    },
+    {
+        "name": "mesh_diff",
+        "description": ("Read what a handed-in task changed: the diff of its `base..sha` (its owner's branch against the "
+                        "commit it was cut from), in one call, without the builder's worktree. Read-only, your squad's "
+                        "tasks only. The whole result stays within 60,000 characters: past that it is cut, with "
+                        "`truncated: true` and `stat_text` (the --stat, or only its totals when that is long); read "
+                        "the rest with `stat` and `path`."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "The task's ref, e.g. 'T-12'."},
+                "stat": {"type": "boolean", "description": "Only the --stat: which files changed, how much."},
+                "path": {"type": "string", "description": "Only this repo-relative path."},
+                "commit": {"type": "string", "description": "Only this commit (hex id), one of the task's own."},
             },
             "required": ["ref"],
         },
@@ -496,6 +515,14 @@ class MeshClient:
             if not ref:
                 raise ValueError("ref is required")
             return self._api(f"/api/mesh/object?{urllib.parse.urlencode({'ref': ref, 'log_limit': int(args.get('log_limit') or 20)})}")
+        if name == "mesh_diff":
+            ref = str(args.get("ref") or "").strip()
+            if not ref:
+                raise ValueError("ref is required")
+            params = dict(ref=ref, **{k: str(args[k]) for k in ("path", "commit") if args.get(k)})
+            if args.get("stat"):
+                params["stat"] = 1
+            return self._api(f"/api/mesh/diff?{urllib.parse.urlencode(params)}")
         if name == "mesh_file":
             payload = {k: args[k] for k in ("kind", "title", "body", "files", "owner", "parent", "status", "backlog",
                                             "roster", "spawn_role") if args.get(k)}
@@ -668,6 +695,12 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
     p_obj.add_argument("ref")
     p_obj.add_argument("--log-limit", type=int, default=20)
 
+    p_diff = sp.add_parser("diff")
+    p_diff.add_argument("ref")
+    p_diff.add_argument("--stat", action="store_true")
+    p_diff.add_argument("--path")
+    p_diff.add_argument("--commit")
+
     p_file = sp.add_parser("file")
     p_file.add_argument("title")
     p_file.add_argument("--body", default="")
@@ -731,6 +764,8 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
                                                                          "backlog")})
     elif ns.cmd == "object":
         res = client.call_tool("mesh_object", {"ref": ns.ref, "log_limit": ns.log_limit})
+    elif ns.cmd == "diff":
+        res = client.call_tool("mesh_diff", {"ref": ns.ref, "stat": ns.stat, "path": ns.path, "commit": ns.commit})
     elif ns.cmd == "file":
         res = client.call_tool("mesh_file", {"kind": ns.kind, "title": ns.title, "body": ns.body, "files": ns.files,
                                              "owner": ns.owner, "parent": ns.parent, "status": ns.status,

@@ -445,7 +445,7 @@ def stage_agy_mesh_bundle(
     rules_md = (
         "---\nname: almanac-mesh\ndescription: Cross-model peer context/contact streams and uds-messaging.\n---\n\n"
         "Use `mesh_roster`, `mesh_context_stream`, `mesh_contact_stream`, and `mesh_send`, and for tasks "
-        "(refs like `T-12`) `mesh_objects`, `mesh_object`, `mesh_file`, `mesh_log` and `mesh_amend` "
+        "(refs like `T-12`) `mesh_objects`, `mesh_object`, `mesh_diff`, `mesh_file`, `mesh_log` and `mesh_amend` "
         "(via `call_mcp_tool` with `ServerName=\"almanac-mesh_almanac-mesh\"` or `python -m almanac.mcp_mesh --cli`) "
         "to inspect Claude and Gemini teammates' live streams and coordinate over `uds-messaging`.\n"
     )

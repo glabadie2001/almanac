@@ -16,6 +16,8 @@ POST /api/mesh/send          deliver over Claude's `uds-messaging` protocol (dir
                              if its role may page the operator, or to answer the operator's last message
 GET  /api/mesh/branches?squad= the squad's member branches holding commits not in its folder's HEAD, each with
                              `ahead` (its commit count past HEAD) or the `error` git gave
+GET  /api/mesh/diff?ref=      a handed-in task's diff `base..sha` (read-only; `stat=1`, `path=`, `commit=` one commit in
+                             that range), kept within 60,000 characters (`truncated`, `stat_text`)
 GET  /api/worktime           per agent: work / wait / idle seconds and per-bucket heat, plus how the agents overlapped
                              (`squad=` or `sessions=a,b,c`, optional `bucket=` seconds); `messages` and `marks`
                              (errors, edits) for the swimlane
@@ -1460,6 +1462,61 @@ def squad_branches(service, agent, caller, query: dict) -> dict:
     return dict(squad=squad_id, branches=out)
 
 
+DIFF_CAP = 60_000          # characters of diff in one tool result; past it the rest is cut and the --stat comes along
+_HEX = re.compile(r"[0-9a-f]{4,40}")
+
+
+def task_diff(service, agent, caller, query: dict) -> dict:
+    """GET /api/mesh/diff?ref=: what a handed-in task changed, `base..sha` (`commit`: one commit in that range;
+    `stat`: --stat only; `path`: one repo-relative path), read in its squad's folder, whose object store its worktree
+    branches share. Read-only: every git argument comes from the task row or is checked here, and the ref goes through
+    the caller's squad boundary (load_object). A task with nothing to diff answers `diff: None` and a `reason`."""
+    from almanac.spawner import git_try
+    row = load_object(service, agent, caller, query.get("ref") or "")
+    stat = _flag(query.get("stat"))
+    path = str(query.get("path") or "").strip()
+    commit = str(query.get("commit") or "").strip().lower()
+    if path and (os.path.isabs(path) or re.match(r"[A-Za-z]:|[\\/:]", path) or ".." in re.split(r"[\\/]", path)):
+        raise ValueError(f"path {path!r}: send a repo-relative path without '..'")
+    if commit and not _HEX.fullmatch(commit):
+        raise ValueError(f"commit {commit!r}: send 4 to 40 hex digits")
+    ref, lo, hi = ref_of(row), row["base"], row["sha"]
+    out = dict(ref=ref, base=lo, sha=hi, commit=None, path=path or None, stat=stat, diff=None)
+    cwd = (service.store.squad(row["squad_id"] or "") or {}).get("cwd")
+    if not hi or not lo:
+        return dict(out, reason=f"{ref} has no {'sha' if not hi else 'base'}: it has not been handed in from a "
+                                "worktree branch")
+    if not cwd or not (_HEX.fullmatch(lo) and _HEX.fullmatch(hi)):
+        return dict(out, reason=f"{ref} has no squad folder or commit ids to diff")
+    if commit:
+        ok, listed = git_try(cwd, "rev-list", f"{lo}..{hi}", "--")
+        if not ok:
+            return dict(out, reason=listed)
+        found = [c for c in listed.split() if c.startswith(commit)]
+        if len(found) != 1:
+            raise ValueError(f"commit {commit}: {'ambiguous' if found else 'not'} in {ref}'s {lo[:7]}..{hi[:7]}")
+        lo, hi = f"{found[0]}^", found[0]
+        out["commit"] = found[0]
+
+    def diff(*extra):
+        # --literal-pathspecs: `path` is a path, never pathspec magic; no external diff driver or textconv runs
+        return git_try(cwd, "--literal-pathspecs", "diff", "--no-color", "--no-ext-diff", "--no-textconv", *extra,
+                       lo, hi, "--", *([path] if path else []))
+    ok, text = diff("--stat") if stat else diff()
+    if not ok:
+        return dict(out, reason=text)
+    if len(text) <= DIFF_CAP:
+        return dict(out, diff=text, truncated=False)
+    # the whole result stays within the cap: the --stat when it fits a quarter of it (and is not the cut text
+    # itself), else the one-line --shortstat; the diff gets what is left
+    ok, summary = (False, "") if stat else diff("--stat")
+    if not ok or len(summary) > DIFF_CAP // 4:
+        ok, summary = diff("--shortstat")
+    summary = summary if ok else ""
+    return dict(out, diff=text[:max(0, DIFF_CAP - len(summary))], truncated=True, chars=len(text),
+                stat_text=summary or None)
+
+
 def log_doc(entry: dict) -> dict:
     return {k: entry[k] for k in LOG_FIELDS}
 
@@ -2380,6 +2437,9 @@ def make_handler(service, token, *, hosts=()):
                 if path == "/api/mesh/branches":
                     caller = service.caller(self.agent, self.agent_session)
                     return self._send(200, squad_branches(service, self.agent, caller, query))
+                if path == "/api/mesh/diff":
+                    caller = service.caller(self.agent, self.agent_session)
+                    return self._send(200, task_diff(service, self.agent, caller, query))
                 if path == "/api/mesh/object":
                     caller = service.caller(self.agent, self.agent_session)
                     row = load_object(service, self.agent, caller, query.get("ref") or "")
