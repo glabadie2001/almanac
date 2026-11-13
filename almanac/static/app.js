@@ -2474,12 +2474,14 @@ async function planPage(plan, rows) {
     Object.assign(planPages, { ref: plan.ref, sig, bodies, pending: Promise.all(slices.map(async ({ row }) => {
       try { bodies[row.ref] = (await planGet(`/api/mesh/object?ref=${encodeURIComponent(row.ref)}`))?.object?.body ?? ""; }
       catch (err) { bodies[row.ref] = null; }
-    })) });
+    })).then(() => {                                  // a failed GET is retried by the next refresh, not in a loop
+      if (planPages.bodies === bodies && Object.values(bodies).includes(null)) planPages.sig = "";
+    }) });
   }
-  const pending = planPages.pending;
+  const { pending, bodies } = planPages;               // this call's own, not a later call's
   await pending;
   return slices.flatMap(({ row, depth }) => {
-    const body = planPages.bodies[row.ref], tier = [row.data?.model, row.data?.effort].filter(Boolean).join(", ");
+    const body = bodies[row.ref], tier = [row.data?.model, row.data?.effort].filter(Boolean).join(", ");
     return [el("li", { cls: "result" }, depth > 1 ? el("span", { cls: "dim", text: "└ " }) : null, el("span", { cls: "cyan", text: row.ref }), ` ${row.title} `,
         statusPill(row.status), tier ? el("span", { cls: "dim", text: ` ${tier}` }) : null),
       el("li", { cls: "you" }, body ? renderMd(body) : el("span", { cls: "dim", text: body === null ? "(could not load this slice)" : "(no body)" }))];
