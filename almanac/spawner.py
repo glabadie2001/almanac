@@ -861,6 +861,7 @@ def launch_squad(
     spawn_role: str | None = None,
     spawn_limit: int = 0,
     lead_task: dict | None = None,
+    plan_first: bool = False,
 ) -> dict:
     """Spawn a multi-agent cross-model squad with pre-wired peer rosters and a shared kickoff brief.
     `spawn_role` / `spawn_limit`: what an agent whose role may_spawn can add later (see `join_squad`).
@@ -907,7 +908,7 @@ def launch_squad(
         # through the launch would leave the members already started orphaned
         prepared[-1]["files"] = _task_files(prepared[-1]["task"], spec.get("files"), str(repo_dir))
     squad_doc = service.store.create_squad(squad_id, name or squad_slug, str(repo_dir), brief or "",
-                                           spawn_role=spawn_role, spawn_limit=spawn_limit)
+                                           spawn_role=spawn_role, spawn_limit=spawn_limit, plan_first=plan_first)
 
     roster_preview = [
         dict(

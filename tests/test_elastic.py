@@ -181,7 +181,18 @@ class OperatorTests(ElasticRig):
         self.assertEqual(self.request(self.handler, "/api/squad", method="POST", body={"id": "nope", "spawn_limit": 1})[0], 404)
         _, _, mesh = self.request(self.handler, "/api/mesh")
         beta = next(s for s in mesh["squads"] if s["id"] == "sq-2")
-        self.assertEqual((beta["spawn_limit"], beta["spawn_used"]), (3, 0))
+        self.assertEqual((beta["spawn_limit"], beta["spawn_used"], beta["plan_first"]), (3, 0, False))
+
+    def test_the_operator_turns_plan_first_on_and_off(self):                                       # T-55
+        status, _, res = self.request(self.handler, "/api/squad", method="POST", body={"id": "sq-1", "plan_first": True})
+        self.assertEqual((status, res["squad"]["plan_first"], res["squad"]["spawn_limit"]), (200, True, 2), "the rest kept")
+        self.assertIn("plan first", self.store.actions()[0]["detail"])
+        self.assertEqual(self.spawn()[0], 403, "no ref: refused")
+        self.request(self.handler, "/api/squad", method="POST", body={"id": "sq-1", "plan_first": "false"})
+        self.assertFalse(self.store.squad("sq-1")["plan_first"])
+        self.assertEqual(self.spawn()[0], 200)
+        self.assertEqual(self.request(self.handler, "/api/squad", token=web.agent_token(TOKEN, "arch"), method="POST",
+                                      body={"id": "sq-1", "plan_first": False})[0], 403, "never an agent's to change")
 
     def test_agent_tokens_cannot_reach_the_operators_routes(self):
         agent = web.agent_token(TOKEN, "arch")
@@ -249,7 +260,7 @@ class MigrationV7Tests(Fixture):
         Store(path).close()
         db = sqlite3.connect(path)
         for table, column in (("spawned_agents", "spawned_by"), ("squads", "spawn_role"), ("squads", "spawn_limit"),
-                              ("roles", "may_spawn")):
+                              ("squads", "plan_first"), ("roles", "may_spawn")):
             db.execute(f"alter table {table} drop column {column}")
         db.execute("insert into squads (id, name, cwd, created_ts) values ('old', 'old', '.', 1)")
         db.execute("insert into spawned_agents (session_id, agent_name, squad_id, provider, cwd, created_ts) "
@@ -260,7 +271,8 @@ class MigrationV7Tests(Fixture):
         s = Store(path)
         self.addCleanup(s.close)
         old = s.squad("old")
-        self.assertEqual((old["spawn_role"], old["spawn_limit"], old["spawn_used"]), (None, 0, 0))
+        self.assertEqual((old["spawn_role"], old["spawn_limit"], old["spawn_used"], old["plan_first"]), (None, 0, 0, False),
+                         "a running squad stays off plan-first")
         self.assertIsNone(s.spawned()[0]["spawned_by"])
         self.assertEqual({r["id"] for r in s.roles() if r["may_spawn"]},
                          {"architect-claude", "architect-gemini", "orchestrator-claude"})   # v10 adds the orchestrator

@@ -305,6 +305,8 @@ details table td:first-child, details table th:first-child { text-align: left; }
 .unread { color: var(--bg); background: var(--hi); padding: 0 4px; font-size: 11px; }
 #inbox-feed li.from-op .msg-body { color: var(--cyan); }
 .check-field label { display: flex; gap: 6px; align-items: center; color: var(--fg); font-size: inherit; padding-top: 16px; }
+.check-field.span-all label { padding-top: 0; }   /* the top padding lines a box up with a labelled field beside it */
+.check-field input[type="checkbox"] { width: auto; flex: none; border: 0; padding: 0; accent-color: var(--hi); }   /* not .field input's 100% */
 .feed-kinds { padding-top: 0; padding-bottom: 2px; }
 @media (max-width: 760px) { .inbox-split { grid-template-columns: minmax(0, 1fr); } }
 
