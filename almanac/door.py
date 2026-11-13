@@ -1758,21 +1758,35 @@ def _notify(service, row: dict, who: dict, status, handin: bool, head: dict | No
                    f"{head['sha'][:7] if head and head.get('sha') else 'no commit recorded'}")
     notice += f"\n\n{text}" if text else ""
     by_creator = (row["created_by"] == who.get("session")) if row["created_by"] else row["created_by_name"] == who["agent_name"]
-    to = []                              # (name, session)
+    to = {}                              # session (or name) -> (name, session): one message per agent
+    peers = service.mesh_peers(squad_id=row["squad_id"]) if row["squad_id"] else []
+    live = {p["session_id"] for p in peers if p.get("session_id")}
+    skip = {who.get("session"), row["created_by"]} - {None}
     if not by_creator:
         to_name, to_session = row["created_by_name"], row["created_by"]
         if to_session and (service.store.spawn_by_session(to_session) or {}).get("squad_id") != row["squad_id"]:
             to_name, to_session = "operator", None     # filed in the backlog by another squad, dispatched since
-        to.append((to_name, to_session))
+            lead = squad_lead(service, service.store.squad(row["squad_id"]) or {})
+            if lead and lead["session_id"] in live and lead["session_id"] not in skip:   # it stands in for the creator
+                to[lead["session_id"]] = (lead["agent_name"], lead["session_id"])
+        to[to_session or to_name] = (to_name, to_session)
     if handin:
         roles = {r["id"]: r["title"] for r in service.store.roles()}
-        skip = {who.get("session"), row["created_by"]} - {None}
-        to += [(p["name"], p["session_id"]) for p in service.mesh_peers(squad_id=row["squad_id"])
-               if p.get("session_id") and p["session_id"] not in skip
-               and role_class(p.get("agent_role"), roles.get(p.get("agent_role"))) == "reviewer"]
-    for to_name, to_session in dict.fromkeys(to):
+        for p in peers:
+            if (p.get("session_id") and p["session_id"] not in skip
+                    and role_class(p.get("agent_role"), roles.get(p.get("agent_role"))) == "reviewer"):
+                to.setdefault(p["session_id"], (p["name"], p["session_id"]))
+    for to_name, to_session in to.values():
         _hub_tell(service, to_name=to_name, to_session=to_session, text=notice, agent=agent, caller=caller,
                   squad=row["squad_id"])
+
+
+def squad_lead(service, squad: dict) -> dict | None:
+    """The squad's lead: its first agent not added by another (launched first), at its newest session; its spawn row,
+    live or not."""
+    lead = next((a for a in squad.get("agents", []) if not a["spawned_by"]), None)       # oldest first
+    found = lead and service.store.spawned(squad_id=squad["id"], agent_name=lead["agent_name"], limit=1)
+    return found[0] if found else lead
 
 
 def log_to_object(service, agent, caller, body: dict, *, after: list | None = None) -> dict:
@@ -2090,10 +2104,8 @@ def assign_task(service, ref, squad_id) -> dict:
         service.store.log_object(row["id"], who=dict(agent_name="operator"), kind="assign", squad_id=squad["id"],
                                  body=f"moved from the backlog into squad {squad['name']} ({squad['id']}) by operator")
         children = _move_children(service, row, squad)
-    lead = next((a for a in squad["agents"] if not a["spawned_by"]), None)        # oldest first: launched first
+    lead = squad_lead(service, squad)                                              # the move is done: never refuse now
     live = {p.get("session_id") for p in service.mesh_peers(squad_id=squad["id"])}
-    found = lead and service.store.spawned(squad_id=squad["id"], agent_name=lead["agent_name"], limit=1)
-    lead = found[0] if found else lead                                             # its newest session; the move is done: never refuse now
     out = dict(ok=True, ref=ref, squad_id=squad["id"], lead=lead and lead["agent_name"], lead_live=False, delivered=False,
                children=children)
     if lead and lead["session_id"] in live:

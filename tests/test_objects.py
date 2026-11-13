@@ -709,3 +709,30 @@ class HandinNoticeTests(HandinTests):
         self.hand_in("T-2")
         git(self.repo, "merge", "-q", "--no-ff", "-m", "merge", "almanac/sq-1/impl")
         self.assertEqual(self.log(ref="T-2", status="accepted", body="ok")[2]["entry"]["body"], "ok")
+
+    def test_a_creator_in_another_squad_has_the_lead_stand_in(self):                  # F1
+        self.file(owner="impl")
+        self.store.db.execute("update objects set created_by = 'sess-other', created_by_name = 'other' where id = 1")
+        self.store.db.execute("update spawned_agents set spawned_by = 'arch' where agent_name in ('impl', 'rev')")  # arch leads
+        self.clear()
+        before = self.store.db.execute("select max(id) from messages").fetchone()[0] or 0
+        self.hand_in("T-1")
+        self.assertEqual(self.counts(), {"arch": 1, "rev": 1}, "the lead stands in; other is not told")
+        to = [r[0] for r in self.store.db.execute("select to_name from messages where id > ?", (before,))]
+        self.assertEqual(sorted(to), ["arch", "operator", "rev"])
+        self.clear()
+        self.log(self.tok("arch"), ref="T-1", status="accepted")
+        self.assertEqual(self.counts(), {}, "the lead accepting it is not told")
+
+
+class ImplementerBriefTests(ObjectRig):
+    def test_an_unedited_brief_is_upgraded_and_an_edited_one_kept(self):            # F2
+        from almanac import store as st
+        self.store.db.execute("update roles set system_prompt = ? where id = 'implementer-claude'", (st.PREV_IMPLEMENTER,))
+        self.store.db.execute("update roles set system_prompt = 'mine' where id = 'implementer-gemini'")
+        self.store.db.commit()
+        again = Store(self.state / "almanac.db")
+        self.addCleanup(again.close)
+        self.assertEqual(again.role("implementer-claude")["system_prompt"], st.IMPLEMENTER)
+        self.assertEqual(again.role("implementer-gemini")["system_prompt"], "mine")
+        self.assertNotIn("mesh_send", st.IMPLEMENTER)
