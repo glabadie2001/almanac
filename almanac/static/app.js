@@ -2409,8 +2409,7 @@ function decideBody(status, comment) {
   return { status, body };
 }
 // plan-decide:end
-// [ACCEPT] / [SEND BACK] on a task in review (POST /api/mesh/object/log, the operator's). One bar per ref, kept so the
-// refresh on an objects_rev change re-attaches it with its half-typed comment instead of rebuilding it.
+// [ACCEPT] / [SEND BACK] on a task in review (POST /api/mesh/object/log, the operator's).
 // It lives in its own slot (#mesh-ctx-decide), outside the feed that loadTask rebuilds: the slot is only touched when the
 // ref or the in-review state changes, so a refresh never blurs the textarea or drops a half-typed comment.
 function paintDecide(o) {
