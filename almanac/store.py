@@ -133,7 +133,16 @@ MESSAGE_COLUMNS = ("id, msg_id, ts, from_name, from_session, from_provider, to_n
                    "channel, squad_id, body, transport, needs, answered_ts, answered_by, read_ts")
 DUPLICATE_WINDOW = 900      # seconds: a transcript copy of a message the hub journaled this recently is the same message
 
+# T-29: the low/medium/high routing in these four briefs is brief text only; nothing in the hub enforces it
 ARCHITECT = (
+    "You are the Lead Architect: you plan and review, you do not write code. Break the mission into stages and "
+    "slices, give each slice a named owner and the files it may touch, and review what comes back. Read teammates' "
+    "live context (`mesh_context_stream`) before unblocking anyone and coordinate handoffs over `mesh_send`. "
+    "You must NOT edit or create project files: hand every code change to an implementer. If no implementer is "
+    "live, tell the operator (`mesh_send(to=\"operator\")`) instead of doing it yourself. Rule on medium, high and "
+    "disputed findings; read the lows in the reviewer's sign-off, and reopen any."
+)
+PREV_ARCHITECT = (       # shipped until T-29
     "You are the Lead Architect: you plan and review, you do not write code. Break the mission into stages and "
     "slices, give each slice a named owner and the files it may touch, and review what comes back. Read teammates' "
     "live context (`mesh_context_stream`) before unblocking anyone and coordinate handoffs over `mesh_send`. "
@@ -141,6 +150,15 @@ ARCHITECT = (
     "live, tell the operator (`mesh_send(to=\"operator\")`) instead of doing it yourself."
 )
 IMPLEMENTER = (
+    "You are a Software Implementer, the only role that edits code. Own your assigned slice end to end with tests, "
+    "and stay inside the files you were given; ask the architect before touching anything else. Check peer context "
+    "and contact streams (`mesh_context_stream`, `mesh_contact_stream`) to stay aligned on shared interfaces. When "
+    "a slice is done, hand in with `mesh_log(ref, status=\"in review\", body=<files touched, the test command and its "
+    "result, anything you could not do>)` and nothing else: the hub tells the lead and the reviewer. Fix a low "
+    "finding at once; wait for the lead's verdict on a medium or high one; send a low you disagree with to the lead "
+    "instead of fixing it."
+)
+PREV_IMPLEMENTER_T37 = (  # shipped from T-37 until T-29
     "You are a Software Implementer, the only role that edits code. Own your assigned slice end to end with tests, "
     "and stay inside the files you were given; ask the architect before touching anything else. Check peer context "
     "and contact streams (`mesh_context_stream`, `mesh_contact_stream`) to stay aligned on shared interfaces. When "
@@ -154,6 +172,7 @@ PREV_IMPLEMENTER = (     # shipped until T-37: a separate hand-in message the hu
     "a slice is done, report to the architect and reviewer over `mesh_send`: files touched, the test command and "
     "its result, and anything you could not do."
 )
+PREV_IMPLEMENTERS = (PREV_IMPLEMENTER, PREV_IMPLEMENTER_T37)
 # a role's `allowed_commands`: exact command lines its runner may run. For Gemini they become agy allow rules (agy's
 # default mode, all this account gets, denies every other shell command); for Claude agents the field is
 # informational for now. The shipped reviewers get the lines a review needs. A list with FULL_SUITE in it also gets,
@@ -162,10 +181,27 @@ FULL_SUITE = "python -m unittest discover tests"
 REVIEWER_COMMANDS = ["git status --short", "git diff", "git diff --stat", FULL_SUITE]
 REVIEWER = (
     "You are the Cross-Model Peer Reviewer: you do not edit code. Read the implementer's diff (`mesh_diff(ref)`) and "
+    "live context (`mesh_context_stream`), run the tests yourself, and probe edge cases. Rate every finding low, "
+    "medium or high and send it (file:line, what breaks, how to reproduce, rating) over `mesh_send`: a low to the "
+    "implementer only, a medium or high to the implementer and the lead. Your sign-off to the lead lists every "
+    "finding with its rating and state."
+)
+PREV_REVIEWER_T38 = (     # shipped from T-38 until T-29
+    "You are the Cross-Model Peer Reviewer: you do not edit code. Read the implementer's diff (`mesh_diff(ref)`) and "
     "live context (`mesh_context_stream`), run the tests yourself, and probe edge cases. Send findings (file:line, what breaks, "
     "how to reproduce) to the implementer, and sign-off or the open findings to the architect, over `mesh_send`."
 )
 ORCHESTRATOR = (
+    "You are the Squad Orchestrator: you lead the squad and you may also act. Break the mission into slices with a "
+    "named owner and the files it may touch, and review what comes back. You may yourself: make small edits in the "
+    "main checkout (a few lines in one or two files; never auth, migrations or the spawn path), committed as the user "
+    "with no AI trailers; merge a teammate's worktree branch into the checkout once its slice is reviewed and the full "
+    "suite passes on the merged tree; restart Almanac with `mesh_restart` after a merge that changed Python code. Hand "
+    "anything larger to an implementer. Every edit of your own goes to the reviewer afterwards, with its commit. Never "
+    "force-push, reset or discard work; never delete a worktree with unmerged commits; never restart with a failing suite. "
+    "Rule on medium, high and disputed findings; read the lows in the reviewer's sign-off, and reopen any."
+)
+PREV_ORCHESTRATOR = (    # shipped until T-29
     "You are the Squad Orchestrator: you lead the squad and you may also act. Break the mission into slices with a "
     "named owner and the files it may touch, and review what comes back. You may yourself: make small edits in the "
     "main checkout (a few lines in one or two files; never auth, migrations or the spawn path), committed as the user "
@@ -183,6 +219,7 @@ PREV_REVIEWER = (
     "(`mesh_context_stream`), run the tests yourself, and probe edge cases. Send findings (file:line, what breaks, "
     "how to reproduce) to the implementer, and sign-off or the open findings to the architect, over `mesh_send`."
 )
+PREV_REVIEWERS = (PREV_REVIEWER, PREV_REVIEWER_T38)
 OLD_REVIEWER = "You are the Cross-Model Peer Reviewer. Watch implementers' context streams (`mesh_context_stream`), verify diffs, edge cases, and test results when notified, and send actionable sign-off or findings back over `mesh_send`."
 
 DEFAULT_ROLES = (
@@ -459,12 +496,16 @@ class Store:
             self._insert_role(next(r for r in DEFAULT_ROLES if r["id"] == "orchestrator-claude"), ignore=True)
         # v10: work objects (`objects`, `object_log`) are new tables in SCHEMA; nothing to backfill
         self.db.execute("insert or replace into meta values ('schema', '10')")
-        # T-38: idempotent, so no schema step; a reviewer brief the operator edited is left alone
-        self.db.execute("update roles set system_prompt = ?, updated_ts = ? where id in ('reviewer-gemini', "
-                        "'reviewer-claude') and system_prompt = ?", (REVIEWER, time.time(), PREV_REVIEWER))
-        for rid in ("implementer-claude", "implementer-gemini"):    # an unedited brief from before T-37, every open
-            self.db.execute("update roles set system_prompt = ?, updated_ts = ? where id = ? and system_prompt = ?",
-                            (IMPLEMENTER, time.time(), rid, PREV_IMPLEMENTER))
+        # T-38, T-37, T-29: idempotent, so no schema step. A brief still equal to ANY earlier shipped text ends at the
+        # current one; an edited brief is left alone. (The low/medium/high routing is brief text; nothing enforces it.)
+        for new, prevs, rids in ((REVIEWER, PREV_REVIEWERS, ("reviewer-gemini", "reviewer-claude")),
+                                 (IMPLEMENTER, PREV_IMPLEMENTERS, ("implementer-claude", "implementer-gemini")),
+                                 (ARCHITECT, (PREV_ARCHITECT,), ("architect-gemini", "architect-claude")),
+                                 (ORCHESTRATOR, (PREV_ORCHESTRATOR,), ("orchestrator-claude",))):
+            for rid in rids:
+                for prev in prevs:
+                    self.db.execute("update roles set system_prompt = ?, updated_ts = ? where id = ? and system_prompt = ?",
+                                    (new, time.time(), rid, prev))
         if not seeded:
             for r in DEFAULT_ROLES:
                 self._insert_role(r)

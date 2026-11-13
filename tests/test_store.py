@@ -85,3 +85,39 @@ class StoreTests(Fixture):
 
     def test_missing_folder_is_reported_not_raised(self):
         self.assertIn("not a folder", self.store.ingest(self.root / "nope")["error"])
+
+
+class BriefUpgradeTests(Fixture):
+    """T-29: a stored brief equal to any earlier shipped text ends at the current one; an edited brief stays."""
+    CASES = (("reviewer-claude", "REVIEWER", "PREV_REVIEWERS"),
+             ("implementer-claude", "IMPLEMENTER", "PREV_IMPLEMENTERS"),
+             ("architect-claude", "ARCHITECT", None),
+             ("orchestrator-claude", "ORCHESTRATOR", None))
+
+    def reopen(self, role_id, text):
+        path = self.root / "state" / "almanac.db"
+        s = Store(path)
+        s.db.execute("update roles set system_prompt = ? where id = ?", (text, role_id))
+        s.db.commit()
+        s.close()
+        again = Store(path)
+        self.addCleanup(again.close)
+        return again.role(role_id)["system_prompt"]
+
+    def test_every_earlier_text_is_upgraded_and_an_edited_one_kept(self):
+        from almanac import store as st
+        for rid, cur, prevs in self.CASES:
+            current = getattr(st, cur)
+            earlier = getattr(st, prevs) if prevs else (getattr(st, "PREV_" + cur),)
+            for i, prev in enumerate(earlier):
+                with self.subTest(role=rid, earlier=i):
+                    self.assertNotEqual(prev, current)
+                    self.assertEqual(self.reopen(rid, prev), current)
+            with self.subTest(role=rid, edited=True):
+                self.assertEqual(self.reopen(rid, "mine"), "mine")
+
+    def test_the_briefs_route_findings_by_rating(self):
+        from almanac import store as st
+        for text in (st.REVIEWER, st.IMPLEMENTER, st.ARCHITECT, st.ORCHESTRATOR):
+            self.assertIn("low", text)
+        self.assertNotIn("architect", st.REVIEWER)
