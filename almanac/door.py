@@ -1476,7 +1476,7 @@ def task_diff(service, agent, caller, query: dict) -> dict:
     stat = _flag(query.get("stat"))
     path = str(query.get("path") or "").strip()
     commit = str(query.get("commit") or "").strip().lower()
-    if path and (os.path.isabs(path) or re.match(r"[A-Za-z]:|[\/:]", path) or ".." in re.split(r"[\/]", path)):
+    if path and (os.path.isabs(path) or re.match(r"[A-Za-z]:|[\\/:]", path) or ".." in re.split(r"[\\/]", path)):
         raise ValueError(f"path {path!r}: send a repo-relative path without '..'")
     if commit and not _HEX.fullmatch(commit):
         raise ValueError(f"commit {commit!r}: send 4 to 40 hex digits")

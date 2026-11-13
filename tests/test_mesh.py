@@ -816,13 +816,24 @@ class TaskDiffTests(test_objects.ObjectRig):
         self.assertNotIn("b.py", one["diff"], "one commit, not the range")
         self.assertNotIn("+two", one["diff"])
 
+    def test_a_windows_spelled_path_inside_the_repo_still_works(self):
+        self.file(owner="impl")
+        (self.wt / "sub").mkdir()
+        self.commit(self.wt / "sub", "d.py")
+        self.hand_in("T-1")
+        for path in ("sub\\d.py", "sub/d.py"):
+            status, _, res = self.diff(ref="T-1", path=path)
+            self.assertEqual(status, 200, res)
+            self.assertIn("sub/d.py", res["diff"], path)
+
     def test_a_commit_outside_the_task_another_squad_and_hostile_values_are_refused(self):
         self.handed_in()
         main = self.commit(self.repo, "main.py")
         for commit in (self.base, main, "HEAD", "--output=x", "abc;x", "ab", "main"):
             status, _, res = self.diff(ref="T-1", commit=commit)
             self.assertEqual(status, 400, (commit, res))
-        for path in ("../x", "a/../../x", "/etc/passwd", "C:/Windows", "\\\\host\\share", ":(top)a.py", ":!a.py"):
+        for path in ("../x", "a/../../x", "/etc/passwd", "C:/Windows", "\\\\host\\share", ":(top)a.py", ":!a.py",
+                     "..\\x", "a\\..\\..\\x", "\\x"):
             status, _, res = self.diff(ref="T-1", path=path)
             self.assertEqual(status, 400, (path, res))
         self.assertEqual(self.diff("other", ref="T-1")[0], 403, "another squad's task")
