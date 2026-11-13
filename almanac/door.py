@@ -1846,15 +1846,29 @@ def plan_gaps(service, plan: dict) -> list[str]:
     return gaps if slices else [f"{ref_of(plan)} has no slices: file them with parent=\"{ref_of(plan)}\""]
 
 
-def _new_parent(service, row: dict, raw) -> dict | None:
-    """mesh_log(parent=): the new parent of backlog task `row`, None for '' (no parent). Not for a task that is in a
-    squad, nor a parent it already has."""
+def _new_parent(service, row: dict, raw, *, agent=None, caller=None) -> dict | None:
+    """mesh_log(parent=): the new parent of backlog task `row`, None for '' (no parent). A squad task moves only under
+    a plan of its own squad (T-60: slices dispatched from the backlog), by the operator or its lead, while it is
+    queued, unowned and not a plan itself; its parent is never cleared. Never a parent it already has."""
     ref = ref_of(row)
-    if row["squad_id"]:
-        raise ValueError(f"{ref} is in squad {row['squad_id']}: only a backlog task changes its parent")
     if not isinstance(raw, str):
         raise ValueError("parent must be a ref, or '' to clear it")
-    new = _parent_row(service, raw.strip(), None, row["project"], child=row["id"]) if raw.strip() else None
+    if row["squad_id"]:
+        refused = f"{ref} is in squad {row['squad_id']}: only a backlog task changes its parent"
+        if agent:
+            mine = service.store.role((caller or {}).get("role_id") or "") if (caller or {}).get("role_id") else None
+            if row["squad_id"] != (caller or {}).get("squad_id") or not mine or not mine.get("may_spawn"):
+                raise _refused(403, refused + ", or a slice its lead moves under a plan")
+        if not raw.strip() or "plan" in row["data"] or row["status"] != "queued" or row["owner_session"]:
+            raise ValueError(refused + ", or a queued, unowned slice moved under a plan")
+        try:
+            new = _parent_row(service, raw.strip(), row["squad_id"], row["project"], child=row["id"])
+        except ValueError as e:
+            raise ValueError(f"{refused}, or a slice moved under a plan of its squad: {e}") from None
+        if plan_of(service, new) is None:
+            raise ValueError(f"{refused}, or a slice moved under a plan: {ref_of(new)} is no plan, nor under one")
+    else:
+        new = _parent_row(service, raw.strip(), None, row["project"], child=row["id"]) if raw.strip() else None
     if (new and new["id"]) == row["parent_id"]:
         raise ValueError(f"{ref} already has " + (f"parent T-{row['parent_id']}" if new else "no parent"))
     return new
@@ -2079,7 +2093,7 @@ def log_to_object(service, agent, caller, body: dict, *, after: list | None = No
     owner = _owner(service, row["squad_id"], body["owner"]) if body.get("owner") else None
     owner = owner if owner and owner["session_id"] != row["owner_session"] else None
     reparent = body.get("parent") is not None
-    new_parent = _new_parent(service, row, body["parent"]) if reparent else None
+    new_parent = _new_parent(service, row, body["parent"], agent=agent, caller=caller) if reparent else None
     if not (text or status or owner or reparent or handin):
         raise ValueError("body is required unless status, owner or parent changes")
     # an owner set in the same call is the one whose worktree shipped it
@@ -2094,7 +2108,8 @@ def log_to_object(service, agent, caller, body: dict, *, after: list | None = No
     if reparent:
         with _DISPATCH_LOCK:             # the lock dispatch and assign hold: checked again and written as one step, so
             fresh = service.store.object_row(row["id"])       # two crossing re-parents cannot both pass the cycle check
-            new_parent = _new_parent(service, fresh, body["parent"])      # and a task that just joined a squad is refused
+            new_parent = _new_parent(service, fresh, body["parent"], agent=agent,    # a task that just joined a
+                                     caller=caller)                   # squad, or was just taken, is refused
             old = f"T-{fresh['parent_id']}" if fresh["parent_id"] else "(none)"
             entry = service.store.reparent_object(
                 row["id"], new_parent and new_parent["id"], who=who,
@@ -2310,6 +2325,9 @@ def _compact(service, row: dict, sp: dict, n: int) -> None:
 
 
 _DISPATCH_LOCK, _DISPATCHING = threading.Lock(), set()
+# what a plan-first squad's lead does with slices that arrived from the backlog (T-60)
+PLAN_FIRST_MOVE = ("This squad is plan-first: file a plan (mesh_file(plan=true)) and move these slices under it with "
+                   "mesh_log(ref=<slice>, parent=<plan>), then hand the plan in.")
 
 
 def _move_children(service, row: dict, squad: dict | None, *, dry: bool = False) -> dict:
@@ -2361,6 +2379,9 @@ def dispatch_task(service, ref, *, almanac_url: str, token: str) -> dict:
     plan = (f"Its slices {', '.join(slices)} are already filed and join your plan with it, queued and unowned: read "
             "mesh_objects() first, put members on them with mesh_spawn(ref=...), and file only what is missing"
             if slices else "Plan it, file each slice with mesh_file")
+    if slices and data.get("plan_first"):
+        plan = (f"Its slices {', '.join(slices)} are already filed and join your squad with it, queued and unowned: "
+                f"read mesh_objects() first. {PLAN_FIRST_MOVE[:-1]}, filing only what is missing")
     members[0].update(files=row["files"], task=(
         f"{row['title']}\n\nYou lead this squad on backlog task {ref}: the mission above is its body. {plan}, and "
         f"hand in with mesh_log(ref=\"{ref}\", status=\"in review\")."))
@@ -2420,6 +2441,8 @@ def assign_task(service, ref, squad_id) -> dict:
                children=children)
     if lead and lead["session_id"] in live:
         with_it = f"\n\nIts slices moved with it, queued and unowned too: {', '.join(children['moved'])}." if children["moved"] else ""
+        if children["moved"] and squad.get("plan_first"):
+            with_it += " " + PLAN_FIRST_MOVE
         out["delivered"], _ = _hub_tell(
             service, to_name=lead["agent_name"], to_session=lead["session_id"], agent=None, caller=None, squad=squad["id"],
             text=(f"[{ref} moved from the backlog into your squad by the operator] {row['title']}\n\nIt is queued and "

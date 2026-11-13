@@ -300,8 +300,9 @@ MCP_TOOLS = [
                 "status": {"type": "string", "enum": ["queued", "in progress", "in review", "accepted", "blocked"]},
                 "owner": {"type": "string", "description": "Hand the task to this squad member."},
                 "parent": {"type": "string", "description": (
-                    "A backlog task only: its new parent, a backlog task of the project ('T-7'); '' clears it. The "
-                    "entry says from what to what.")},
+                    "A backlog task: its new parent, a backlog task of the project ('T-7'); '' clears it. A squad "
+                    "task only when its lead moves a queued, unowned slice under a plan of the squad. The entry says "
+                    "from what to what.")},
             },
             "required": ["ref"],
         },

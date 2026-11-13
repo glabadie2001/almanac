@@ -439,3 +439,126 @@ class RespawnGateTests(RespawnRig):
         status, _, res = self.respawn("arch")             # T-1 is under no plan
         self.assertEqual(status, 200, res)
         self.assertEqual(self.killed, [500])
+
+
+class MoveTests(GateTests):
+    """T-60: slices that arrived in a plan-first squad from the backlog are filed before any plan; the lead (or the
+    operator) moves each queued, unowned one under a plan of the squad with mesh_log(parent=)."""
+
+    def loose(self, body="no headings", **kw):
+        """A squad task under no plan, as a slice dispatched from the backlog arrives."""
+        status, _, res = self.file(self.tok("arch"), title="from the backlog", body=body, **kw)
+        self.assertEqual(status, 200, res)
+        return res["object"]["ref"]
+
+    def move(self, ref, parent, who="arch"):
+        return self.log(self.tok(who) if who else TOKEN, ref=ref, parent=parent)
+
+    def unmoved(self, ref, parent, code, needle, who="arch"):
+        before = self.store.object_row(int(ref[2:]))["parent_id"]
+        status, _, res = self.move(ref, parent, who)
+        self.assertEqual(status, code, res)
+        self.assertIn(needle, res["error"])
+        self.assertEqual(self.store.object_row(int(ref[2:]))["parent_id"], before)
+
+    def test_a_lead_moves_a_queued_unowned_slice_under_a_plan(self):
+        ref = self.loose()                                 # T-1, no sketch
+        self.plan()                                        # T-2
+        status, _, res = self.move(ref, "T-2")
+        self.assertEqual(status, 200, res)
+        self.assertEqual(self.store.object_row(1)["parent_id"], 2)
+        self.assertEqual(res["entry"]["kind"], "parent")
+        self.assertEqual(res["entry"]["body"], "parent (none) → T-2")
+        status, _, res = self.hand_in("T-2")
+        self.assertEqual(status, 400, res)
+        self.assertIn("T-1: no ## Sketch", res["error"], "plan_gaps reads the moved slice")
+        sub = self.loose(body=SLICE)                       # T-3: under a slice of the plan is under the plan
+        self.assertEqual(self.move(sub, "T-1", who=None)[0], 200, "the operator may")
+        self.assertEqual(plan_of(self.service, self.store.object_row(3))["id"], 2)
+
+    def test_a_builder_cannot_move_a_slice(self):
+        ref = self.loose()
+        self.plan()
+        self.unmoved(ref, "T-2", 403, "only a backlog task", who="impl")
+
+    def test_an_owned_or_started_slice_does_not_move(self):
+        self.plan()                                        # T-1
+        owned = self.loose(owner="impl")
+        started = self.loose(status="in progress")
+        for ref in (owned, started):
+            self.unmoved(ref, "T-1", 400, "queued, unowned")
+        self.unmoved(owned, "T-1", 400, "queued, unowned", who=None)
+        cleared = self.slice()                             # under T-1 already: never cleared this way
+        self.unmoved(cleared, "", 400, "queued, unowned")
+
+    def test_not_under_a_task_outside_a_plan(self):
+        ref, other = self.loose(), self.loose()
+        self.unmoved(ref, other, 400, f"{other} is no plan, nor under one")
+        self.unmoved(ref, other, 400, "nor under one", who=None)
+
+    def test_not_into_another_squads_plan(self):
+        ref = self.loose()                                 # T-1
+        self.assertEqual(self.file(squad="sq-2", title="theirs", plan=True)[0], 200)     # T-2, sq-2's
+        self.unmoved(ref, "T-2", 400, "no task of squad sq-1")
+        self.unmoved(ref, "T-2", 400, "no task of squad sq-1", who=None)
+        self.assertEqual(self.log(self.tok("other"), ref="T-2", body="x")[0], 200)
+        self.unmoved(ref, "T-2", 403, "another squad", who="other")
+
+    def test_a_plan_does_not_move_under_a_plan(self):
+        self.plan()                                        # T-1
+        self.plan()                                        # T-2
+        self.unmoved("T-2", "T-1", 400, "queued, unowned")
+
+    def test_no_cycle(self):
+        self.plan()                                        # T-1
+        top = self.slice()                                 # T-2
+        ref = self.slice(parent=top)                       # T-3
+        self.unmoved(top, ref, 400, "itself")
+        self.unmoved(top, top, 400, "itself")
+        self.unmoved(ref, top, 400, "already has parent")
+
+    def test_a_slice_moved_after_the_hand_in_is_not_covered(self):
+        loose, late = self.loose(body=SLICE), self.loose(body=SLICE)    # T-1, T-2: filed before the plan
+        self.plan()                                        # T-3
+        self.assertEqual(self.move(loose, "T-3")[0], 200)
+        self.assertEqual(self.hand_in("T-3")[0], 200)
+        self.assertEqual(self.move(late, "T-3")[0], 200, "moved while the plan is in review")
+        self.assertEqual(self.log(ref="T-3", status="accepted")[0], 200)
+        self.refused(f"{late} changed after plan T-3 was handed in", ref=late)
+        self.assertEqual(self.spawn(ref=loose)[0], 200, "what was handed in is covered")
+        self.argv.clear()
+        another = self.loose(body=SLICE)                   # moved under the accepted plan
+        self.assertEqual(self.move(another, "T-3")[0], 200)
+        self.refused(f"{another} changed after plan T-3 was handed in", ref=another)
+        self.assertEqual(self.hand_in("T-3")[0], 200)
+        self.assertEqual(self.log(ref="T-3", status="accepted")[0], 200)
+        self.assertEqual(self.spawn(ref=another, name="impl-two")[0], 200, "handed in again: covered")
+
+    def test_the_dispatch_notice_names_the_plan_step_only_in_a_plan_first_squad(self):
+        from almanac.door import PLAN_FIRST_MOVE
+        for plan_first in (True, False):
+            self.store.update_squad("sq-1", plan_first=plan_first)
+            self.clear()
+            status, _, res = self.file(title="feature", backlog=True, project=str(self.root))
+            self.assertEqual(status, 200, res)
+            top = res["object"]["ref"]
+            self.assertEqual(self.file(title="slice", backlog=True, project=str(self.root), parent=top)[0], 200)
+            status, _, res = self.post("/api/squads/assign", ref=top, squad_id="sq-1")
+            self.assertEqual((status, res.get("delivered")), (200, True), res)
+            said = json.dumps(self.inbox["arch"], ensure_ascii=False)
+            self.assertEqual(PLAN_FIRST_MOVE in said, plan_first, said)
+        self.store.update_squad("sq-1", plan_first=True)
+        self.clear()
+        status, _, res = self.file(title="alone", backlog=True, project=str(self.root))
+        self.assertEqual(self.post("/api/squads/assign", ref=res["object"]["ref"], squad_id="sq-1")[0], 200)
+        self.assertNotIn("plan-first", json.dumps(self.inbox["arch"]), "no slices moved: nothing to put under a plan")
+        from almanac.door import dispatch_task                       # the dispatched lead's brief says it too
+        for plan_first in (True, False):
+            top = self.file(title="later", backlog=True, project=str(self.root), plan_first=plan_first)[2]["object"]["ref"]
+            self.file(title="its slice", backlog=True, project=str(self.root), parent=top)
+            with mock.patch.object(spawner, "launch_squad", side_effect=RuntimeError("stop")) as launch:
+                with self.assertRaises(RuntimeError):
+                    dispatch_task(self.service, top, almanac_url="http://x", token=TOKEN)
+            task = launch.call_args.kwargs["members"][0]["task"]
+            self.assertEqual(PLAN_FIRST_MOVE[:-1] in task, plan_first, task)
+            self.assertEqual("put members on them with mesh_spawn" in task, not plan_first, task)
