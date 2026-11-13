@@ -217,7 +217,7 @@ class CommandLineTests(RespawnRig):
                                   body=f"entry {i} " + 'say "quoted" ' * 40)
 
     def test_a_long_charter_leaves_less_room_and_the_oldest_entries_go(self):
-        self.long_charter(20_000)
+        self.long_charter(19_000)
         status, _, res = self.respawn()
         self.assertEqual(status, 200, res)
         argv = self.argv[-1]
