@@ -180,7 +180,7 @@ class GeminiMeshGrantTests(Fixture):
         allow = json.loads(gemini_host.MESH_GRANTS)["permissions"]["allow"]
         self.assertEqual(allow, [f"mcp(almanac-mesh_almanac-mesh/{t})" for t in
                                  ("mesh_roster", "mesh_context_stream", "mesh_contact_stream", "mesh_send", "mesh_spawn",
-                              "mesh_objects", "mesh_object", "mesh_file", "mesh_log", "mesh_amend", "mesh_respawn", "mesh_restart")])
+                              "mesh_objects", "mesh_object", "mesh_diff", "mesh_file", "mesh_log", "mesh_amend", "mesh_respawn", "mesh_restart")])
         host = gemini_host.GeminiHost(name="g", cwd=str(self.root), transcript_path=self.root / "t.jsonl",
                                       sessions_dir=self.root / "s", agy_bin="agy", permission_mode="auto",
                                       in_memory_uds=True, quiet=True)

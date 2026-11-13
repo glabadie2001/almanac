@@ -306,7 +306,7 @@ class MeshDoorAndMcpTests(Fixture):
         self.assertEqual(
             tool_names,
             ["mesh_roster", "mesh_context_stream", "mesh_contact_stream", "mesh_send", "mesh_spawn",
-             "mesh_objects", "mesh_object", "mesh_file", "mesh_log", "mesh_amend", "mesh_respawn", "mesh_restart"],
+             "mesh_objects", "mesh_object", "mesh_diff", "mesh_file", "mesh_log", "mesh_amend", "mesh_respawn", "mesh_restart"],
         )
         # mesh_wait is the CLI's: over MCP it is refused by name, with what to do instead
         wait_rpc = mcp_mesh.handle_rpc({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
@@ -754,6 +754,106 @@ class ReviewTestRunTests(Fixture):
         solo = spawner.build_mesh_charter(agent_name="r", provider="claude", role_title="R", role_prompt="p",
                                           almanac_url="u")
         self.assertNotIn("merge gate", solo, "no squad, no review rounds")
+
+
+import urllib.parse  # noqa: E402
+import test_objects  # noqa: E402  (a module, not its names: its test classes must not run twice)
+from almanac import door  # noqa: E402
+from test_spawn_fixes import git  # noqa: E402
+
+
+class TaskDiffTests(test_objects.ObjectRig):
+    """T-38: `mesh_diff(ref)` reads a handed-in task's `base..sha` from the squad folder, read-only, own squad only."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        git(self.repo, "init", "-q", "-b", "main")
+        git(self.repo, "config", "user.name", "t")
+        git(self.repo, "config", "user.email", "t@t")
+        (self.repo / "a.py").write_text("one\n", encoding="utf-8")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "base")
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        self.store.db.execute("update squads set cwd = ? where id = 'sq-1'", (str(self.repo),))
+        self.wt = spawner.ensure_worktree(self.repo, self.state, "impl", "sq-1")
+        branch, base = spawner.branch_and_base(self.wt)
+        self.store.record_spawn(agent_name="impl", session_id="sess-impl", squad_id="sq-1", role_id=None,
+                                provider="claude", model=None, effort=None, cwd=str(self.wt),
+                                worktree_path=str(self.wt), pid=0, branch=branch, base=base)
+
+    commit = test_objects.HandinTests.commit
+    hand_in = test_objects.HandinTests.hand_in
+
+    def diff(self, who="arch", **query):
+        return self.request(self.handler, f"/api/mesh/diff?{urllib.parse.urlencode(query)}", token=self.tok(who))
+
+    def handed_in(self):
+        self.file(owner="impl")
+        (self.wt / "a.py").write_text("one\ntwo\n", encoding="utf-8")
+        first = self.commit(self.wt, "b.py")
+        second = self.commit(self.wt, "c.py")
+        self.hand_in("T-1")
+        return first, second
+
+    def test_the_diff_of_a_hand_in_its_stat_one_path_and_one_commit(self):
+        first, second = self.handed_in()
+        status, _, res = self.diff(ref="T-1")
+        self.assertEqual(status, 200, res)
+        self.assertEqual((res["base"], res["sha"], res["truncated"]), (self.base, second, False))
+        for name in ("a/a.py", "a/b.py", "a/c.py", "+two"):
+            self.assertIn(name, res["diff"])
+        stat = self.diff(ref="T-1", stat=1)[2]["diff"]
+        self.assertIn("3 files changed", stat)
+        self.assertNotIn("+two", stat)
+        only = self.diff(ref="T-1", path="a.py")[2]["diff"]
+        self.assertIn("+two", only)
+        self.assertNotIn("b.py", only)
+        one = self.diff(ref="T-1", commit=second[:8])[2]
+        self.assertEqual(one["commit"], second)
+        self.assertIn("c.py", one["diff"])
+        self.assertNotIn("b.py", one["diff"], "one commit, not the range")
+        self.assertNotIn("+two", one["diff"])
+
+    def test_a_commit_outside_the_task_another_squad_and_hostile_values_are_refused(self):
+        self.handed_in()
+        main = self.commit(self.repo, "main.py")
+        for commit in (self.base, main, "HEAD", "--output=x", "abc;x", "ab", "main"):
+            status, _, res = self.diff(ref="T-1", commit=commit)
+            self.assertEqual(status, 400, (commit, res))
+        for path in ("../x", "a/../../x", "/etc/passwd", "C:/Windows", "\\\\host\\share", ":(top)a.py", ":!a.py"):
+            status, _, res = self.diff(ref="T-1", path=path)
+            self.assertEqual(status, 400, (path, res))
+        self.assertEqual(self.diff("other", ref="T-1")[0], 403, "another squad's task")
+        self.assertEqual(self.diff(ref="T-9")[0], 404)
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "", "nothing written to the squad folder")
+        self.assertEqual(git(self.wt, "status", "--porcelain"), "", "nor to the worktree")
+
+    def test_a_task_not_handed_in_answers_with_a_reason(self):
+        self.file(owner="impl")
+        status, _, res = self.diff(ref="T-1")
+        self.assertEqual(status, 200, res)
+        self.assertIsNone(res["diff"])
+        self.assertIn("has no sha", res["reason"])
+
+    def test_a_large_diff_is_cut_with_its_stat(self):
+        self.handed_in()
+        with mock.patch.object(door, "DIFF_CAP", 40):
+            res = self.diff(ref="T-1")[2]
+        self.assertEqual(len(res["diff"]), 40)
+        self.assertTrue(res["truncated"])
+        self.assertGreater(res["chars"], 40)
+        self.assertIn("3 files changed", res["stat_text"])
+
+    def test_the_tool_and_the_cli_verb(self):
+        _, second = self.handed_in()
+        api = test_objects.McpTests.client(self, "arch")
+        self.assertIn("c.py", api.call_tool("mesh_diff", {"ref": "T-1", "stat": True})["diff"])
+        self.assertEqual(api.call_tool("mesh_diff", {"ref": "T-1", "commit": second})["commit"], second)
+        with mock.patch("sys.stdout", new_callable=__import__("io").StringIO) as out:
+            mcp_mesh._run_cli(["diff", "T-1", "--path", "a.py"], api)
+        self.assertIn("+two", out.getvalue())
 
 
 if __name__ == "__main__":
