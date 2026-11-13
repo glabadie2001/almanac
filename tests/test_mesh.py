@@ -851,13 +851,23 @@ class TaskDiffTests(test_objects.ObjectRig):
         self.assertIn("has no sha", res["reason"])
 
     def test_a_large_diff_is_cut_with_its_stat(self):
-        self.handed_in()
-        with mock.patch.object(door, "DIFF_CAP", 40):
+        self.file(owner="impl")
+        for i in range(30):
+            (self.wt / f"a_rather_long_file_name_for_the_stat_{i:02}.py").write_text("x\n" * 200, encoding="utf-8")
+        self.commit(self.wt, "z.py")
+        self.hand_in("T-1")
+        with mock.patch.object(door, "DIFF_CAP", 10_000):        # the --stat (~2,200) fits a quarter: it comes whole
             res = self.diff(ref="T-1")[2]
-        self.assertEqual(len(res["diff"]), 40)
-        self.assertTrue(res["truncated"])
-        self.assertGreater(res["chars"], 40)
-        self.assertIn("3 files changed", res["stat_text"])
+        self.assertIn("|", res["stat_text"])
+        self.assertLessEqual(len(res["diff"]) + len(res["stat_text"]), 10_000)
+        with mock.patch.object(door, "DIFF_CAP", 2000):
+            full = self.diff(ref="T-1")[2]
+            self.assertNotIn("|", full["stat_text"], "a --stat over a quarter of the cap: the --shortstat")
+            for res in (full, self.diff(ref="T-1", stat=1)[2]):
+                self.assertTrue(res["truncated"])
+                self.assertGreater(res["chars"], 2000)
+                self.assertIn("31 files changed", res["stat_text"])
+                self.assertLessEqual(len(res["diff"]) + len(res["stat_text"]), 2000, "the whole result fits the cap")
 
     def test_the_tool_and_the_cli_verb(self):
         _, second = self.handed_in()

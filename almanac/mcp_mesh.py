@@ -229,8 +229,9 @@ MCP_TOOLS = [
         "name": "mesh_diff",
         "description": ("Read what a handed-in task changed: the diff of its `base..sha` (its owner's branch against the "
                         "commit it was cut from), in one call, without the builder's worktree. Read-only, your squad's "
-                        "tasks only. Over 60,000 characters it is cut: `truncated: true` and `stat_text` (the --stat) "
-                        "say what was left out; read the rest with `path`."),
+                        "tasks only. The whole result stays within 60,000 characters: past that it is cut, with "
+                        "`truncated: true` and `stat_text` (the --stat, or only its totals when that is long); read "
+                        "the rest with `stat` and `path`."),
         "inputSchema": {
             "type": "object",
             "properties": {

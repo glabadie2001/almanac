@@ -17,7 +17,7 @@ POST /api/mesh/send          deliver over Claude's `uds-messaging` protocol (dir
 GET  /api/mesh/branches?squad= the squad's member branches holding commits not in its folder's HEAD, each with
                              `ahead` (its commit count past HEAD) or the `error` git gave
 GET  /api/mesh/diff?ref=      a handed-in task's diff `base..sha` (read-only; `stat=1`, `path=`, `commit=` one commit in
-                             that range), cut at 60,000 characters with `truncated` and the --stat
+                             that range), kept within 60,000 characters (`truncated`, `stat_text`)
 GET  /api/worktime           per agent: work / wait / idle seconds and per-bucket heat, plus how the agents overlapped
                              (`squad=` or `sessions=a,b,c`, optional `bucket=` seconds); `messages` and `marks`
                              (errors, edits) for the swimlane
@@ -1507,8 +1507,14 @@ def task_diff(service, agent, caller, query: dict) -> dict:
         return dict(out, reason=text)
     if len(text) <= DIFF_CAP:
         return dict(out, diff=text, truncated=False)
-    ok, summary = diff("--stat")
-    return dict(out, diff=text[:DIFF_CAP], truncated=True, chars=len(text), stat_text=summary if ok else None)
+    # the whole result stays within the cap: the --stat when it fits a quarter of it (and is not the cut text
+    # itself), else the one-line --shortstat; the diff gets what is left
+    ok, summary = (False, "") if stat else diff("--stat")
+    if not ok or len(summary) > DIFF_CAP // 4:
+        ok, summary = diff("--shortstat")
+    summary = summary if ok else ""
+    return dict(out, diff=text[:max(0, DIFF_CAP - len(summary))], truncated=True, chars=len(text),
+                stat_text=summary or None)
 
 
 def log_doc(entry: dict) -> dict:
