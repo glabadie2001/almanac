@@ -211,13 +211,14 @@ class PlanTests(ObjectRig):
     def test_accept_stamps_accepted_ts(self):
         self.plan()
         self.slice()
-        self.hand_in()
+        handin = self.hand_in()[2]
         self.assertEqual(self.blocking(), 1)
         with mock.patch("almanac.door.context_boundary") as boundary:
             status, _, res = self.log(ref="T-1", status="accepted", body="go")
         self.assertEqual(status, 200, res)
         boundary.assert_not_called()                      # an accepted plan starts the work: its owner stays
-        self.assertEqual(self.store.object_row(1)["data"]["plan"], {"accepted_ts": res["entry"]["ts"]})
+        self.assertEqual(self.store.object_row(1)["data"]["plan"],
+                         {"accepted_ts": res["entry"]["ts"], "handin_ts": handin["entry"]["ts"]})
         self.assertEqual(self.blocking(), 0, "the decision closes the hand-in's flag")
 
     def test_send_back_tells_the_lead_with_the_comment(self):
@@ -231,7 +232,7 @@ class PlanTests(ObjectRig):
         said = json.dumps(self.inbox["arch"][0], ensure_ascii=False)
         self.assertIn("[T-1 in review → in progress by operator] the plan", said)
         self.assertIn("split T-2 in two", said)
-        self.assertEqual(self.store.object_row(1)["data"]["plan"], {})
+        self.assertEqual(list(self.store.object_row(1)["data"]["plan"]), ["handin_ts"], "the flag is gone")
         self.assertEqual(self.blocking(), 0, "sending it back closes the hand-in's flag")
 
 
@@ -312,13 +313,48 @@ class GateTests(PlanTests):
         self.accepted_plan()
         ref = self.slice()
         self.assertEqual(self.refused("changed after", ref=ref),
-                         f"{ref} changed after plan T-1 was accepted: hand the plan in again")
+                         f"{ref} changed after plan T-1 was handed in: hand the plan in again")
 
     def test_refuses_a_slice_amended_after_accept(self):
         self.accepted_plan()
         status, _, res = self.post("/api/mesh/object/amend", ref="T-2", body=SLICE + "\nand one thing more")
         self.assertEqual(status, 200, res)
-        self.refused("T-2 changed after plan T-1 was accepted", ref="T-2")
+        self.refused("T-2 changed after plan T-1 was handed in", ref="T-2")
+
+    def amend(self, ref, more):
+        status, _, res = self.post("/api/mesh/object/amend", ref=ref, body=SLICE + more)
+        self.assertEqual(status, 200, res)
+
+    def test_a_slice_filed_between_hand_in_and_accept_is_not_covered(self):
+        self.plan()
+        self.slice()                                       # T-2, handed in
+        self.assertEqual(self.hand_in()[0], 200)
+        ref = self.slice()                                 # T-3, filed while the plan is in review: the operator never saw it
+        self.assertEqual(self.log(ref="T-1", status="accepted")[0], 200)
+        self.assertEqual(self.refused("changed after", ref=ref),
+                         f"{ref} changed after plan T-1 was handed in: hand the plan in again")
+        self.assertEqual(self.spawn(ref="T-2")[0], 200, "what was handed in is covered")
+
+    def test_a_slice_amended_between_hand_in_and_accept_is_not_covered(self):
+        self.plan()
+        self.slice()
+        self.slice()                                       # T-3, untouched
+        self.assertEqual(self.hand_in()[0], 200)
+        self.amend("T-2", "\nand one thing more")          # while the plan is in review: allowed, not covered
+        self.assertEqual(self.log(ref="T-1", status="accepted")[0], 200)
+        self.refused("T-2 changed after plan T-1 was handed in", ref="T-2")
+        self.assertEqual(self.spawn(ref="T-3")[0], 200)
+
+    def test_a_re_hand_in_moves_the_cut(self):
+        self.plan()
+        self.slice()
+        self.assertEqual(self.hand_in()[0], 200)
+        self.assertEqual(self.log(ref="T-1", status="in progress", body="tighten T-2")[0], 200)     # sent back
+        self.amend("T-2", "\ntightened")
+        self.assertEqual(self.hand_in()[0], 200)          # the amended slice is handed in
+        self.assertEqual(self.log(ref="T-1", status="accepted")[0], 200)
+        status, _, res = self.spawn(ref="T-2")
+        self.assertEqual(status, 200, res)
 
     def test_a_second_accepted_plan_covers_its_own_slices(self):
         self.accepted_plan()

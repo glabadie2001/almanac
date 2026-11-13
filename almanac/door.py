@@ -1802,8 +1802,8 @@ def plan_of(service, row: dict) -> dict | None:
 def spawn_covered(service, squad: dict, task_row: dict | None, files=None) -> str | None:
     """An agent's mesh_spawn in `squad` onto `task_row` (None: no ref): None when the member may start, else the
     refusal. Only a plan-first squad gates: the task must be a slice (not a plan) whose nearest plan the operator
-    accepted (status accepted AND accepted_ts: the stamp outlives a re-hand-in), filed before that and not amended
-    since. `files` at spawn would replace the slice's in the kickoff, outside what was accepted: refused."""
+    accepted (status accepted AND accepted_ts: the stamp outlives a re-hand-in), filed before its last hand-in
+    (handin_ts; accepted_ts when it has none) and not amended since. `files` at spawn would replace the slice's in the kickoff, outside what was accepted: refused."""
     if not squad.get("plan_first"):
         return None
     if task_row is None:
@@ -1816,8 +1816,10 @@ def spawn_covered(service, squad: dict, task_row: dict | None, files=None) -> st
     if plan is None or plan["status"] != "accepted" or not accepted:
         return (f"{ref} is not under an accepted plan: file the slices, hand the plan in and wait for the operator"
                 + (f" ({ref_of(plan)} is {plan['status']})" if plan else ""))
-    if task_row["created_ts"] >= accepted or service.store.amended_since(task_row["id"], accepted):
-        return f"{ref} changed after plan {ref_of(plan)} was accepted: hand the plan in again"
+    # the cut is the hand-in the operator accepted, not the click; accepted without a hand-in: the click
+    cut = (plan["data"].get("plan") or {}).get("handin_ts") or accepted
+    if task_row["created_ts"] >= cut or service.store.amended_since(task_row["id"], cut):
+        return f"{ref} changed after plan {ref_of(plan)} was handed in: hand the plan in again"
     if files:
         return f"{ref}'s files are the plan's: amend the task and hand the plan in again"
     return None
@@ -2135,6 +2137,8 @@ def log_to_object(service, agent, caller, body: dict, *, after: list | None = No
                 service.store.resolve_message(old)
             if status == "accepted":
                 now["accepted_ts"] = entry["ts"]
+            if handin:
+                now["handin_ts"] = entry["ts"]    # every hand-in, also a re-hand-in: the cut spawn_covered checks
             if flag:
                 now["flag"] = flag
             service.store.merge_object_data(row["id"], plan=now)

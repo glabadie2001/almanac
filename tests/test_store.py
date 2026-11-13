@@ -116,6 +116,15 @@ class BriefUpgradeTests(Fixture):
             with self.subTest(role=rid, edited=True):
                 self.assertEqual(self.reopen(rid, "mine"), "mine")
 
+    def test_the_t56_plan_first_brief_upgrades_to_plan_before_slices(self):
+        from almanac import store as st
+        for rid, cur, prev in (("architect-claude", st.ARCHITECT, st.PREV_ARCHITECT_T56),
+                               ("orchestrator-claude", st.ORCHESTRATOR, st.PREV_ORCHESTRATOR_T56)):
+            with self.subTest(role=rid):
+                self.assertIn("file the slices and a plan (`mesh_file(plan=true)`)", prev)    # as shipped in bc0fda1
+                self.assertIn("file a plan (`mesh_file(plan=true)`), then its slices under it", cur)
+                self.assertEqual(self.reopen(rid, prev), cur)
+
     def test_the_briefs_route_findings_by_rating(self):
         from almanac import store as st
         for text in (st.REVIEWER, st.IMPLEMENTER, st.ARCHITECT, st.ORCHESTRATOR):
