@@ -144,6 +144,13 @@ IMPLEMENTER = (
     "You are a Software Implementer, the only role that edits code. Own your assigned slice end to end with tests, "
     "and stay inside the files you were given; ask the architect before touching anything else. Check peer context "
     "and contact streams (`mesh_context_stream`, `mesh_contact_stream`) to stay aligned on shared interfaces. When "
+    "a slice is done, hand in with `mesh_log(ref, status=\"in review\", body=<files touched, the test command and its "
+    "result, anything you could not do>)` and nothing else: the hub tells the lead and the reviewer."
+)
+PREV_IMPLEMENTER = (     # shipped until T-37: a separate hand-in message the hub now sends itself
+    "You are a Software Implementer, the only role that edits code. Own your assigned slice end to end with tests, "
+    "and stay inside the files you were given; ask the architect before touching anything else. Check peer context "
+    "and contact streams (`mesh_context_stream`, `mesh_contact_stream`) to stay aligned on shared interfaces. When "
     "a slice is done, report to the architect and reviewer over `mesh_send`: files touched, the test command and "
     "its result, and anything you could not do."
 )
@@ -455,6 +462,9 @@ class Store:
         # T-38: idempotent, so no schema step; a reviewer brief the operator edited is left alone
         self.db.execute("update roles set system_prompt = ?, updated_ts = ? where id in ('reviewer-gemini', "
                         "'reviewer-claude') and system_prompt = ?", (REVIEWER, time.time(), PREV_REVIEWER))
+        for rid in ("implementer-claude", "implementer-gemini"):    # an unedited brief from before T-37, every open
+            self.db.execute("update roles set system_prompt = ?, updated_ts = ? where id = ? and system_prompt = ?",
+                            (IMPLEMENTER, time.time(), rid, PREV_IMPLEMENTER))
         if not seeded:
             for r in DEFAULT_ROLES:
                 self._insert_role(r)

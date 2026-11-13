@@ -1804,6 +1804,51 @@ def amend_task(service, agent, caller, body: dict) -> dict:
     return dict(object=object_docs(service, [service.store.object_row(row["id"])], body=True)[0], entry=log_doc(entry))
 
 
+def _notify(service, row: dict, who: dict, status, handin: bool, head: dict | None, text: str, agent, caller) -> None:
+    """One notice per agent for a status change or a hand-in: the task's creator (unless it made the change), and the
+    squad's live lead when the creator is not live in the squad; on a hand-in also each live reviewer of the squad
+    (role_class of its role is `reviewer`), with the branch and commit. Never the agent that logged it; one message
+    to an agent that is more than one of these."""
+    move = f"{row['status']} → {status}" if status else "in review again"
+    notice = f"[{ref_of(row)} {move} by {who['agent_name']}] {row['title']}"
+    if handin:
+        notice += (f"\nBranch: {(head or {}).get('branch') or '(none)'}, commit: "
+                   f"{head['sha'][:7] if head and head.get('sha') else 'no commit recorded'}")
+    notice += f"\n\n{text}" if text else ""
+    by_creator = (row["created_by"] == who.get("session")) if row["created_by"] else row["created_by_name"] == who["agent_name"]
+    to = {}                              # session (or name) -> (name, session): one message per agent
+    peers = service.mesh_peers(squad_id=row["squad_id"]) if row["squad_id"] else []
+    live = {p["session_id"] for p in peers if p.get("session_id")}
+    skip = {who.get("session"), row["created_by"]} - {None}
+    if not by_creator:
+        to_name, to_session = row["created_by_name"], row["created_by"]
+        if to_session and (service.store.spawn_by_session(to_session) or {}).get("squad_id") != row["squad_id"]:
+            to_name, to_session = "operator", None     # filed in the backlog by another squad, dispatched since
+        if row["squad_id"] and row["created_by"] not in live:    # the operator, another squad or an ended session
+            lead = squad_lead(service, service.store.squad(row["squad_id"]) or {})
+            if (lead and lead["session_id"] in live and lead["session_id"] not in skip
+                    and (row["created_by"] or lead["agent_name"] != row["created_by_name"])):  # name-only lead: once
+                to[lead["session_id"]] = (lead["agent_name"], lead["session_id"])
+        to[to_session or to_name] = (to_name, to_session)
+    if handin:
+        roles = {r["id"]: r["title"] for r in service.store.roles()}
+        for p in peers:
+            if (p.get("session_id") and p["session_id"] not in skip
+                    and role_class(p.get("agent_role"), roles.get(p.get("agent_role"))) == "reviewer"):
+                to.setdefault(p["session_id"], (p["name"], p["session_id"]))
+    for to_name, to_session in to.values():
+        _hub_tell(service, to_name=to_name, to_session=to_session, text=notice, agent=agent, caller=caller,
+                  squad=row["squad_id"])
+
+
+def squad_lead(service, squad: dict) -> dict | None:
+    """The squad's lead: its first agent not added by another (launched first), at its newest session; its spawn row,
+    live or not."""
+    lead = next((a for a in squad.get("agents", []) if not a["spawned_by"]), None)       # oldest first
+    found = lead and service.store.spawned(squad_id=squad["id"], agent_name=lead["agent_name"], limit=1)
+    return found[0] if found else lead
+
+
 def log_to_object(service, agent, caller, body: dict, *, after: list | None = None) -> dict:
     """POST /api/mesh/object/log: append to a task's log, optionally changing its status or owner. A changed owner
     gets the assignment message; a changed status sends its creator one notice; a task becoming accepted is a context
@@ -1830,6 +1875,9 @@ def log_to_object(service, agent, caller, body: dict, *, after: list | None = No
     # an owner set in the same call is the one whose worktree shipped it
     head, note = (handin_head(service, dict(row, owner_session=owner["session_id"]) if owner else row) if handin
                   else (None, ""))
+    if status == "accepted" and merge_state(service, [row]).get(row["id"]) is False:     # said, never refused
+        note = (f"almanac-hub: accepted with {row['sha'][:7]} not in "
+                f"{(service.store.squad(row['squad_id']) or {}).get('cwd')}'s HEAD")
     text = "\n\n".join(x for x in (text, note) if x)
     who = log_identity(agent, caller)
     delivered = mid = entry = None
@@ -1848,14 +1896,8 @@ def log_to_object(service, agent, caller, body: dict, *, after: list | None = No
             row["id"], who=who, kind="assign" if owner else "status" if status else kind, body=text, status=status,
             owner_session=owner and owner["session_id"], owner_name=owner and owner["agent_name"], message_id=mid,
             head=head)
-    by_creator = (row["created_by"] == who.get("session")) if row["created_by"] else row["created_by_name"] == who["agent_name"]
-    if status and not by_creator:
-        notice = f"[{ref_of(row)} {row['status']} → {status} by {who['agent_name']}] {row['title']}"
-        to_name, to_session = row["created_by_name"], row["created_by"]
-        if to_session and (service.store.spawn_by_session(to_session) or {}).get("squad_id") != row["squad_id"]:
-            to_name, to_session = "operator", None     # filed in the backlog by another squad, dispatched since
-        _hub_tell(service, to_name=to_name, to_session=to_session,
-                  text=notice + (f"\n\n{text}" if text else ""), agent=agent, caller=caller, squad=row["squad_id"])
+    if status or handin:                 # a fix round (in review again) notifies like the first hand-in
+        _notify(service, row, who, status, handin, head, text, agent, caller)
     later = [] if after is None else after
     if status == "accepted":
         context_boundary(service, service.store.object_row(row["id"]), caller if agent else None, after=later)
@@ -2122,10 +2164,8 @@ def assign_task(service, ref, squad_id) -> dict:
         service.store.log_object(row["id"], who=dict(agent_name="operator"), kind="assign", squad_id=squad["id"],
                                  body=f"moved from the backlog into squad {squad['name']} ({squad['id']}) by operator")
         children = _move_children(service, row, squad)
-    lead = next((a for a in squad["agents"] if not a["spawned_by"]), None)        # oldest first: launched first
+    lead = squad_lead(service, squad)                                              # the move is done: never refuse now
     live = {p.get("session_id") for p in service.mesh_peers(squad_id=squad["id"])}
-    found = lead and service.store.spawned(squad_id=squad["id"], agent_name=lead["agent_name"], limit=1)
-    lead = found[0] if found else lead                                             # its newest session; the move is done: never refuse now
     out = dict(ok=True, ref=ref, squad_id=squad["id"], lead=lead and lead["agent_name"], lead_live=False, delivered=False,
                children=children)
     if lead and lead["session_id"] in live:

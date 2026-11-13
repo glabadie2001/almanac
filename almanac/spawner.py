@@ -200,7 +200,9 @@ def build_mesh_charter(
         "5a. **Tasks are objects** with refs like `T-12`; `mesh_objects()` lists your squad's plan and `mesh_object(ref)` "
         "reads one with its log. Architects file each slice with `mesh_file(kind=\"task\", title=..., body=..., owner=..., "
         "files=[...])` instead of describing it in a message: filing with an owner is the assignment. Owners hand in with "
-        "`mesh_log(ref, status=\"in review\", body=<files touched, test command and result, what is left>)`. As you go, "
+        "`mesh_log(ref, status=\"in review\", body=<files touched, test command and result, what is left>)` and nothing "
+        "else: the hub tells the creator (or the lead, if the creator is not in the squad) and the reviewer, with the "
+        "commit. A fix round is the same call. As you go, "
         "`mesh_log` what you learned (`kind=\"learned\"`), dead ends (`kind=\"dead\"`, or `kind=\"parked\"` with "
         "\"retry when ...\") and what comes next (`kind=\"next\"`). Reply about a task with `mesh_send(..., re=\"T-12\")`. "
         "Change a task's title, body or files with `mesh_amend(ref, ...)` (the log keeps the old text); a backlog task can sit "
@@ -1160,12 +1162,17 @@ def join_squad(
         if (squad.get("brief") or "").strip():
             kickoff.append(f"## Squad Mission ({squad['name']})\n{squad['brief'].strip()}")
         kickoff.append(f"## Your Initial Assignment (`{_ref(task_row, name)}`)\n{task or '(none given: ask whoever added you)'}")
-    tail = [f"You were added to the running squad by {who}. Report to {report_to} over `mesh_send` when your slice "
-            "is done: files touched, the test command and its result, anything you could not do."]
+    ref = _ref(task_row, "<your task>")
+    tail = [f"You were added to the running squad by {who}. Report to {report_to} over `mesh_send` for questions and "
+            f"blockers. When your slice is done, hand in with `mesh_log(ref=\"{ref}\", status=\"in review\", "
+            "body=<files touched, the test command and its result, anything you could not do>)` and send nothing else: "
+            "the hub tells the creator (or the lead, if the creator is not in the squad) and the reviewer, with your "
+            "commit. A fix round is the same call."]
     wmode = (operator_overrides.get("workspace_mode") or role.get("workspace_mode") or "shared").strip().lower()
     if wmode == "worktree":
         tail.append(f"You work in your own git worktree on branch `almanac/{squad_id}/{name}`, cut from a snapshot of "
-                    "the checkout at spawn time. Commit your work on that branch, and name the branch in your report.")
+                    "the checkout at spawn time. Commit your work on that branch; the hub records the branch and "
+                    "commit at hand-in.")
     tail.append("Coordinate with your squadmates via `mesh_send`, check `mesh_roster` and `mesh_context_stream` as "
                 "teammates make progress, and post major milestones to `#squad`.")
     if existing:       # the task and its log, cut to fit the command line (door.task_kickoff), then the same tail
