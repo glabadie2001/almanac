@@ -136,6 +136,10 @@ class Service:
         self.ingesting = threading.Lock()
         self.fleet_lock = threading.Lock()
         self.spawn_lock = threading.Lock()            # an agent's limit check and its spawn are one step
+        # ids of tasks whose fresh reviewer start is queued or running (_start_reviewer), under a lock of their own:
+        # a hand-in checks it without ever waiting on spawn_lock
+        self.review_starts: set[int] = set()
+        self.review_lock = threading.Lock()
         self.error = ""
         self.exit_code = 0                            # what `python -m almanac` returns when the door stops
         self.on_exit = None                           # set by __main__: stops the server; tests inject their own
@@ -1804,11 +1808,22 @@ def amend_task(service, agent, caller, body: dict) -> dict:
     return dict(object=object_docs(service, [service.store.object_row(row["id"])], body=True)[0], entry=log_doc(entry))
 
 
-def _notify(service, row: dict, who: dict, status, handin: bool, head: dict | None, text: str, agent, caller) -> None:
+def _standing_reviewers(service, peers: list[dict]) -> list[tuple[str, str]]:
+    """(name, session) of the squad's live reviewers (role_class `reviewer`) that are not one task's fresh reviewer
+    (spawned by the hub: _start_reviewer)."""
+    roles = {r["id"]: r["title"] for r in service.store.roles()}
+    return [(p["name"], p["session_id"]) for p in peers
+            if p.get("session_id") and p.get("spawned_by") != HUB["agent_name"]
+            and role_class(p.get("agent_role"), roles.get(p.get("agent_role"))) == "reviewer"]
+
+
+def _notify(service, row: dict, who: dict, status, handin: bool, head: dict | None, text: str, agent, caller,
+            *, reviewers="standing") -> tuple[str, set]:
     """One notice per agent for a status change or a hand-in: the task's creator (unless it made the change), and the
-    squad's live lead when the creator is not live in the squad; on a hand-in also each live reviewer of the squad
-    (role_class of its role is `reviewer`), with the branch and commit. Never the agent that logged it; one message
-    to an agent that is more than one of these."""
+    squad's live lead when the creator is not live in the squad; on a hand-in also its reviewers, with the branch and
+    commit: `reviewers` is "standing" (each live standing reviewer of the squad), None (none: a fresh reviewer is about
+    to start, _start_reviewer) or (name, session) (the task's own live fresh reviewer). Never the agent that logged
+    it; one message to an agent that is more than one of these. Returns (the notice, the sessions or names told)."""
     move = f"{row['status']} → {status}" if status else "in review again"
     notice = f"[{ref_of(row)} {move} by {who['agent_name']}] {row['title']}"
     if handin:
@@ -1830,15 +1845,14 @@ def _notify(service, row: dict, who: dict, status, handin: bool, head: dict | No
                     and (row["created_by"] or lead["agent_name"] != row["created_by_name"])):  # name-only lead: once
                 to[lead["session_id"]] = (lead["agent_name"], lead["session_id"])
         to[to_session or to_name] = (to_name, to_session)
-    if handin:
-        roles = {r["id"]: r["title"] for r in service.store.roles()}
-        for p in peers:
-            if (p.get("session_id") and p["session_id"] not in skip
-                    and role_class(p.get("agent_role"), roles.get(p.get("agent_role"))) == "reviewer"):
-                to.setdefault(p["session_id"], (p["name"], p["session_id"]))
+    if handin and reviewers:
+        for name, sid in ([reviewers] if isinstance(reviewers, tuple) else _standing_reviewers(service, peers)):
+            if sid not in skip:
+                to.setdefault(sid, (name, sid))
     for to_name, to_session in to.values():
         _hub_tell(service, to_name=to_name, to_session=to_session, text=notice, agent=agent, caller=caller,
                   squad=row["squad_id"])
+    return notice, set(to) | skip
 
 
 def squad_lead(service, squad: dict) -> dict | None:
@@ -1849,11 +1863,98 @@ def squad_lead(service, squad: dict) -> dict | None:
     return found[0] if found else lead
 
 
-def log_to_object(service, agent, caller, body: dict, *, after: list | None = None) -> dict:
+def launched_reviewer_role(service, squad: dict) -> dict | None:
+    """The role of the reviewer the squad was launched with (its first member not added by another whose role is a
+    reviewer by role_class), or None: a squad launched without one gets no fresh reviewers."""
+    titles = {r["id"]: r["title"] for r in service.store.roles()}
+    first = next((a for a in squad.get("agents", []) if not a["spawned_by"] and a.get("role_id")
+                  and role_class(a["role_id"], titles.get(a["role_id"])) == "reviewer"), None)
+    return service.store.role(first["role_id"]) if first else None
+
+
+def _start_reviewer(service, row: dict, role: dict, notice: str, told: set, agent, caller,
+                    hub: tuple[str, str]) -> None:
+    """Run once a task's first hand-in is answered: start one fresh member of `role` on it, whose kickoff is the task,
+    its log and how to review it, and record it on the task (data.reviewer) so a fix round reaches it and accepting
+    the task retires it (context_boundary). It counts toward the squad's spawn limit like any member, but it is the
+    hub's spawn, not an agent's mesh_spawn, so the squad's spawn_role does not bind it. When the limit is used up or
+    the start fails for any reason, the standing reviewers get the hand-in's notice instead and the task's log says
+    why: the hand-in itself has already been answered. The task stays in service.review_starts (entered by
+    log_to_object) until this is done, so a hand-in crossing it tells no reviewer and starts nothing."""
+    try:
+        _start_reviewer_now(service, row, role, notice, told, agent, caller, hub)
+    finally:
+        with service.review_lock:
+            service.review_starts.discard(row["id"])
+
+
+def _start_reviewer_now(service, row, role, notice, told, agent, caller, hub) -> None:
+    from almanac import spawner
+    ref = ref_of(row)
+    try:
+        with service.spawn_lock:                 # the limit check and the spawn are one step, as for mesh_spawn
+            fresh = service.store.object_row(row["id"])
+            if fresh["status"] != "in review" or fresh["data"].get("reviewer"):
+                return           # accepted or moved on since, or a crossing hand-in already started its reviewer
+            squad = service.store.squad(row["squad_id"]) or {}
+            used, limit = squad.get("spawn_used") or 0, squad.get("spawn_limit") or 0
+            if squad.get("status") != "active":
+                why = f"squad {row['squad_id']} is {squad.get('status') or 'gone'}"
+            elif used >= limit:
+                why = f"{used}/{limit} of the squad's spawn limit used"
+            else:
+                name = spawner.free_handle(service, squad, role)
+                log = list(reversed(service.store.object_log(row["id"], 100_000)))
+                res = spawner.spawn_agent(
+                    service, almanac_url=hub[0], token=hub[1], cwd=squad["cwd"], agent_name=name, role_id=role["id"],
+                    provider=role["provider"], workspace_mode="shared",
+                    initial_prompt=lambda room: task_kickoff(fresh, log, squad, room,
+                                                             _reviewer_tail(service, fresh, squad, name)),
+                    squad_id=squad["id"], squad_name=squad["name"], spawned_by=HUB["agent_name"],
+                    teammates=spawner.squad_roster(service, squad))
+                if res.get("ok"):
+                    service.store.merge_object_data(row["id"], reviewer=dict(agent_name=name,
+                                                                              session_id=res["session_id"]))
+                    service.store.log_object(row["id"], who=HUB, kind="note", body=(
+                        f"almanac-hub: {name} ({role['id']}) started to review {ref}, session {res['session_id']}; "
+                        "it is retired when the task is accepted"))
+                    return
+                why = res.get("error") or "it did not start"
+    except Exception as exc:          # noqa: BLE001 -- whatever stops the start, the hand-in still reaches a reviewer
+        logging.getLogger("almanac").warning("fresh reviewer for %s: %s", ref, exc)
+        why = str(exc) or type(exc).__name__
+    service.store.log_object(row["id"], who=HUB, kind="note", body=(
+        f"almanac-hub: no fresh reviewer for {ref} ({role['id']}): {why}. The squad's standing reviewers were told"))
+    for name, sid in _standing_reviewers(service, service.mesh_peers(squad_id=row["squad_id"])):
+        if sid not in told:
+            _hub_tell(service, to_name=name, to_session=sid, text=notice, agent=agent, caller=caller,
+                      squad=row["squad_id"])
+
+
+def _reviewer_tail(service, row: dict, squad: dict, name: str) -> str:
+    """What a fresh reviewer is to do: the latest hand-in's branch and commit (`row` as it stands now), how to read the
+    diff, where findings go."""
+    ref = ref_of(row)
+    owner = (service.store.spawn_by_session(row["owner_session"]) or {}).get("agent_name") if row["owner_session"] else None
+    lead = (squad_lead(service, squad) or {}).get("agent_name")
+    return (f"You are `{name}`, a fresh reviewer the hub started on {ref}'s hand-in: branch "
+            f"{row.get('branch') or '(none)'}, commit "
+            f"{row['sha'][:7] if row.get('sha') else '(no commit recorded)'}. You review this task only, "
+            "edit nothing, and are retired when it is accepted. Read the diff with "
+            f"`mesh_diff(ref=\"{ref}\")` (stat, path or commit narrow it) and run the tests of the files it touches. "
+            "Rate each finding (file:line, what breaks, how to reproduce) low, medium or high. Send lows to the owner "
+            f"`{owner or '(none)'}` only, mediums and highs to the owner and the lead `{lead or '#squad'}`, and your "
+            f"verdict to the lead, listing every finding with its rating and state, each with `mesh_send(..., "
+            f"re=\"{ref}\")`. A fix round on this task comes to you as a message with its new commit.")
+
+
+def log_to_object(service, agent, caller, body: dict, *, after: list | None = None,
+                  hub: tuple[str, str] | None = None) -> dict:
     """POST /api/mesh/object/log: append to a task's log, optionally changing its status or owner. A changed owner
-    gets the assignment message; a changed status sends its creator one notice; a task becoming accepted is a context
-    boundary (context_boundary). `after`: the route's list of steps to run once the response is written; without
-    one they run before this returns."""
+    gets the assignment message; a changed status sends its creator one notice; a task's first hand-in gets a fresh
+    reviewer (_start_reviewer; `hub`: (almanac_url, token) to start it with, None starts none); a task becoming
+    accepted is a context boundary (context_boundary). `after`: the route's list of steps to run once the response
+    is written; without one they run before this returns."""
     row = load_object(service, agent, caller, body.get("ref") or "")
     kind = str(body.get("kind") or "note").strip()
     if kind not in LOG_KINDS:
@@ -1896,9 +1997,28 @@ def log_to_object(service, agent, caller, body: dict, *, after: list | None = No
             row["id"], who=who, kind="assign" if owner else "status" if status else kind, body=text, status=status,
             owner_session=owner and owner["session_id"], owner_name=owner and owner["agent_name"], message_id=mid,
             head=head)
-    if status or handin:                 # a fix round (in review again) notifies like the first hand-in
-        _notify(service, row, who, status, handin, head, text, agent, caller)
     later = [] if after is None else after
+    reviewers, fresh = "standing", None
+    if handin:
+        # the task's own fresh reviewer while it lives; else, on its first hand-in, a fresh one of the launched
+        # reviewer's role (after the response); else the standing reviewers
+        mine = row["data"].get("reviewer") or {}
+        if mine:
+            live = {p["session_id"] for p in service.mesh_peers(squad_id=row["squad_id"]) if p.get("session_id")}
+            reviewers = (mine["agent_name"], mine["session_id"]) if mine.get("session_id") in live else "standing"
+        elif hub:
+            role = (launched_reviewer_role(service, service.store.squad(row["squad_id"]) or {})
+                    if status == "in review" else None)
+            with service.review_lock:
+                if row["id"] in service.review_starts:
+                    reviewers = None         # a start in flight covers it; its fallback tells the standing reviewers
+                elif role:
+                    service.review_starts.add(row["id"])
+                    fresh, reviewers = role, None
+    if status or handin:                 # a fix round (in review again) notifies like the first hand-in
+        notice, told = _notify(service, row, who, status, handin, head, text, agent, caller, reviewers=reviewers)
+        if fresh:
+            later.append(lambda: _start_reviewer(service, row, fresh, notice, told, agent, caller, hub))
     if status == "accepted":
         context_boundary(service, service.store.object_row(row["id"]), caller if agent else None, after=later)
     doc = dict(object=object_docs(service, [service.store.object_row(row["id"])], body=True)[0],
@@ -1944,6 +2064,10 @@ def context_boundary(service, row: dict, caller: dict | None, *, after: list) ->
             _retire(service, row, sp, caller, after)
         elif kind == "compact":
             _compact(service, row, sp, n)
+    # the task's fresh reviewer (_start_reviewer) is retired with it, whatever its role's policy
+    mine = service.store.spawn_by_session((row["data"].get("reviewer") or {}).get("session_id") or "")
+    if mine and mine["squad_id"] == squad and not mine.get("retired_ts"):
+        _retire(service, row, mine, caller, after)
 
 
 def _live_proc(service, sid: str) -> dict | None:
@@ -2586,14 +2710,24 @@ def make_handler(service, token, *, hosts=()):
                 return self._send(200, file_object(service, self.agent, service.caller(self.agent, self.agent_session),
                                                    self._body()))
             if method == "POST" and path == "/api/mesh/object/log":
-                after = []          # what must wait for the response: ending the caller itself (context_boundary)
-                self._send(200, log_to_object(service, self.agent, service.caller(self.agent, self.agent_session),
-                                              self._body(), after=after))
-                if after:
-                    self.close_connection = True
-                    self.wfile.flush()
-                for step in after:
-                    step()
+                # what must wait for the response: ending the caller itself (context_boundary), starting a fresh
+                # reviewer (_start_reviewer)
+                # reviewer (_start_reviewer). They run even when the write fails (a client that timed out): the log row
+                # is written, so a reviewer must still start and review_starts must still be cleared
+                after = []
+                port = getattr(self.server, "server_port", 8812)
+                try:
+                    self._send(200, log_to_object(service, self.agent, service.caller(self.agent, self.agent_session),
+                                                  self._body(), after=after, hub=(f"http://127.0.0.1:{port}", token)))
+                    if after:
+                        self.close_connection = True
+                        self.wfile.flush()
+                finally:
+                    for step in after:
+                        try:
+                            step()
+                        except Exception:          # noqa: BLE001 -- one step failing never skips the next
+                            logging.getLogger("almanac").exception("a step after %s failed", path)
                 return None
             if method == "POST" and path == "/api/mesh/object/amend":
                 return self._send(200, amend_task(service, self.agent, service.caller(self.agent, self.agent_session),
