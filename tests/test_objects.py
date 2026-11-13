@@ -6,12 +6,13 @@ import subprocess
 import urllib.parse
 from unittest import mock
 
-from support import TOKEN
+from support import TOKEN, runner_probe
 from test_fleet import CLI
 from test_server_fixes import MeshRig
 from test_spawn_fixes import git
 
 from almanac import spawner, uds, web
+from almanac.door import Service, make_handler
 from almanac.store import Store
 
 
@@ -529,7 +530,9 @@ class HandinTests(ObjectRig):
         second = self.commit(self.wt, "two.py")                       # the fix round: still in review
         res = self.hand_in("T-1", body="fixed F1")
         self.assertEqual((res["object"]["sha"], res["entry"]["sha"], res["object"]["merged"]), (second, second, False))
-        self.assertEqual([e["sha"] for e in self.read("T-1")["log"][:2]], [second, first])
+        # T-30: a squad with a launched reviewer and no slot left has a hub row saying why no fresh reviewer started
+        self.assertEqual([e["sha"] for e in self.read("T-1")["log"] if e["agent_name"] != "almanac-hub"][:2],
+                         [second, first])
         self.assertEqual(self.branches()[0]["ahead"], 2)
 
         git(self.repo, "merge", "-q", "--no-ff", "-m", "merge", "almanac/sq-1/impl")
@@ -774,6 +777,182 @@ class HandinNoticeTests(HandinTests):
         self.hand_in("T-1", body="again")
         to = sorted(r[0] for r in self.store.db.execute("select to_name from messages where id > ?", (before,)))
         self.assertEqual(to, ["arch", "operator", "rev"], "arch hears as a reviewer only")
+
+
+class FreshReviewerTests(ObjectRig):
+    """T-30: a task's first hand-in gets a fresh reviewer of the launched reviewer's role, started by the hub after
+    the response; a fix round reaches it; accepting the task retires it; no slot or a failed start falls back to the
+    standing reviewers. arch leads, rev is the standing reviewer, impl builds; the squad folder is outside git."""
+
+    PEERS = ObjectRig.PEERS + (("rev", 900, "sq-1", ["#squad"]),)
+
+    def setUp(self):
+        super().setUp()
+        self.service.probe = runner_probe(self.root, claude=True, gemini=False)
+        self.service._runners = None
+        self.store.record_spawn(agent_name="rev", session_id="sess-rev", squad_id="sq-1", role_id="reviewer-claude",
+                                provider="claude", model=None, effort=None, cwd=str(self.root), worktree_path=None,
+                                pid=0)
+        # the lead's mesh_spawn may add implementers only: the hub's reviewer is not bound by that
+        self.store.update_squad("sq-1", spawn_role="implementer-claude", spawn_limit=2)
+        self.argv = []
+        real = subprocess.Popen
+
+        def popen(argv, **kwargs):
+            if argv[0] == "git":                           # the hand-in's head read runs for real
+                return real(argv, **kwargs)
+            self.argv.append(list(argv))
+            return mock.MagicMock(pid=9000 + len(self.argv), **{"poll.return_value": None})
+        patcher = mock.patch.object(spawner.subprocess, "Popen", side_effect=popen)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def counts(self):
+        return {name: len(got) for name, got in self.inbox.items() if got}
+
+    def clear(self):
+        for got in self.inbox.values():
+            got.clear()
+
+    def hand_in(self, ref="T-1", body="done"):
+        status, _, res = self.log(self.tok("impl"), ref=ref, status="in review", body=body)
+        self.assertEqual(status, 200, res)
+        return res
+
+    def task(self, ref="T-1"):
+        return self.get("/api/mesh/object", ref=ref, log_limit=50)[2]
+
+    def hub_rows(self, ref="T-1"):
+        return [e["body"] for e in self.task(ref)["log"] if e["agent_name"] == "almanac-hub"]
+
+    def reviewer(self, ref="T-1"):
+        return self.store.object_row(int(ref[2:]))["data"].get("reviewer")
+
+    def go_live(self, name, sid, pid):
+        """The started reviewer's process registers on the mesh, as a real one would."""
+        self.inbox[name] = []
+        peer = uds.PeerServer(self.root / "claude" / "sessions", name=name, pid=pid, session_id=sid,
+                              cwd=str(self.root), provider="claude", squad_id="sq-1", channels=["#squad"],
+                              on_message=self.inbox[name].append, in_memory=True).start()
+        self.addCleanup(peer.close)
+        self.machine.procs[pid] = dict(ppid=1, exe="claude.exe", path=CLI, cmd=f'"{CLI}"',
+                                       created=int(peer.proc_start), cpu=0, mem=1 << 20)
+        self.fleet.last["at"] = 0
+        return peer
+
+    def test_a_first_hand_in_starts_one_reviewer_of_the_launched_role_and_records_it(self):
+        self.file(self.tok("arch"), owner="impl", title="store slice", body="Build the store slice.")
+        self.clear()
+        self.hand_in(body="store.py; 12 OK")
+        self.assertEqual(len(self.argv), 1, "exactly one reviewer started")
+        mine = self.reviewer()
+        row = self.store.spawn_by_session(mine["session_id"])
+        self.assertEqual((mine["agent_name"], row["role_id"], row["spawned_by"], row["worktree_path"]),
+                         ("rev-claude", "reviewer-claude", "almanac-hub", None))
+        self.assertEqual(self.store.squad("sq-1")["spawn_used"], 1, "it counts toward the limit")
+        self.assertEqual(self.counts(), {"arch": 1}, "the standing reviewer is not also told: no double review")
+        kickoff = self.argv[0][-1]
+        for part in ("## Your task (`T-1`): store slice", "Build the store slice.", "store.py; 12 OK",
+                     'mesh_diff(ref="T-1")', "owner `impl`", "lead `arch`", "edit nothing"):
+            self.assertIn(part, kickoff)
+        [note] = self.hub_rows()
+        self.assertIn(f"rev-claude (reviewer-claude) started to review T-1, session {mine['session_id']}", note)
+
+    def test_a_fix_round_starts_none_and_reaches_that_reviewer_while_it_lives(self):
+        self.file(self.tok("arch"), owner="impl")
+        self.hand_in()
+        mine = self.reviewer()
+        peer = self.go_live(mine["agent_name"], mine["session_id"], 9001)
+        self.clear()
+        self.hand_in(body="fixed F1")
+        self.assertEqual(len(self.argv), 1, "a fix round starts nobody")
+        self.assertEqual(self.counts(), {"arch": 1, "rev-claude": 1})
+        self.assertIn("in review again", json.dumps(self.inbox["rev-claude"][0]))
+        self.log(self.tok("impl"), ref="T-1", status="in progress", body="one more")
+        self.clear()
+        self.hand_in(body="fixed F2")                      # in review from another status, a reviewer on record
+        self.assertEqual((len(self.argv), self.counts()), (1, {"arch": 1, "rev-claude": 1}))
+        peer.close()                                       # it ended: the standing reviewer takes the fix round
+        self.machine.procs.pop(9001)
+        self.fleet.last["at"] = 0
+        self.clear()
+        self.hand_in(body="fixed F3")
+        self.assertEqual((len(self.argv), self.counts()), (1, {"arch": 1, "rev": 1}))
+
+    def test_no_slot_left_falls_back_to_the_standing_reviewer_with_a_log_row(self):
+        self.store.update_squad("sq-1", spawn_limit=0)
+        self.file(self.tok("arch"), owner="impl")
+        self.clear()
+        res = self.hand_in()
+        self.assertEqual((res["object"]["status"], self.argv), ("in review", []))
+        self.assertEqual(self.counts(), {"arch": 1, "rev": 1})
+        self.assertIn("[T-1 in progress → in review by impl]", json.dumps(self.inbox["rev"][0], ensure_ascii=False))
+        [why] = self.hub_rows()
+        self.assertIn("no fresh reviewer for T-1 (reviewer-claude): 0/0 of the squad's spawn limit used", why)
+        self.assertIsNone(self.reviewer())
+
+    def test_a_start_that_raises_or_fails_falls_back_and_the_hand_in_stands(self):
+        self.file(self.tok("arch"), owner="impl")
+        self.clear()
+        with mock.patch.object(spawner, "spawn_agent", side_effect=RuntimeError("provider rejected the model")), \
+                self.assertLogs("almanac", "WARNING"):
+            self.hand_in()
+        self.assertEqual(self.counts(), {"arch": 1, "rev": 1})
+        self.assertIn("provider rejected the model", self.hub_rows()[0])
+        # a reviewer whose runner is missing: spawn_agent answers ok=False, nothing raised
+        self.store.db.execute("update spawned_agents set role_id = 'reviewer-gemini' where agent_name = 'rev'")
+        self.store.db.commit()
+        self.file(self.tok("arch"), owner="impl")
+        self.clear()
+        self.hand_in("T-2")
+        self.assertEqual((self.counts(), self.argv), ({"arch": 1, "rev": 1}, []))
+        self.assertIn("Gemini runner not found", self.hub_rows("T-2")[0])
+        self.assertEqual(self.store.squad("sq-1")["spawn_used"], 0)
+
+    def test_a_squad_launched_without_a_reviewer_is_as_before(self):
+        self.store.db.execute("update spawned_agents set spawned_by = 'arch' where agent_name = 'rev'")  # added later
+        self.store.db.commit()
+        self.file(self.tok("arch"), owner="impl")
+        self.clear()
+        self.hand_in()
+        self.assertEqual((self.argv, self.hub_rows(), self.reviewer()), ([], [], None))
+        self.assertEqual(self.counts(), {"arch": 1, "rev": 1}, "T-37's notice, as it was")
+
+    def test_accepting_the_task_retires_its_reviewer_and_not_the_standing_one(self):
+        self.file(self.tok("arch"), owner="impl")
+        self.hand_in()
+        mine = self.reviewer()
+        status, _, res = self.log(self.tok("arch"), ref="T-1", status="accepted")
+        self.assertEqual(status, 200, res)
+        self.assertIsNotNone(self.store.spawn_by_session(mine["session_id"])["retired_ts"])
+        self.assertIsNone(self.store.spawn_by_session("sess-rev")["retired_ts"])
+        self.assertEqual(self.store.squad("sq-1")["spawn_used"], 0, "its slot comes back")
+        retired = [e["body"] for e in self.task()["log"] if e["kind"] == "retired"]
+        self.assertEqual(len(retired), 1)
+        self.assertIn("rev-claude retired on T-1", retired[0])
+
+    def test_two_tasks_handed_in_back_to_back_get_two_reviewers(self):
+        self.file(self.tok("arch"), owner="impl")
+        self.file(self.tok("arch"), owner="impl")
+        self.hand_in("T-1")
+        self.hand_in("T-2")
+        self.assertEqual(len(self.argv), 2)
+        names = (self.reviewer("T-1")["agent_name"], self.reviewer("T-2")["agent_name"])
+        self.assertEqual(names, ("rev-claude", "rev-claude-2"))
+        self.assertIn("## Your task (`T-2`)", self.argv[1][-1])
+
+    def test_a_restart_between_the_hand_in_and_the_fix_round_still_finds_the_reviewer(self):
+        self.file(self.tok("arch"), owner="impl")
+        self.hand_in()
+        mine = self.reviewer()
+        self.service = Service(self.store, self.projects, 300, fleet=self.fleet, state=self.state)
+        self.service.probe = runner_probe(self.root, claude=True, gemini=False)
+        self.handler = make_handler(self.service, TOKEN)
+        self.go_live(mine["agent_name"], mine["session_id"], 9001)
+        self.clear()
+        self.hand_in(body="fixed F1")
+        self.assertEqual((len(self.argv), self.counts()), (1, {"arch": 1, "rev-claude": 1}))
+
 
 class ImplementerBriefTests(ObjectRig):
     def test_an_unedited_brief_is_upgraded_and_an_edited_one_kept(self):            # F2

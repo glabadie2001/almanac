@@ -1851,6 +1851,20 @@ class Store:
                 self.db.execute("update spawned_agents set retired_ts = null where session_id = ?", (session_id,))
             self.db.commit()
 
+    def merge_object_data(self, oid: int, **values) -> None:
+        """Set keys of an object's `data` (its other keys kept), read and written as one step."""
+        with self.lock:
+            r = self.db.execute("select data from objects where id = ?", (oid,)).fetchone()
+            if r is None:
+                raise LookupError(oid)
+            try:
+                data = json.loads(r[0] or "{}")
+            except ValueError:
+                data = {}
+            data = dict(data if isinstance(data, dict) else {}, **values)
+            self.db.execute("update objects set data = ? where id = ?", (json.dumps(data), oid))
+            self.db.commit()
+
 
 CONTEXT_POLICY_FORMS = "none, fresh-per-task, or compact-at-<tokens> (compact-at-300000 or compact-at-300k)"
 

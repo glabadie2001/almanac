@@ -218,6 +218,22 @@ class JoinTests(ElasticRig):
         self.assertNotIn("Grow the squad", spawner.build_mesh_charter(agent_name="a", provider="claude", role_title="R",
                                                                       role_prompt="p", almanac_url="u"))
 
+    def test_a_hand_ins_fresh_reviewer_takes_a_slot_the_lead_then_lacks(self):                     # T-30
+        self.store.record_spawn(agent_name="rev", session_id="sess-rev", squad_id="sq-1", role_id="reviewer-claude",
+                                provider="claude", model=None, effort=None, cwd=str(self.ws), worktree_path=None, pid=1)
+        self.store.update_squad("sq-1", spawn_limit=1)
+        arch, impl = web.agent_token(TOKEN, "arch", "sess-arch"), web.agent_token(TOKEN, "impl", "sess-impl")
+        status, _, res = self.request(self.handler, "/api/mesh/object", token=arch, method="POST",
+                                      body={"title": "a slice", "owner": "impl"})
+        self.assertEqual(status, 200, res)
+        with mock.patch("almanac.door.handin_head", return_value=(None, "")):
+            status, _, res = self.request(self.handler, "/api/mesh/object/log", token=impl, method="POST",
+                                          body={"ref": res["object"]["ref"], "status": "in review", "body": "done"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual((len(self.argv), self.used()), (1, 1), "the hub started a reviewer of the launched role")
+        status, _, res = self.spawn()
+        self.assertEqual((status, res["error"]), (403, "1/1 used; ask the operator to raise the limit"))
+
     def test_a_name_already_live_is_refused(self):
         self.assertEqual(self.spawn(name="impl")[0], 400)
 
