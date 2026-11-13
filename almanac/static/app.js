@@ -2412,7 +2412,7 @@ function decideBody(status, comment) {
 const decideBars = {};
 function decideBar(o) {
   if (decideBars[o.ref]) return decideBars[o.ref];
-  const box = el("textarea", { rows: 2, placeholder: "comment (needed to send back)", style: "width:100%" });
+  const box = el("textarea", { rows: 2, placeholder: "comment (needed to send back)", "aria-label": "comment (needed to send back)", style: "width:100%" });
   const msg = el("span", { cls: "red" });
   const btns = ["accepted", "in progress"].map((status) =>
     el("button", { type: "button", cls: "btn hi", text: status === "accepted" ? "[ACCEPT]" : "[SEND BACK]" }));
@@ -2460,7 +2460,7 @@ async function loadTask(ref) {
   feed.replaceChildren(
     el("li", { cls: "you" }, o.body ? renderMd(o.body) : "(no body)"),
     el("li", { cls: "result", text: o.files?.length ? `files: ${o.files.join(", ")}` : "files: none" }),
-    ...(o.status === "in review" ? [decideBar(o)] : []),
+    ...(o.status === "in review" ? [decideBar(o)] : (delete decideBars[o.ref], [])),   // a later round starts a fresh bar
     ...(log.length
       ? log.map((l) => el("li", { cls: logCls(l.kind), title: new Date(l.ts * 1000).toLocaleString() }, logHead(l), l.body ? renderMd(l.body) : null))
       : [el("li", { cls: "result", text: "no log entries yet" })]),
