@@ -2447,6 +2447,47 @@ function decideBar(o) {
   return el("div", { cls: "field" }, box, el("div", { cls: "bar-line" }, ...btns, msg));
 }
 
+// plan-page:begin
+// a plan's descendants (not a nested plan's) in the rows' order, a parent before its parts, each with its depth below the plan (1: a slice)
+function planOrder(rows, planRef) {
+  const kids = new Map(), out = [], seen = new Set([planRef]);
+  for (const o of rows) if (o.parent) kids.set(o.parent, [...(kids.get(o.parent) || []), o]);
+  const walk = (ref, depth) => {
+    for (const o of kids.get(ref) || []) {
+      if (seen.has(o.ref) || o.data?.plan) continue;      // a nested plan is decided on its own, with its slices
+      seen.add(o.ref); out.push({ row: o, depth }); walk(o.ref, depth + 1);
+    }
+  };
+  walk(planRef, 1);
+  return out;
+}
+// plan-page:end
+// A plan's page: its slices' bodies, in tree order, below the plan's own. One GET /api/mesh/object per slice, only when
+// the plan is first opened or its slices' rows change (updated_ts moves on an amend or a status change), never on the
+// refreshes in between: those render from `planPages`.
+const planPages = { ref: null, sig: "", bodies: {}, pending: null };
+async function planPage(plan, rows) {
+  const slices = planOrder(rows, plan.ref);
+  const sig = JSON.stringify(slices.map(({ row }) => [row.ref, row.updated_ts]));
+  if (planPages.ref !== plan.ref || planPages.sig !== sig) {
+    const bodies = {};
+    Object.assign(planPages, { ref: plan.ref, sig, bodies, pending: Promise.all(slices.map(async ({ row }) => {
+      try { bodies[row.ref] = (await planGet(`/api/mesh/object?ref=${encodeURIComponent(row.ref)}`))?.object?.body ?? ""; }
+      catch (err) { bodies[row.ref] = null; }
+    })).then(() => {                                  // a failed GET is retried by the next refresh, not in a loop
+      if (planPages.bodies === bodies && Object.values(bodies).includes(null)) planPages.sig = "";
+    }) });
+  }
+  const { pending, bodies } = planPages;               // this call's own, not a later call's
+  await pending;
+  return slices.flatMap(({ row, depth }) => {
+    const body = bodies[row.ref], tier = [row.data?.model, row.data?.effort].filter(Boolean).join(", ");
+    return [el("li", { cls: "result" }, depth > 1 ? el("span", { cls: "dim", text: "└ " }) : null, el("span", { cls: "cyan", text: row.ref }), ` ${row.title} `,
+        statusPill(row.status), tier ? el("span", { cls: "dim", text: ` ${tier}` }) : null),
+      el("li", { cls: "you" }, body ? renderMd(body) : el("span", { cls: "dim", text: body === null ? "(could not load this slice)" : "(no body)" }))];
+  });
+}
+
 async function loadTask(ref) {
   let doc;
   try {
@@ -2473,15 +2514,27 @@ async function loadTask(ref) {
   const logCls = (k) => (k === "dead" ? "error" : k === "message" ? "peer_out" : k === "status" || k === "assign" || k === "dispatch" || k === "respawn" || k === "retired" || k === "compact" || k === "parent" || k === "amend" ? "tool" : "claude");
   // a refresh (every objects_rev change re-runs this for the open task) keeps the reader's place, measured from the
   // bottom because new log entries arrive at the top; only a newly opened task, or a reader at the top, starts at the top
-  const feed = $("mesh-ctx-feed"), fromBottom = feed.scrollTop ? feed.scrollHeight - feed.scrollTop : 0;
+  const slices = o.data?.plan ? await planPage(o, planState.rows) : [];
+  if (meshState.selTask !== ref) return;
+  const feed = $("mesh-ctx-feed");
+  // nothing changed since the last paint (a 30 s or objects_rev refresh): leave the nodes, so a selection or a scrolled <pre> stays
+  const sig = JSON.stringify([o.ref, o.body, o.files, log.map((l) => l.id ?? [l.ts, l.kind, l.body]), slices.map((n) => n.textContent)]);
+  if (feed.childElementCount && feed.dataset.sig === sig) return;
+  feed.dataset.sig = sig;
+  // a reader in the log is anchored from the bottom (new entries arrive at the top of the log); above it, the plan and
+  // its slices, the position is kept as it is
+  const top = feed.scrollTop, first = feed.querySelector("li[data-log]");
+  const inLog = first && top >= first.getBoundingClientRect().top - feed.getBoundingClientRect().top + top;
+  const fromBottom = inLog ? feed.scrollHeight - top : 0;
   feed.replaceChildren(
     el("li", { cls: "you" }, o.body ? renderMd(o.body) : "(no body)"),
+    ...slices,
     el("li", { cls: "result", text: o.files?.length ? `files: ${o.files.join(", ")}` : "files: none" }),
     ...(log.length
-      ? log.map((l) => el("li", { cls: logCls(l.kind), title: new Date(l.ts * 1000).toLocaleString() }, logHead(l), l.body ? renderMd(l.body) : null))
+      ? log.map((l) => el("li", { cls: logCls(l.kind), "data-log": "1", title: new Date(l.ts * 1000).toLocaleString() }, logHead(l), l.body ? renderMd(l.body) : null))
       : [el("li", { cls: "result", text: "no log entries yet" })]),
   );
-  feed.scrollTop = fromBottom ? feed.scrollHeight - fromBottom : 0;   // the log is newest first
+  feed.scrollTop = inLog ? feed.scrollHeight - fromBottom : top;   // the log is newest first
 }
 
 // ------------------------------------------------------------------ mesh: backlog (tasks no squad has taken yet)

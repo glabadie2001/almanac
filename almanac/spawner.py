@@ -1177,9 +1177,10 @@ def join_squad(
     tail.append("Coordinate with your squadmates via `mesh_send`, check `mesh_roster` and `mesh_context_stream` as "
                 "teammates make progress, and post major milestones to `#squad`.")
     if existing:       # the task and its log, cut to fit the command line (door.task_kickoff), then the same tail
-        from almanac.door import task_kickoff
+        from almanac.door import plan_note, task_kickoff
+        note = plan_note(service, task_row)
         log = list(reversed(service.store.object_log(task_row["id"], 100_000)))
-        prompt = lambda room: task_kickoff(task_row, log, squad, room, "\n\n".join(tail), extra=task, files=files)  # noqa: E731
+        prompt = lambda room: task_kickoff(task_row, log, squad, room, "\n\n".join(tail), extra=task, files=files, plan=note)  # noqa: E731
     else:
         prompt = "\n\n".join(kickoff + tail)
     res = spawn_agent(
