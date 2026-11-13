@@ -717,6 +717,7 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
     p_file.add_argument("--roster", nargs="*", help="backlog: role or role:name, lead first")
     p_file.add_argument("--spawn-role")
     p_file.add_argument("--spawn-limit", type=int)
+    p_file.add_argument("--plan", action="store_true", help="this task is the squad's plan (leads only)")
 
     p_log = sp.add_parser("log")
     p_log.add_argument("ref")
@@ -774,7 +775,7 @@ def _run_cli(argv: list[str], client: MeshClient) -> int:
         res = client.call_tool("mesh_file", {"kind": ns.kind, "title": ns.title, "body": ns.body, "files": ns.files,
                                              "owner": ns.owner, "parent": ns.parent, "status": ns.status,
                                              "backlog": ns.backlog, "spawn_role": ns.spawn_role,
-                                             "spawn_limit": ns.spawn_limit,
+                                             "spawn_limit": ns.spawn_limit, "plan": ns.plan,
                                              "roster": [dict(zip(("role", "name"), m.split(":", 1)))
                                                         for m in ns.roster] if ns.roster is not None else None})
     elif ns.cmd == "log":
