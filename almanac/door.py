@@ -14,6 +14,8 @@ GET  /api/mesh/graph?squad=  topology: the squad's agents (ended ones too), oper
 POST /api/mesh/send          deliver over Claude's `uds-messaging` protocol (direct or `@squad`/`@all`/`#channel`);
                              `needs` reply|blocking flags it open until answered; an agent reaches `operator` only
                              if its role may page the operator, or to answer the operator's last message
+GET  /api/mesh/branches?squad= the squad's member branches holding commits not in its folder's HEAD, each with
+                             `ahead` (its commit count past HEAD) or the `error` git gave
 GET  /api/worktime           per agent: work / wait / idle seconds and per-bucket heat, plus how the agents overlapped
                              (`squad=` or `sessions=a,b,c`, optional `bucket=` seconds); `messages` and `marks`
                              (errors, edits) for the swimlane
@@ -1240,7 +1242,7 @@ TITLE_MAX, BODY_MAX, FILES_MAX = 120, 8000, 50
 LOG_KINDS = ("note", "learned", "dead", "parked", "next")       # what an agent may write; create/status/assign/message
                                                                  # are the hub's own
 LOG_FIELDS = ("id", "ts", "agent_name", "role_id", "provider", "kind", "body", "status_from", "status_to", "owner_to",
-              "message_id")
+              "message_id", "sha")
 
 
 WHY_MAX = 200
@@ -1364,6 +1366,7 @@ def object_docs(service, rows: list[dict], *, body: bool = False) -> list[dict]:
         if sid and sid not in names:
             names[sid] = (service.store.spawn_by_session(sid) or {}).get("agent_name")
     stats = service.store.object_stats([r["id"] for r in rows])
+    merged = merge_state(service, rows)
     out = []
     for r in rows:
         st, sid = stats[r["id"]], r["owner_session"]
@@ -1375,6 +1378,7 @@ def object_docs(service, rows: list[dict], *, body: bool = False) -> list[dict]:
                    owner_context_total=totals.get(sid, False), files=r["files"],
                    created_by_name=r["created_by_name"], created_ts=r["created_ts"], updated_ts=r["updated_ts"],
                    project=r["project"], data=r["data"],
+                   sha=r["sha"], branch=r["branch"], base=r["base"], merged=merged.get(r["id"]),
                    children=dict(total=st["children"][0], accepted=st["children"][1]), log_count=st["log_count"],
                    last_log=last and dict(ts=last["ts"], agent_name=last["agent_name"], kind=last["kind"],
                                           body=last["body"][:200], status_to=last["status_to"]))
@@ -1382,6 +1386,78 @@ def object_docs(service, rows: list[dict], *, body: bool = False) -> list[dict]:
             doc["body"] = r["body"]
         out.append(doc)
     return out
+
+
+def merge_state(service, rows: list[dict]) -> dict:
+    """{id: merged} for the rows that carry a sha: True when the sha is in its squad folder's HEAD. One
+    `git rev-list <sha>... --not HEAD` per squad (a sha it prints is not merged). Computed on each read, never stored;
+    a call that fails leaves its rows out (merged None)."""
+    from almanac.spawner import git_try
+    by_squad: dict = {}
+    for r in rows:
+        if r["sha"] and r["squad_id"]:
+            by_squad.setdefault(r["squad_id"], []).append(r)
+    out = {}
+    for squad_id, group in by_squad.items():
+        cwd = (service.store.squad(squad_id) or {}).get("cwd")
+        shas = sorted({r["sha"] for r in group})
+        ok, text = git_try(cwd, "rev-list", *shas, "--not", "HEAD", "--") if cwd else (False, "")
+        if ok:
+            unmerged = set(text.split())
+            out.update({r["id"]: r["sha"] not in unmerged for r in group})
+    return out
+
+
+def handin_head(service, row: dict) -> tuple[dict | None, str]:
+    """What a task going `in review` shipped: ({sha, branch, base}, a note for its log row). The owner's worktree
+    HEAD with its branch and base; an owner without a worktree (or no owner): the squad folder's HEAD, no branch.
+    A git call that fails or times out records nothing and says so: it never refuses the hand-in."""
+    from almanac.spawner import branch_and_base, git_try
+    sp = service.store.spawn_by_session(row["owner_session"]) if row["owner_session"] else None
+    wt = (sp or {}).get("worktree_path")
+    where = wt or (service.store.squad(row["squad_id"]) or {}).get("cwd")
+    if not where:
+        return None, "almanac-hub: no commit recorded: the task has no folder to read"
+    ok, sha = git_try(where, "rev-parse", "--verify", "HEAD")
+    if not ok and not wt and "not a git repository" in sha:
+        return None, ""                       # a squad folder outside git: nothing to record, nothing gone wrong
+    if not ok:
+        return None, f"almanac-hub: no commit recorded: {sha}"
+    branch, base = (sp.get("branch"), sp.get("base")) if wt else (None, None)
+    if wt and not branch:                     # spawned before T-46: its row has neither
+        branch, base = branch_and_base(wt)
+    head = dict(sha=sha, branch=branch, base=base)
+    ok, dirty = git_try(where, "status", "--porcelain")
+    if not ok:
+        return head, f"almanac-hub: could not check {where} for uncommitted changes: {dirty}"
+    if dirty:
+        return head, (f"almanac-hub: {len(dirty.splitlines())} uncommitted path(s) in {where} are not in "
+                      f"{sha[:7]}")
+    return head, ""
+
+
+def squad_branches(service, agent, caller, query: dict) -> dict:
+    """GET /api/mesh/branches?squad=: the squad's member branches holding commits its folder's HEAD lacks (what
+    ending a squad must name), newest member first, one `rev-list --count` each. A branch git cannot count is listed
+    with its error, never left out."""
+    from almanac.spawner import branch_and_base, git_try
+    squad_id = object_squad(service, agent, caller, query.get("squad"))
+    cwd = (service.store.squad(squad_id) or {}).get("cwd")
+    out, seen = [], set()
+    for sp in service.store.spawned(squad_id=squad_id, limit=10_000):
+        wt = sp.get("worktree_path")
+        if not wt or wt in seen:
+            continue
+        seen.add(wt)
+        branch = sp.get("branch") or branch_and_base(wt)[0]
+        doc = dict(agent_name=sp["agent_name"], branch=branch, worktree=wt, ahead=None)
+        ok, n = (git_try(cwd, "rev-list", "--count", f"HEAD..refs/heads/{branch}", "--") if branch
+                 else (False, "its branch is unknown"))
+        if not ok:
+            out.append(dict(doc, error=n))
+        elif int(n):
+            out.append(dict(doc, ahead=int(n)))
+    return dict(squad=squad_id, branches=out)
 
 
 def log_doc(entry: dict) -> dict:
@@ -1681,8 +1757,9 @@ def log_to_object(service, agent, caller, body: dict, *, after: list | None = No
     if kind not in LOG_KINDS:
         raise ValueError(f"kind {kind!r}: one of {', '.join(LOG_KINDS)}")
     text = _text(body, "body")
-    status = _status(body["status"]) if body.get("status") else None
-    status = status if status != row["status"] else None
+    asked = _status(body["status"]) if body.get("status") else None
+    status = asked if asked != row["status"] else None
+    handin = asked == "in review" and bool(row["squad_id"])     # again while in review: a fix round moves the sha
     if body.get("owner") and not row["squad_id"]:
         raise ValueError(f"{ref_of(row)} is in the backlog: it has no owner until it is dispatched")
     if agent and body.get("status") and not row["squad_id"] and body["status"] != row["status"]:
@@ -1691,8 +1768,12 @@ def log_to_object(service, agent, caller, body: dict, *, after: list | None = No
     owner = owner if owner and owner["session_id"] != row["owner_session"] else None
     reparent = body.get("parent") is not None
     new_parent = _new_parent(service, row, body["parent"]) if reparent else None
-    if not (text or status or owner or reparent):
+    if not (text or status or owner or reparent or handin):
         raise ValueError("body is required unless status, owner or parent changes")
+    # an owner set in the same call is the one whose worktree shipped it
+    head, note = (handin_head(service, dict(row, owner_session=owner["session_id"]) if owner else row) if handin
+                  else (None, ""))
+    text = "\n\n".join(x for x in (text, note) if x)
     who = log_identity(agent, caller)
     delivered = mid = entry = None
     if reparent:
@@ -1703,12 +1784,13 @@ def log_to_object(service, agent, caller, body: dict, *, after: list | None = No
             entry = service.store.reparent_object(
                 row["id"], new_parent and new_parent["id"], who=who,
                 body=f"parent {old} → {ref_of(new_parent) if new_parent else '(none)'}")
-    if text or status or owner:
+    if text or status or owner or handin:
         if owner:
             delivered, mid = _assign(service, dict(row, owner_session=owner["session_id"]), owner, agent, caller)
         entry = service.store.log_object(
             row["id"], who=who, kind="assign" if owner else "status" if status else kind, body=text, status=status,
-            owner_session=owner and owner["session_id"], owner_name=owner and owner["agent_name"], message_id=mid)
+            owner_session=owner and owner["session_id"], owner_name=owner and owner["agent_name"], message_id=mid,
+            head=head)
     by_creator = (row["created_by"] == who.get("session")) if row["created_by"] else row["created_by_name"] == who["agent_name"]
     if status and not by_creator:
         notice = f"[{ref_of(row)} {row['status']} → {status} by {who['agent_name']}] {row['title']}"
@@ -2295,6 +2377,9 @@ def make_handler(service, token, *, hosts=()):
                 if path == "/api/mesh/objects":
                     caller = service.caller(self.agent, self.agent_session)
                     return self._send(200, list_objects(service, self.agent, caller, query))
+                if path == "/api/mesh/branches":
+                    caller = service.caller(self.agent, self.agent_session)
+                    return self._send(200, squad_branches(service, self.agent, caller, query))
                 if path == "/api/mesh/object":
                     caller = service.caller(self.agent, self.agent_session)
                     row = load_object(service, self.agent, caller, query.get("ref") or "")

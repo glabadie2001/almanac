@@ -194,7 +194,7 @@ MCP_TOOLS = [
         "name": "mesh_objects",
         "description": (
             "List your squad's tasks (the plan) in tree order: parents before their parts. Each row has its ref "
-            "(T-12), title, status, owner and the last log line."
+            "(T-12), title, status, owner, the last log line, and once handed in its `sha`, `branch` and `merged`."
         ),
         "inputSchema": {
             "type": "object",
@@ -212,7 +212,9 @@ MCP_TOOLS = [
     },
     {
         "name": "mesh_object",
-        "description": "Read one task by ref (T-12): body, files, owner, status and its log, newest first.",
+        "description": ("Read one task by ref (T-12): body, files, owner, status and its log, newest first. A task "
+                        "handed in carries `sha` (its owner's head then), `branch`, `base` and `merged` (sha in the "
+                        "squad folder's HEAD now)."),
         "inputSchema": {
             "type": "object",
             "properties": {

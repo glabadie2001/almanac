@@ -126,8 +126,9 @@ OPERATOR_NAMES = ("operator", "almanac-hub")  # the human, by every name the hub
 TASK_STATUSES = ("queued", "in progress", "in review", "accepted", "blocked")
 OBJECT_KINDS = {"T": "task"}                  # stage 1: tasks only; F finding and N note come later
 OBJECT_COLUMNS = ("id, kind, project, squad_id, title, body, status, owner_session, parent_id, files, sha, branch, "
-                  "created_by, created_by_name, created_ts, updated_ts, data")
-LOG_COLUMNS = "id, object_id, ts, session, agent_name, role_id, provider, kind, body, status_from, status_to, owner_to, message_id"
+                  "created_by, created_by_name, created_ts, updated_ts, data, base")
+LOG_COLUMNS = ("id, object_id, ts, session, agent_name, role_id, provider, kind, body, status_from, status_to, owner_to, "
+               "message_id, sha")
 MESSAGE_COLUMNS = ("id, msg_id, ts, from_name, from_session, from_provider, to_name, to_session, to_provider, "
                    "channel, squad_id, body, transport, needs, answered_ts, answered_by, read_ts")
 DUPLICATE_WINDOW = 900      # seconds: a transcript copy of a message the hub journaled this recently is the same message
@@ -349,6 +350,12 @@ class Store:
         # v11: a member retired by its role's fresh-per-task policy (door.context_boundary) gives its slot back
         if "retired_ts" not in {r[1] for r in self.db.execute("pragma table_info(spawned_agents)")}:
             self.db.execute("alter table spawned_agents add column retired_ts real")
+        # v12 (T-46): a worktree member's branch and the commit it was cut from; a task's head at hand-in and that
+        # branch's base, and the hand-in log row's sha
+        for table, column in (("spawned_agents", "branch"), ("spawned_agents", "base"), ("objects", "base"),
+                              ("object_log", "sha")):
+            if column not in {r[1] for r in self.db.execute(f"pragma table_info({table})")}:
+                self.db.execute(f"alter table {table} add column {column} text")
         have = {r[1] for r in self.db.execute("pragma table_info(squads)")}
         for column, kind in (("spawn_role", "text"), ("spawn_limit", "integer default 0")):
             if column not in have:
@@ -1543,6 +1550,8 @@ class Store:
         pid: int,
         channels: list[str] | None = None,
         spawned_by: str | None = None,
+        branch: str | None = None,
+        base: str | None = None,
     ) -> dict:
         if not session_id:
             raise ValueError("a spawn record needs its session id")
@@ -1551,9 +1560,9 @@ class Store:
             self.db.execute(
                 "insert or replace into spawned_agents "
                 "(agent_name, session_id, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, created_ts, channels, "
-                "spawned_by) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "spawned_by, branch, base) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (agent_name, session_id, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, now,
-                 json.dumps(list(channels or [])), spawned_by),
+                 json.dumps(list(channels or [])), spawned_by, branch, base),
             )
             self.db.commit()
         return dict(
@@ -1569,6 +1578,8 @@ class Store:
             pid=pid,
             created_ts=now,
             spawned_by=spawned_by,
+            branch=branch,
+            base=base,
         )
 
     def update_spawn_model(
@@ -1625,7 +1636,8 @@ class Store:
         with self.lock:
             rows = self.db.execute(
                 "select agent_name, session_id, squad_id, role_id, provider, model, effort, cwd, worktree_path, pid, created_ts, "
-                f"channels, spawned_by, retired_ts from spawned_agents {where}order by created_ts desc, rowid desc limit ?",
+                f"channels, spawned_by, retired_ts, branch, base from spawned_agents {where}order by created_ts desc, rowid desc "
+                "limit ?",
                 (*params, limit),
             ).fetchall()
         return [
@@ -1644,6 +1656,8 @@ class Store:
                 channels=_json_list(a[11]),
                 spawned_by=a[12],
                 retired_ts=a[13],
+                branch=a[14],
+                base=a[15],
             )
             for a in rows
         ]
@@ -1667,17 +1681,18 @@ class Store:
             self.db.commit()
         return self.object_row(oid)
 
-    def _insert_log(self, oid, ts, who, kind, body, status_from, status_to, owner_to, message_id) -> int:
+    def _insert_log(self, oid, ts, who, kind, body, status_from, status_to, owner_to, message_id, sha=None) -> int:
         return self.db.execute(
-            f"insert into object_log ({LOG_COLUMNS.removeprefix('id, ')}) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            f"insert into object_log ({LOG_COLUMNS.removeprefix('id, ')}) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (oid, ts, who.get("session"), who.get("agent_name") or "operator", who.get("role_id"), who.get("provider"),
-             kind, body, status_from, status_to, owner_to, message_id)).lastrowid
+             kind, body, status_from, status_to, owner_to, message_id, sha)).lastrowid
 
     def log_object(self, oid: int, *, who: dict, kind: str, body: str = "", status: str | None = None,
                    owner_session: str | None = None, owner_name: str | None = None,
-                   message_id: int | None = None, squad_id: str | None = None) -> dict:
+                   message_id: int | None = None, squad_id: str | None = None, head: dict | None = None) -> dict:
         """Append a log row; a `status`, `owner_session` or `squad_id` (a backlog task's dispatch) also changes the
-        object (and its updated_ts)."""
+        object (and its updated_ts). `head` {sha, branch, base}: what a hand-in shipped, set on the object (all three,
+        a None included) and as the row's sha."""
         now = time.time()
         with self.lock:
             row = self.db.execute("select status from objects where id = ?", (oid,)).fetchone()
@@ -1693,9 +1708,12 @@ class Store:
             if squad_id is not None:
                 sets.append("squad_id = ?")
                 params.append(squad_id)
+            if head is not None:
+                sets.append("sha = ?, branch = ?, base = ?")
+                params.extend((head["sha"], head.get("branch"), head.get("base")))
             self.db.execute(f"update objects set {', '.join(sets)} where id = ?", (*params, oid))
             lid = self._insert_log(oid, now, who, kind, body, row[0] if status is not None else None, status,
-                                   owner_name, message_id)
+                                   owner_name, message_id, head and head["sha"])
             self.db.commit()
             r = self.db.execute(f"select {LOG_COLUMNS} from object_log where id = ?", (lid,)).fetchone()
         return _log(r)
@@ -1798,9 +1816,10 @@ class Store:
 
     def spawn_by_session(self, session_id: str) -> dict | None:
         with self.lock:
-            a = self.db.execute(f"select {SPAWNED_COLUMNS}, retired_ts from spawned_agents where session_id = ?",
-                                (session_id,)).fetchone()
-        return dict(zip(SPAWNED_COLUMNS.split(", ") + ["retired_ts"], a), channels=_json_list(a[11])) if a else None
+            a = self.db.execute(f"select {SPAWNED_COLUMNS}, retired_ts, branch, base from spawned_agents "
+                                "where session_id = ?", (session_id,)).fetchone()
+        return (dict(zip(SPAWNED_COLUMNS.split(", ") + ["retired_ts", "branch", "base"], a), channels=_json_list(a[11]))
+                if a else None)
 
     def retire_spawn(self, session_id: str, retired: bool = True) -> None:
         """Mark a spawn row retired (fresh-per-task): its handle no longer counts toward the squad's spawn_used.

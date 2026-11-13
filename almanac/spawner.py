@@ -277,6 +277,34 @@ def _git(repo: Path, *args: str, env: dict | None = None) -> str:
     return proc.stdout.decode("utf-8", "replace").strip()
 
 
+def git_try(repo, *args: str, timeout: float = 10) -> tuple[bool, str]:
+    """A read-only git call that never raises: (True, stdout) or (False, why it failed or timed out)."""
+    try:
+        # --no-optional-locks: a read never takes index.lock from an agent committing in the same folder
+        proc = subprocess.run(["git", "--no-optional-locks", "-C", str(repo), *args], capture_output=True, timeout=timeout,
+                              creationflags=NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        return False, f"git {args[0]} timed out after {timeout:g}s"
+    except (OSError, ValueError) as exc:
+        return False, f"git {args[0]}: {exc}"
+    if proc.returncode != 0:
+        return False, f"git {args[0]} failed: {_git_cause((proc.stderr or proc.stdout).decode('utf-8', 'replace'))}"
+    return True, proc.stdout.decode("utf-8", "replace").strip()
+
+
+def branch_and_base(worktree) -> tuple[str | None, str | None]:
+    """A worktree's branch and the commit it was cut from: the newest `branch: Created from` / `branch: Reset to`
+    entry of the branch's reflog (ensure_worktree's `worktree add -B`), so a respawn into the same worktree finds the
+    same base. (None, None) for what git cannot tell."""
+    ok, branch = git_try(worktree, "symbolic-ref", "--short", "-q", "HEAD")
+    if not ok or not branch:
+        return None, None
+    ok, out = git_try(worktree, "reflog", "show", "--format=%H %gs", f"refs/heads/{branch}")
+    base = next((ln.split(" ", 1)[0] for ln in out.splitlines() if ln.split(" ", 1)[-1].startswith("branch: ")),
+                None) if ok else None
+    return branch, base
+
+
 def _git_cause(text: str, limit: int = 240) -> str:
     """git's error output with the cause first: `fatal:` / `error:` / `The following paths…` lines lead, hints and
     line-ending warnings (which come first and bury it) drop out, and what is kept is cut from the end."""
@@ -582,6 +610,7 @@ def _spawn_agent(
             worktree_path = wt
             run_cwd = wt
     allowed = role_commands((role or {}).get("allowed_commands"), run_cwd)
+    branch, base = branch_and_base(worktree_path) if worktree_path else (None, None)
 
     spawn_dir = service.state / "spawns" / f"{eff_name}-{session_id[:8]}"
     spawn_dir.mkdir(parents=True, exist_ok=True)
@@ -802,6 +831,8 @@ def _spawn_agent(
         pid=proc.pid,
         channels=eff_channels,
         spawned_by=spawned_by,
+        branch=branch,
+        base=base,
     )
     with service.fleet_lock:
         if service.fleet:
