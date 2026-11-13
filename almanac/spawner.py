@@ -134,6 +134,7 @@ def _policy_line(value) -> str | None:
 
 
 _TEST_MODULE = re.compile(r"test_\w+", re.ASCII)
+_MODULE_LINE = re.compile(r"python -m unittest discover tests -p test_\w+\.py", re.ASCII)
 
 
 def role_commands(cmds, cwd) -> list[str]:
@@ -245,8 +246,14 @@ def build_mesh_charter(
                      "and never with a failing suite; static files need no restart. Almanac refuses if its preflight "
                      "fails, and your mesh tools wait while it comes back.")
     if allowed_commands and provider == "gemini":     # agy's allow rules; for Claude the role field is informational
+        # the per-module lines from role_commands are named once, not one by one: the charter is re-read every turn
+        base = [c for c in allowed_commands if not _MODULE_LINE.fullmatch(c)]
+        named = [f"`{c}`" for c in base]
+        if len(base) < len(allowed_commands):
+            named.append("one test module at a time, `python -m unittest discover tests -p test_<name>.py`, for the "
+                         "test files that existed when you were spawned")
         lines.append("- **Shell**: your runner only permits these exact command lines, typed character for character: "
-                     + ", ".join(f"`{c}`" for c in allowed_commands) + "; anything else is denied, so do not try variants.")
+                     + ", ".join(named) + "; anything else is denied, so do not try variants.")
     if add_dirs and provider == "gemini":             # agy `--add-dir`; Claude agents already read outside their cwd
         lines.append("- **Folders**: these folders are also part of your workspace: "
                      + ", ".join(f"`{d}`" for d in add_dirs) + ".")

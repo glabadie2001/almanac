@@ -741,10 +741,16 @@ class ReviewTestRunTests(Fixture):
     def test_the_squad_charter_says_who_runs_what(self):
         text = spawner.build_mesh_charter(agent_name="r", provider="gemini", role_title="R", role_prompt="p",
                                           almanac_url="u", squad_id="sq",
-                                          allowed_commands=["python -m unittest discover tests -p test_a.py"])
+                                          allowed_commands=["git diff", "python -m unittest discover tests",
+                                                            "python -m unittest discover tests -p test_a.py",
+                                                            "python -m unittest discover tests -p test_b.py"])
         self.assertIn("on a fix round, the builder and the reviewer run only the test modules of the files touched", text)
         self.assertIn("by the lead on the merged tree; that run is the merge gate", text)
-        self.assertIn("`python -m unittest discover tests -p test_a.py`", text)
+        self.assertIn("only permits these exact command lines, typed character for character: `git diff`, "
+                      "`python -m unittest discover tests`, one test module at a time, "
+                      "`python -m unittest discover tests -p test_<name>.py`, for the test files that existed when "
+                      "you were spawned; anything else is denied, so do not try variants.", text)
+        self.assertNotIn("test_a.py", text, "the module lines are described once, not listed")
         solo = spawner.build_mesh_charter(agent_name="r", provider="claude", role_title="R", role_prompt="p",
                                           almanac_url="u")
         self.assertNotIn("merge gate", solo, "no squad, no review rounds")
