@@ -1864,9 +1864,10 @@ class Store:
         return _log(r)
 
     def amended_since(self, oid: int, ts: float) -> bool:
-        """Has the object an `amend` log row at or after `ts`?"""
+        """Has the object an `amend` or `parent` (a move) log row at or after `ts`?"""
         with self.lock:
-            return self.db.execute("select 1 from object_log where object_id = ? and kind = 'amend' and ts >= ? limit 1",
+            return self.db.execute("select 1 from object_log where object_id = ? and kind in ('amend', 'parent') "
+                                   "and ts >= ? limit 1",
                                    (oid, ts)).fetchone() is not None
 
     def object_row(self, oid: int) -> dict | None:
