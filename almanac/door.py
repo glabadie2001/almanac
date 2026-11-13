@@ -2444,7 +2444,17 @@ def spawn_ref_row(service, ref, squad_id: str) -> dict:
     return row
 
 
-def respawn_kickoff(row: dict, log: list[dict], squad: dict, name: str, room: int) -> str:
+def plan_note(service, row: dict) -> str:
+    """The kickoff line for a task under a plan the operator accepted (status accepted AND accepted_ts, as spawn_covered
+    tests); "" for any other task, and for the plan itself."""
+    plan = plan_of(service, row)
+    if plan is None or plan["id"] == row["id"] or plan["status"] != "accepted" \
+            or not (plan["data"].get("plan") or {}).get("accepted_ts"):
+        return ""
+    return f"Plan {ref_of(plan)}, accepted by the operator: build to this task's Sketch."
+
+
+def respawn_kickoff(row: dict, log: list[dict], squad: dict, name: str, room: int, plan: str = "") -> str:
     """A respawned owner's first prompt: the mission, its task, the task's log oldest first, and what to do, in at most
     `room` characters when it can (spawner.fit_prompt gives the room a Claude command line has left)."""
     ref = ref_of(row)
@@ -2452,11 +2462,11 @@ def respawn_kickoff(row: dict, log: list[dict], squad: dict, name: str, room: in
             "too large, or it stalled). Carry on from the log: `git status` and `git log` in your worktree show what is "
             f"already done. Hand in as usual: mesh_log(ref=\"{ref}\", status=\"in review\", body=<files touched, the "
             "test command and its result, what is left>).")
-    return task_kickoff(row, log, squad, room, tail)
+    return task_kickoff(row, log, squad, room, tail, plan=plan)
 
 
 def task_kickoff(row: dict, log: list[dict], squad: dict, room: int, tail: str, *, extra: str = "",
-                 files: list[str] | None = None) -> str:
+                 files: list[str] | None = None, plan: str = "") -> str:
     """A session's first prompt on an existing task: the mission, the task (`extra`: more instructions from whoever
     put the session on it; `files` replace the task's), the task's log oldest first, then `tail`. The oldest log
     entries go first, and the prompt says how to read them; the task and `tail` are never cut."""
@@ -2464,6 +2474,8 @@ def task_kickoff(row: dict, log: list[dict], squad: dict, room: int, tail: str, 
     head = [f"## Squad Mission ({squad['name']})\n{squad['brief'].strip()}"] if (squad.get("brief") or "").strip() else []
     head.append(f"## Your task (`{ref}`): {row['title']}\n{row['body'] or '(no body)'}\n\n"
                 f"Files: {', '.join(files or row['files']) or '(none named)'}")
+    if plan:                                              # plan_note: in the head, which is never cut
+        head.append(plan)
     if extra:
         head.append(f"## More instructions\n{extra}")
     entries = []
@@ -2572,7 +2584,7 @@ def respawn_task(service, agent, caller, body: dict, *, almanac_url: str, token:
         res = spawner.spawn_agent(
             service, almanac_url=almanac_url, token=token, cwd=squad["cwd"], agent_name=name, role_id=role["id"],
             provider=old["provider"], model=model or "", effort=effort or "", workspace_mode=wmode,
-            initial_prompt=lambda room: respawn_kickoff(row, log, squad, name, room), channels=old["channels"],
+            initial_prompt=lambda room: respawn_kickoff(row, log, squad, name, room, plan_note(service, row)), channels=old["channels"],
             squad_id=squad["id"], squad_name=squad["name"], spawned_by=old["spawned_by"], before_launch=end_old,
             teammates=[t for t in spawner.squad_roster(service, squad) if t["agent_name"] != name])
     except web.Refused:
